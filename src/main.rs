@@ -15,7 +15,6 @@ use config::{Config, ProviderUrl};
 use db::Db;
 use monitor::Monitor;
 use sweeper::Sweeper;
-use tracing_subscriber;
 use traits::Service;
 use wallet::Wallet;
 

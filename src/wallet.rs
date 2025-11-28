@@ -1,6 +1,6 @@
 use alloy::primitives::Address;
-use alloy::signers::local::MnemonicBuilder;
 use alloy::signers::local::coins_bip39::English;
+use alloy::signers::local::MnemonicBuilder;
 use anyhow::Result;
 
 #[derive(Clone)]

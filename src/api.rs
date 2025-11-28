@@ -1,8 +1,8 @@
 use crate::{config::Config, db::Db, wallet::Wallet};
 use axum::{
-    Router,
     extract::{Json, State},
     routing::post,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 

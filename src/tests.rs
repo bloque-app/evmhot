@@ -82,9 +82,6 @@ async fn test_monitor_creation_with_http_provider() {
     // Create provider and monitor (no actual connection needed for this test)
     let provider = ProviderBuilder::new().on_http("http://localhost:8545".parse().unwrap());
     let _monitor = Monitor::new(config, db.clone(), provider);
-
-    // Test should compile and create successfully
-    assert!(true);
 }
 
 #[test]
@@ -164,10 +161,7 @@ async fn test_sweeper_creation() {
     let wallet = Wallet::new(config.mnemonic.clone());
     let provider = ProviderBuilder::new().on_http("http://localhost:8545".parse().unwrap());
 
-    let _sweeper = Sweeper::new(config, db, wallet, provider);
-
-    // Test should compile and create successfully
-    assert!(true);
+    Sweeper::new(config, db, wallet, provider);
 }
 
 #[test]
