@@ -29,9 +29,11 @@ async fn test_e2e_deposit_sweep_flow() {
         provider_url: ProviderUrl::Http(rpc_server.uri()),
         mnemonic: "test test test test test test test test test test test junk".to_string(),
         treasury_address: "0x9999999999999999999999999999999999999999".to_string(),
-        webhook_url: webhook_server.uri(),
         port: 3001,
         poll_interval: 1,
+        faucet_mnemonic: "test test test test test test test test test test test junk".to_string(),
+        existential_deposit: "10000000000000000".to_string(),
+        faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
     };
 
     let wallet = Wallet::new(config.mnemonic.clone());
@@ -41,12 +43,13 @@ async fn test_e2e_deposit_sweep_flow() {
     // User 1 -> Index 0
     let addr1 = wallet.derive_address(0).unwrap();
     let addr1_str = addr1.to_string();
-    db.register_account("user_1", 0, &addr1_str).unwrap();
+    let webhook_url = webhook_server.uri();
+    db.register_account("user_1", 0, &addr1_str, &webhook_url).unwrap();
 
     // User 2 -> Index 1
     let addr2 = wallet.derive_address(1).unwrap();
     let addr2_str = addr2.to_string();
-    db.register_account("user_2", 1, &addr2_str).unwrap();
+    db.register_account("user_2", 1, &addr2_str, &webhook_url).unwrap();
 
     // 4. Initialize Provider
     let provider = ProviderBuilder::new().on_http(rpc_server.uri().parse().unwrap());

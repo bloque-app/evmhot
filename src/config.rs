@@ -14,9 +14,11 @@ pub struct Config {
     pub provider_url: ProviderUrl,
     pub mnemonic: String,
     pub treasury_address: String,
-    pub webhook_url: String,
     pub port: u16,
     pub poll_interval: u64,
+    pub faucet_mnemonic: String,
+    pub existential_deposit: String,
+    pub faucet_address: String,
 }
 
 impl Config {
@@ -36,7 +38,10 @@ impl Config {
 
         let mnemonic = env::var("MNEMONIC").expect("MNEMONIC must be set");
         let treasury_address = env::var("TREASURY_ADDRESS").expect("TREASURY_ADDRESS must be set");
-        let webhook_url = env::var("WEBHOOK_URL").expect("WEBHOOK_URL must be set");
+        let faucet_mnemonic = env::var("FAUCET_MNEMONIC").expect("FAUCET_MNEMONIC must be set");
+        let faucet_address = env::var("FAUCET_ADDRESS").expect("FAUCET_ADDRESS must be set");
+        let existential_deposit = env::var("EXISTENTIAL_DEPOSIT")
+            .unwrap_or_else(|_| "10000000000000000".to_string()); // Default: 0.01 ETH
         let port = env::var("PORT")
             .unwrap_or_else(|_| "3000".to_string())
             .parse()?;
@@ -49,9 +54,11 @@ impl Config {
             provider_url,
             mnemonic,
             treasury_address,
-            webhook_url,
             port,
             poll_interval,
+            faucet_mnemonic,
+            existential_deposit,
+            faucet_address,
         })
     }
 }

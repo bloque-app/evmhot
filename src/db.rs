@@ -2,10 +2,12 @@ use anyhow::Result;
 use redb::{Database, ReadableTable, TableDefinition};
 use std::sync::Arc;
 
-const ACCOUNTS: TableDefinition<&str, (u32, &str)> = TableDefinition::new("accounts");
+const ACCOUNTS: TableDefinition<&str, (u32, &str, &str)> = TableDefinition::new("accounts"); // account_id -> (index, address, webhook_url)
 const ADDRESS_TO_ID: TableDefinition<&str, &str> = TableDefinition::new("address_to_id");
 const DEPOSITS: TableDefinition<&str, (&str, &str, &str)> = TableDefinition::new("deposits"); // tx_hash -> (account_id, amount, status)
 const STATE: TableDefinition<&str, &str> = TableDefinition::new("state");
+const TOKEN_METADATA: TableDefinition<&str, (&str, u64, &str)> = TableDefinition::new("token_metadata"); // token_address -> (symbol, decimals, name)
+const ERC20_DEPOSITS: TableDefinition<&str, (&str, &str, &str, &str, &str)> = TableDefinition::new("erc20_deposits"); // tx_hash:log_index -> (account_id, amount, token_address, token_symbol, status)
 
 #[derive(Clone)]
 pub struct Db {
@@ -23,12 +25,15 @@ impl Db {
             let _ = write_txn.open_table(ADDRESS_TO_ID)?;
             let _ = write_txn.open_table(DEPOSITS)?;
             let _ = write_txn.open_table(STATE)?;
+            let _ = write_txn.open_table(TOKEN_METADATA)?;
+            let _ = write_txn.open_table(ERC20_DEPOSITS)?;
         }
         write_txn.commit()?;
 
         Ok(Self { db: Arc::new(db) })
     }
 
+    #[allow(dead_code)]
     pub fn get_next_derivation_index(&self) -> Result<u32> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ACCOUNTS)?;
@@ -42,11 +47,11 @@ impl Db {
         }
     }
 
-    pub fn register_account(&self, id: &str, index: u32, address: &str) -> Result<()> {
+    pub fn register_account(&self, id: &str, index: u32, address: &str, webhook_url: &str) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut accounts = write_txn.open_table(ACCOUNTS)?;
-            accounts.insert(id, (index, address))?;
+            accounts.insert(id, (index, address, webhook_url))?;
 
             let mut addr_map = write_txn.open_table(ADDRESS_TO_ID)?;
             addr_map.insert(address, id)?;
@@ -62,14 +67,21 @@ impl Db {
         Ok(result.map(|v| v.value().to_string()))
     }
 
-    pub fn get_account_by_id(&self, id: &str) -> Result<Option<(u32, String)>> {
+    pub fn get_account_by_id(&self, id: &str) -> Result<Option<(u32, String, String)>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ACCOUNTS)?;
         let result = table.get(id)?;
         Ok(result.map(|v| {
             let val = v.value();
-            (val.0, val.1.to_string())
+            (val.0, val.1.to_string(), val.2.to_string())
         }))
+    }
+
+    pub fn get_webhook_url(&self, account_id: &str) -> Result<Option<String>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(ACCOUNTS)?;
+        let result = table.get(account_id)?;
+        Ok(result.map(|v| v.value().2.to_string()))
     }
 
     pub fn record_deposit(&self, tx_hash: &str, account_id: &str, amount: &str) -> Result<()> {
@@ -135,6 +147,103 @@ impl Db {
         {
             let mut state = write_txn.open_table(STATE)?;
             state.insert("last_block", block.to_string().as_str())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    // ========== ERC20 Token Metadata ==========
+    
+    pub fn store_token_metadata(&self, address: &str, symbol: &str, decimals: u8, name: &str) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut metadata = write_txn.open_table(TOKEN_METADATA)?;
+            metadata.insert(address, (symbol, decimals as u64, name))?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_token_metadata(&self, address: &str) -> Result<Option<(String, u8, String)>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(TOKEN_METADATA)?;
+        let result = table.get(address)?;
+        Ok(result.map(|v| {
+            let val = v.value();
+            (val.0.to_string(), val.1 as u8, val.2.to_string())
+        }))
+    }
+
+    // ========== ERC20 Deposits ==========
+    
+    pub fn record_erc20_deposit(
+        &self,
+        tx_hash: &str,
+        log_index: u64,
+        account_id: &str,
+        amount: &str,
+        token_address: &str,
+        token_symbol: &str,
+    ) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut deposits = write_txn.open_table(ERC20_DEPOSITS)?;
+            let key = format!("{}:{}", tx_hash, log_index);
+            if deposits.get(key.as_str())?.is_none() {
+                deposits.insert(
+                    key.as_str(),
+                    (account_id, amount, token_address, token_symbol, "detected"),
+                )?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_detected_erc20_deposits(&self) -> Result<Vec<(String, String, String, String, String)>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(ERC20_DEPOSITS)?;
+        let mut results = Vec::new();
+        for item in table.iter()? {
+            let (key, value) = item?;
+            let (account_id, amount, token_address, token_symbol, status) = value.value();
+            if status == "detected" {
+                results.push((
+                    key.value().to_string(), // tx_hash:log_index
+                    account_id.to_string(),
+                    amount.to_string(),
+                    token_address.to_string(),
+                    token_symbol.to_string(),
+                ));
+            }
+        }
+        Ok(results)
+    }
+
+    pub fn mark_erc20_deposit_swept(&self, key: &str) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut deposits = write_txn.open_table(ERC20_DEPOSITS)?;
+            let (account_id, amount, token_address, token_symbol) = {
+                let current_val = deposits.get(key)?;
+                if let Some(v) = current_val {
+                    let val = v.value();
+                    (val.0.to_string(), val.1.to_string(), val.2.to_string(), val.3.to_string())
+                } else {
+                    return Ok(());
+                }
+            };
+
+            deposits.insert(
+                key,
+                (
+                    account_id.as_str(),
+                    amount.as_str(),
+                    token_address.as_str(),
+                    token_symbol.as_str(),
+                    "swept",
+                ),
+            )?;
         }
         write_txn.commit()?;
         Ok(())
