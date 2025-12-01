@@ -208,10 +208,21 @@ async fn test_e2e_deposit_sweep_flow() {
         .mount(&rpc_server)
         .await;
 
-    // Webhook Expectation
+    // eth_getLogs (for ERC20 Transfer events - return empty array)
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": []
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    // Webhook Expectation (2 calls: 1 deposit_detected + 1 deposit_swept)
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200))
-        .expect(1)
+        .expect(2)
         .mount(&webhook_server)
         .await;
 
