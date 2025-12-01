@@ -1,2 +1,18 @@
 /target
 .env
+.env.*
+!env.*.example
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Docker
+docker-compose.override.yml
+
+# Backups
+backups/
+
+# Logs
+*.log

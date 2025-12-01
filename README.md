@@ -386,16 +386,125 @@ See [`Cargo.toml`](./Cargo.toml) for the complete list.
 - Sweeper transfers ERC-20 tokens using the native balance for gas
 - Separate webhook notifications for ERC-20 sweeps with token details
 
+## Docker Deployment
+
+### Quick Start with Docker Compose
+
+1. **Copy the environment template:**
+```bash
+cp env.docker.example .env
+# Or use: make setup
+```
+
+2. **Edit `.env` with your configuration:**
+```bash
+# Set your RPC endpoint, mnemonics, addresses, etc.
+nano .env
+```
+
+3. **Build and start the service:**
+```bash
+docker-compose up -d
+# Or use: make up
+```
+
+4. **View logs:**
+```bash
+docker-compose logs -f evm-hot-wallet
+# Or use: make logs
+```
+
+5. **Check health:**
+```bash
+curl http://localhost:3000/health
+# Or use: make health
+```
+
+6. **Stop the service:**
+```bash
+docker-compose down
+# Or use: make down
+```
+
+### Using the Makefile
+
+A Makefile is provided for convenience:
+
+```bash
+make help          # Show all available commands
+make setup         # Create .env from template
+make up            # Start the service
+make logs          # View logs
+make health        # Check service health
+make backup        # Backup database
+make restart       # Restart service
+make down          # Stop service
+make rebuild       # Rebuild and restart
+make prod-check    # Verify production configuration
+```
+
+### Docker Commands
+
+**Build the image manually:**
+```bash
+docker build -t evm-hot-wallet .
+```
+
+**Run the container:**
+```bash
+docker run -d \
+  --name evm-hot-wallet \
+  -p 3000:3000 \
+  -v wallet-data:/app/data \
+  --env-file .env \
+  evm-hot-wallet
+```
+
+**Check container health:**
+```bash
+docker ps
+docker logs evm-hot-wallet
+```
+
+**Backup the database:**
+```bash
+docker cp evm-hot-wallet:/app/data/wallet.db ./backup-wallet.db
+```
+
+### Production Deployment Notes
+
+1. **Persistent Storage**: Database is stored in a Docker volume (`wallet-data`) to persist across container restarts
+2. **Environment Variables**: All configuration is loaded from `.env` file
+3. **Network**: Service runs on port 3000 by default (configurable)
+4. **Security**: 
+   - Never commit `.env` file with real secrets
+   - Use Docker secrets or environment variable injection for production
+   - Consider using a secrets management service (HashiCorp Vault, AWS Secrets Manager, etc.)
+5. **Monitoring**: Add health checks and monitoring solutions (Prometheus, Grafana)
+6. **Scaling**: For high availability, consider running multiple instances with a shared database
+
+### Health Check
+
+The docker-compose.yml includes a health check. You can also manually check:
+
+```bash
+curl http://localhost:3000/health
+```
+
+Note: You may need to implement a `/health` endpoint in the API if it doesn't exist.
+
 ## Roadmap
 
 - [x] Support for ERC-20 token sweeping
 - [x] Faucet integration for funding new addresses
 - [x] Smart filtering to prevent sweeping existential deposits
+- [x] Docker deployment
+- [x] Per-account webhook URLs
 - [ ] Configurable gas price strategies
 - [ ] Multi-chain support
 - [ ] Admin dashboard
 - [ ] Prometheus metrics
-- [ ] Docker deployment
+- [ ] Health check endpoint
 
 ## Contributing
 

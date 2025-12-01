@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  evm-hot-wallet:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: evm-hot-wallet
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      # Persist database
+      - wallet-data:/app/data
+      # Mount .env file for configuration
+    environment:
+      # Database
+      - DATABASE_URL=/app/data/wallet.db
+      
+      # These will be read from .env file
+      # Uncomment and set here if you prefer docker-compose configuration over .env
+      # - MNEMONIC=your twelve word mnemonic phrase goes here for hot wallet
+      # - FAUCET_MNEMONIC=another twelve word mnemonic phrase for faucet wallet funding
+      # - FAUCET_ADDRESS=0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
+      # - TREASURY_ADDRESS=0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
+      # - RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
+      # Or for WebSocket:
+      # - WS_URL=wss://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
+      # - EXISTENTIAL_DEPOSIT=10000000000000000
+      # - PORT=3000
+      # - POLL_INTERVAL=10
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - evm-network
+
+volumes:
+  wallet-data:
+    driver: local
+
+networks:
+  evm-network:
+    driver: bridge
+

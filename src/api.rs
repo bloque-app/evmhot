@@ -4,7 +4,7 @@ use axum::{
     extract::{Json, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,7 @@ pub async fn start_server<T>(
     };
 
     let app = Router::new()
+        .route("/health", get(health))
         .route("/register", post(register::<T>))
         .with_state(state);
 
@@ -59,12 +60,16 @@ pub async fn start_server<T>(
     axum::serve(listener, app).await.unwrap();
 }
 
+async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "OK")
+}
+
 async fn register<T>(
     State(state): State<AppState<T>>,
     Json(payload): Json<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, ApiError>
 where
-    T: Transport + Clone,
+    T: Transport + Clone + Send + Sync + 'static,
 {
     // Check if account already exists
     if let Ok(Some((_index, existing_address, _webhook))) = state.db.get_account_by_id(&payload.id)
@@ -100,25 +105,71 @@ where
         payload.id, address_str, index
     );
 
-    // Fund the new address with existential deposit
-    let funding_tx = match state.faucet.fund_new_address(&address_str).await {
-        Ok(tx_hash) => {
-            info!(
-                "Successfully funded address {} with tx: {}",
-                address_str, tx_hash
-            );
-            Some(tx_hash)
+    // Fire-and-forget: Fund the new address with existential deposit in the background
+    let faucet = Arc::clone(&state.faucet);
+    let db = state.db.clone();
+    let account_id = payload.id.clone();
+    let address_for_funding = address_str.clone();
+    
+    tokio::spawn(async move {
+        info!(
+            "Background task: Starting faucet funding for address {}",
+            address_for_funding
+        );
+        
+        match faucet.fund_new_address(&address_for_funding).await {
+            Ok(tx_hash) => {
+                info!(
+                    "Successfully funded address {} with tx: {}",
+                    address_for_funding, tx_hash
+                );
+                
+                // Send webhook notification for successful funding
+                if let Err(e) = send_faucet_funding_webhook(
+                    &db,
+                    &account_id,
+                    &address_for_funding,
+                    &tx_hash,
+                    true,
+                    None,
+                )
+                .await
+                {
+                    error!(
+                        "Failed to send faucet funding webhook for {}: {:?}",
+                        account_id, e
+                    );
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Failed to fund address {}: {:?}",
+                    address_for_funding, e
+                );
+                
+                // Send webhook notification for failed funding
+                if let Err(webhook_err) = send_faucet_funding_webhook(
+                    &db,
+                    &account_id,
+                    &address_for_funding,
+                    "",
+                    false,
+                    Some(&e.to_string()),
+                )
+                .await
+                {
+                    error!(
+                        "Failed to send faucet funding error webhook for {}: {:?}",
+                        account_id, webhook_err
+                    );
+                }
+            }
         }
-        Err(e) => {
-            error!("Failed to fund address {}: {:?}", address_str, e);
-            // Don't fail registration if funding fails - just log it
-            None
-        }
-    };
+    });
 
     Ok(Json(RegisterResponse {
         address: address_str,
-        funding_tx,
+        funding_tx: None, // No longer waiting for funding - it's fire-and-forget
     }))
 }
 
@@ -135,6 +186,60 @@ fn derive_index_from_account_id(account_id: &str) -> u32 {
     // Use the lower 31 bits to ensure we stay within u32::MAX and avoid negative values
     // BIP32 derivation paths use 31 bits for normal (non-hardened) derivation
     (hash & 0x7FFFFFFF) as u32
+}
+
+/// Send webhook notification for faucet funding event
+async fn send_faucet_funding_webhook(
+    db: &Db,
+    account_id: &str,
+    address: &str,
+    tx_hash: &str,
+    success: bool,
+    error_message: Option<&str>,
+) -> anyhow::Result<()> {
+    // Get the webhook URL for this account
+    let webhook_url = match db.get_webhook_url(account_id)? {
+        Some(url) => url,
+        None => {
+            error!("No webhook URL found for account: {}", account_id);
+            return Ok(());
+        }
+    };
+
+    let client = reqwest::Client::new();
+
+    let mut payload = serde_json::json!({
+        "event": "faucet_funding",
+        "account_id": account_id,
+        "address": address,
+        "success": success,
+    });
+
+    // Add tx_hash if funding was successful
+    if success && !tx_hash.is_empty() {
+        payload["tx_hash"] = serde_json::json!(tx_hash);
+    }
+
+    // Add error message if funding failed
+    if let Some(error) = error_message {
+        payload["error"] = serde_json::json!(error);
+    }
+
+    let res = client.post(&webhook_url).json(&payload).send().await;
+
+    match res {
+        Ok(r) => info!(
+            "Faucet funding webhook sent to {}: status={}",
+            webhook_url,
+            r.status()
+        ),
+        Err(e) => error!(
+            "Failed to send faucet funding webhook to {}: {:?}",
+            webhook_url, e
+        ),
+    }
+
+    Ok(())
 }
 
 // Error handling for the API
