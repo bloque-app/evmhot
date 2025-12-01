@@ -1,9 +1,9 @@
 mod api;
 mod config;
 mod db;
-mod faucet;
 #[cfg(test)]
 mod e2e_tests;
+mod faucet;
 mod monitor;
 mod sweeper;
 #[cfg(test)]
@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let config = Config::from_env()?;
-    
+
     // Log configuration on startup
     tracing::info!("🚀 Starting EVM Hot Wallet");
     tracing::info!("📊 Database: {}", config.database_url);
@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("⚡ Existential Deposit: {} wei", config.existential_deposit);
     tracing::info!("🔄 Poll Interval: {} seconds", config.poll_interval);
     tracing::info!("🌐 API Port: {}", config.port);
-    
+
     let db = Db::new(&config.database_url)?;
     let wallet = Wallet::new(config.mnemonic.clone());
 

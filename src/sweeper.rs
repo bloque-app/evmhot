@@ -114,16 +114,17 @@ where
                 .on_provider(&self.provider);
 
             // Try to sweep, but don't fail the entire loop if one sweep fails
-            match self.sweep_erc20_deposit(
-                &sweep_provider,
-                &address_str,
-                &key,
-                &account_id,
-                &amount_str,
-                &token_address,
-                &token_symbol,
-            )
-            .await
+            match self
+                .sweep_erc20_deposit(
+                    &sweep_provider,
+                    &address_str,
+                    &key,
+                    &account_id,
+                    &amount_str,
+                    &token_address,
+                    &token_symbol,
+                )
+                .await
             {
                 Ok(_) => info!("Successfully swept ERC20 deposit: {}", key),
                 Err(e) => {
@@ -206,7 +207,10 @@ where
         // Check native balance first (need gas for ERC20 transfer)
         let native_balance = provider.get_balance(from_address).await?;
 
-        info!("Native balance: {} wei for address {}", native_balance, from_address_str);
+        info!(
+            "Native balance: {} wei for address {}",
+            native_balance, from_address_str
+        );
 
         if native_balance.is_zero() {
             error!(
@@ -232,7 +236,8 @@ where
             );
             return Err(anyhow::anyhow!(
                 "Insufficient native balance for gas. Need at least {} wei, but only have {} wei",
-                estimated_gas_cost, native_balance
+                estimated_gas_cost,
+                native_balance
             ));
         }
 
@@ -245,7 +250,10 @@ where
         let token_balance = get_token_balance(&self.provider, token_address, from_address).await?;
 
         if token_balance.is_zero() {
-            info!("ERC20 balance is zero for {} token at {}, skipping sweep", token_symbol, from_address_str);
+            info!(
+                "ERC20 balance is zero for {} token at {}, skipping sweep",
+                token_symbol, from_address_str
+            );
             return Ok(());
         }
 
@@ -270,13 +278,23 @@ where
         let pending_tx = provider.send_transaction(tx).await?;
         let receipt = pending_tx.get_receipt().await?;
 
-        info!("Swept ERC20 tokens! Tx hash: {:?}", receipt.transaction_hash);
+        info!(
+            "Swept ERC20 tokens! Tx hash: {:?}",
+            receipt.transaction_hash
+        );
 
         // Update DB
         self.db.mark_erc20_deposit_swept(deposit_key)?;
 
         // Send Webhook
-        self.send_erc20_webhook(account_id, deposit_key, amount_str, token_symbol, token_address_str).await?;
+        self.send_erc20_webhook(
+            account_id,
+            deposit_key,
+            amount_str,
+            token_symbol,
+            token_address_str,
+        )
+        .await?;
 
         Ok(())
     }
@@ -300,11 +318,7 @@ where
             "token_type": "native"
         });
 
-        let res = client
-            .post(&webhook_url)
-            .json(&payload)
-            .send()
-            .await;
+        let res = client.post(&webhook_url).json(&payload).send().await;
 
         match res {
             Ok(r) => info!("Webhook sent to {}: status={}", webhook_url, r.status()),
@@ -342,14 +356,14 @@ where
             "token_address": token_address
         });
 
-        let res = client
-            .post(&webhook_url)
-            .json(&payload)
-            .send()
-            .await;
+        let res = client.post(&webhook_url).json(&payload).send().await;
 
         match res {
-            Ok(r) => info!("ERC20 Webhook sent to {}: status={}", webhook_url, r.status()),
+            Ok(r) => info!(
+                "ERC20 Webhook sent to {}: status={}",
+                webhook_url,
+                r.status()
+            ),
             Err(e) => error!("Failed to send ERC20 webhook to {}: {:?}", webhook_url, e),
         }
 
@@ -365,7 +379,7 @@ sol! {
     #[sol(rpc)]
     contract IERC20 {
         event Transfer(address indexed from, address indexed to, uint256 value);
-        
+
         function balanceOf(address account) external view returns (uint256);
         function transfer(address to, uint256 amount) external returns (bool);
         function symbol() external view returns (string memory);

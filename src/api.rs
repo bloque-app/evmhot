@@ -1,4 +1,4 @@
-use crate::{config::Config, db::Db, wallet::Wallet, faucet::Faucet};
+use crate::{config::Config, db::Db, faucet::Faucet, wallet::Wallet};
 use alloy::transports::Transport;
 use axum::{
     extract::{Json, State},
@@ -67,8 +67,12 @@ where
     T: Transport + Clone,
 {
     // Check if account already exists
-    if let Ok(Some((_index, existing_address, _webhook))) = state.db.get_account_by_id(&payload.id) {
-        info!("Account {} already exists with address {}", payload.id, existing_address);
+    if let Ok(Some((_index, existing_address, _webhook))) = state.db.get_account_by_id(&payload.id)
+    {
+        info!(
+            "Account {} already exists with address {}",
+            payload.id, existing_address
+        );
         return Ok(Json(RegisterResponse {
             address: existing_address,
             funding_tx: None,
@@ -91,12 +95,18 @@ where
         .register_account(&payload.id, index, &address_str, &payload.webhook_url)
         .map_err(|e| ApiError::Internal(format!("Failed to register account: {}", e)))?;
 
-    info!("Registered account {} with address {} (index: {})", payload.id, address_str, index);
+    info!(
+        "Registered account {} with address {} (index: {})",
+        payload.id, address_str, index
+    );
 
     // Fund the new address with existential deposit
     let funding_tx = match state.faucet.fund_new_address(&address_str).await {
         Ok(tx_hash) => {
-            info!("Successfully funded address {} with tx: {}", address_str, tx_hash);
+            info!(
+                "Successfully funded address {} with tx: {}",
+                address_str, tx_hash
+            );
             Some(tx_hash)
         }
         Err(e) => {
@@ -121,7 +131,7 @@ fn derive_index_from_account_id(account_id: &str) -> u32 {
     let mut hasher = DefaultHasher::new();
     account_id.hash(&mut hasher);
     let hash = hasher.finish();
-    
+
     // Use the lower 31 bits to ensure we stay within u32::MAX and avoid negative values
     // BIP32 derivation paths use 31 bits for normal (non-hardened) derivation
     (hash & 0x7FFFFFFF) as u32

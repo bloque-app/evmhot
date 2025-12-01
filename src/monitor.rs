@@ -1,7 +1,7 @@
 use crate::{config::Config, db::Db};
+use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::BlockNumberOrTag;
-use alloy::primitives::Address;
 use anyhow::Result;
 use tracing::{error, info, warn};
 
@@ -63,7 +63,7 @@ where
                     if let Some(to) = tx.to {
                         let to_address_str = to.to_string();
                         let from_address_str = tx.from.to_string();
-                        
+
                         info!("To address: {:?}", to_address_str);
                         info!("From address: {:?}", from_address_str);
                         info!("Value: {:?}", tx.value.to_string());
@@ -87,16 +87,19 @@ where
                                 &account_id,
                                 &tx.value.to_string(),
                             )?;
-                            
+
                             // Send webhook notification for deposit detection
-                            if let Err(e) = self.send_deposit_detected_webhook(
-                                &account_id,
-                                &tx.hash.to_string(),
-                                &tx.value.to_string(),
-                                "native",
-                                None,
-                                None,
-                            ).await {
+                            if let Err(e) = self
+                                .send_deposit_detected_webhook(
+                                    &account_id,
+                                    &tx.hash.to_string(),
+                                    &tx.value.to_string(),
+                                    "native",
+                                    None,
+                                    None,
+                                )
+                                .await
+                            {
                                 error!("Failed to send deposit detected webhook: {:?}", e);
                             }
                         }
@@ -113,11 +116,12 @@ where
     }
 
     async fn process_erc20_transfers(&self, block_num: u64) -> Result<()> {
-        use alloy::rpc::types::Filter;
         use alloy::primitives::FixedBytes;
+        use alloy::rpc::types::Filter;
 
         // ERC20 Transfer event signature: Transfer(address,address,uint256)
-        let transfer_signature: FixedBytes<32> = alloy::primitives::keccak256("Transfer(address,address,uint256)".as_bytes());
+        let transfer_signature: FixedBytes<32> =
+            alloy::primitives::keccak256("Transfer(address,address,uint256)".as_bytes());
 
         let filter = Filter::new()
             .from_block(block_num)
@@ -126,7 +130,11 @@ where
 
         let logs = self.provider.get_logs(&filter).await?;
 
-        info!("Found {} Transfer events in block {}", logs.len(), block_num);
+        info!(
+            "Found {} Transfer events in block {}",
+            logs.len(),
+            block_num
+        );
 
         for log in logs {
             // Decode Transfer event: topic[0] = signature, topic[1] = from, topic[2] = to
@@ -134,7 +142,7 @@ where
                 let token_address = log.address();
                 let from_address = Address::from_slice(&log.topics()[1].as_slice()[12..]); // Last 20 bytes of topic[1]
                 let to_address = Address::from_slice(&log.topics()[2].as_slice()[12..]); // Last 20 bytes of topic[2]
-                
+
                 let from_address_str = from_address.to_string();
                 let to_address_str = to_address.to_string();
 
@@ -142,8 +150,7 @@ where
                 if from_address_str.eq_ignore_ascii_case(&self.config.faucet_address) {
                     info!(
                         "Skipping ERC20 deposit from faucet address: Token: {}, To: {}",
-                        token_address,
-                        to_address_str
+                        token_address, to_address_str
                     );
                     continue;
                 }
@@ -162,11 +169,7 @@ where
 
                     info!(
                         "ERC20 deposit detected! Token: {} ({}), Amount: {}, Account: {}, Tx: {:?}",
-                        token_info.symbol,
-                        token_address,
-                        amount,
-                        account_id,
-                        log.transaction_hash
+                        token_info.symbol, token_address, amount, account_id, log.transaction_hash
                     );
 
                     // Store ERC20 deposit
@@ -180,16 +183,19 @@ where
                             &token_address.to_string(),
                             &token_info.symbol,
                         )?;
-                        
+
                         // Send webhook notification for ERC20 deposit detection
-                        if let Err(e) = self.send_deposit_detected_webhook(
-                            &account_id,
-                            &tx_hash.to_string(),
-                            &amount.to_string(),
-                            "erc20",
-                            Some(&token_info.symbol),
-                            Some(&token_address.to_string()),
-                        ).await {
+                        if let Err(e) = self
+                            .send_deposit_detected_webhook(
+                                &account_id,
+                                &tx_hash.to_string(),
+                                &amount.to_string(),
+                                "erc20",
+                                Some(&token_info.symbol),
+                                Some(&token_address.to_string()),
+                            )
+                            .await
+                        {
                             error!("Failed to send ERC20 deposit detected webhook: {:?}", e);
                         }
                     }
@@ -226,7 +232,10 @@ where
                 Ok(token_info)
             }
             Err(e) => {
-                warn!("Failed to fetch token metadata for {}: {:?}", token_address, e);
+                warn!(
+                    "Failed to fetch token metadata for {}: {:?}",
+                    token_address, e
+                );
                 // Return a default token info
                 Ok(TokenInfo {
                     address: token_address_str.clone(),
@@ -257,7 +266,7 @@ where
         };
 
         let client = reqwest::Client::new();
-        
+
         let mut payload = serde_json::json!({
             "event": "deposit_detected",
             "account_id": account_id,
@@ -274,15 +283,18 @@ where
             payload["token_address"] = serde_json::json!(address);
         }
 
-        let res = client
-            .post(&webhook_url)
-            .json(&payload)
-            .send()
-            .await;
+        let res = client.post(&webhook_url).json(&payload).send().await;
 
         match res {
-            Ok(r) => info!("Deposit detected webhook sent to {}: status={}", webhook_url, r.status()),
-            Err(e) => error!("Failed to send deposit detected webhook to {}: {:?}", webhook_url, e),
+            Ok(r) => info!(
+                "Deposit detected webhook sent to {}: status={}",
+                webhook_url,
+                r.status()
+            ),
+            Err(e) => error!(
+                "Failed to send deposit detected webhook to {}: {:?}",
+                webhook_url, e
+            ),
         }
 
         Ok(())
@@ -297,7 +309,7 @@ sol! {
     #[sol(rpc)]
     contract IERC20 {
         event Transfer(address indexed from, address indexed to, uint256 value);
-        
+
         function balanceOf(address account) external view returns (uint256);
         function transfer(address to, uint256 amount) external returns (bool);
         function symbol() external view returns (string memory);

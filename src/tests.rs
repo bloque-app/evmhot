@@ -33,7 +33,8 @@ fn test_db_operations() {
     let index = 0;
     let address = "0x123";
 
-    db.register_account(id, index, address, "https://webhook.example.com").unwrap();
+    db.register_account(id, index, address, "https://webhook.example.com")
+        .unwrap();
 
     let fetched_addr = db.get_account_by_id(id).unwrap().unwrap().1;
     assert_eq!(fetched_addr, address);
@@ -97,7 +98,8 @@ fn test_monitor_db_operations() {
     let user_address = wallet.derive_address(0).unwrap().to_string();
 
     // Register account
-    db.register_account("test_user", 0, &user_address, "https://webhook.example.com").unwrap();
+    db.register_account("test_user", 0, &user_address, "https://webhook.example.com")
+        .unwrap();
 
     // Verify no deposits initially
     let deposits_before = db.get_detected_deposits().unwrap();
@@ -130,7 +132,8 @@ fn test_monitor_address_lookup() {
     let addr2 = wallet.derive_address(1).unwrap().to_string();
 
     // Register only addr1
-    db.register_account("user1", 0, &addr1, "https://webhook.example.com").unwrap();
+    db.register_account("user1", 0, &addr1, "https://webhook.example.com")
+        .unwrap();
 
     // Check addr1 is registered
     let account = db.get_account_by_address(&addr1).unwrap();
@@ -179,7 +182,8 @@ fn test_sweeper_deposit_workflow() {
     let user_address = wallet.derive_address(0).unwrap().to_string();
 
     // Register account and create a deposit
-    db.register_account("test_user", 0, &user_address, "https://webhook.example.com").unwrap();
+    db.register_account("test_user", 0, &user_address, "https://webhook.example.com")
+        .unwrap();
     db.record_deposit("0xtx123", "test_user", "1000000000000000000")
         .unwrap();
 
@@ -238,9 +242,12 @@ fn test_sweeper_multiple_deposits() {
     let addr1 = wallet.derive_address(1).unwrap().to_string();
     let addr2 = wallet.derive_address(2).unwrap().to_string();
 
-    db.register_account("user_0", 0, &addr0, "https://webhook.example.com").unwrap();
-    db.register_account("user_1", 1, &addr1, "https://webhook.example.com").unwrap();
-    db.register_account("user_2", 2, &addr2, "https://webhook.example.com").unwrap();
+    db.register_account("user_0", 0, &addr0, "https://webhook.example.com")
+        .unwrap();
+    db.register_account("user_1", 1, &addr1, "https://webhook.example.com")
+        .unwrap();
+    db.register_account("user_2", 2, &addr2, "https://webhook.example.com")
+        .unwrap();
 
     // Record deposits for each
     db.record_deposit("0xtx1", "user_0", "1000000000000000000")

@@ -44,12 +44,14 @@ async fn test_e2e_deposit_sweep_flow() {
     let addr1 = wallet.derive_address(0).unwrap();
     let addr1_str = addr1.to_string();
     let webhook_url = webhook_server.uri();
-    db.register_account("user_1", 0, &addr1_str, &webhook_url).unwrap();
+    db.register_account("user_1", 0, &addr1_str, &webhook_url)
+        .unwrap();
 
     // User 2 -> Index 1
     let addr2 = wallet.derive_address(1).unwrap();
     let addr2_str = addr2.to_string();
-    db.register_account("user_2", 1, &addr2_str, &webhook_url).unwrap();
+    db.register_account("user_2", 1, &addr2_str, &webhook_url)
+        .unwrap();
 
     // 4. Initialize Provider
     let provider = ProviderBuilder::new().on_http(rpc_server.uri().parse().unwrap());

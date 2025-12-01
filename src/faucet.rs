@@ -45,7 +45,7 @@ where
         // Get the faucet signer (using index 0 from the faucet mnemonic)
         let signer = self.wallet.get_signer(0)?;
         let faucet_address = signer.address();
-        
+
         info!("Faucet address: {}", faucet_address);
 
         // Check faucet balance
@@ -66,7 +66,6 @@ where
             .with_recommended_fillers()
             .wallet(wallet)
             .on_provider(&self.provider);
-
 
         // Build and send transaction
         let tx = TransactionRequest::default()
@@ -90,9 +89,8 @@ where
     pub async fn needs_funding(&self, address: &str) -> Result<bool> {
         let addr = Address::from_str(address)?;
         let balance = self.provider.get_balance(addr).await?;
-        
+
         // If balance is less than existential deposit, it needs funding
         Ok(balance < self.existential_deposit)
     }
 }
-

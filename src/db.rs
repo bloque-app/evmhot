@@ -6,8 +6,10 @@ const ACCOUNTS: TableDefinition<&str, (u32, &str, &str)> = TableDefinition::new(
 const ADDRESS_TO_ID: TableDefinition<&str, &str> = TableDefinition::new("address_to_id");
 const DEPOSITS: TableDefinition<&str, (&str, &str, &str)> = TableDefinition::new("deposits"); // tx_hash -> (account_id, amount, status)
 const STATE: TableDefinition<&str, &str> = TableDefinition::new("state");
-const TOKEN_METADATA: TableDefinition<&str, (&str, u64, &str)> = TableDefinition::new("token_metadata"); // token_address -> (symbol, decimals, name)
-const ERC20_DEPOSITS: TableDefinition<&str, (&str, &str, &str, &str, &str)> = TableDefinition::new("erc20_deposits"); // tx_hash:log_index -> (account_id, amount, token_address, token_symbol, status)
+const TOKEN_METADATA: TableDefinition<&str, (&str, u64, &str)> =
+    TableDefinition::new("token_metadata"); // token_address -> (symbol, decimals, name)
+const ERC20_DEPOSITS: TableDefinition<&str, (&str, &str, &str, &str, &str)> =
+    TableDefinition::new("erc20_deposits"); // tx_hash:log_index -> (account_id, amount, token_address, token_symbol, status)
 
 #[derive(Clone)]
 pub struct Db {
@@ -47,7 +49,13 @@ impl Db {
         }
     }
 
-    pub fn register_account(&self, id: &str, index: u32, address: &str, webhook_url: &str) -> Result<()> {
+    pub fn register_account(
+        &self,
+        id: &str,
+        index: u32,
+        address: &str,
+        webhook_url: &str,
+    ) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut accounts = write_txn.open_table(ACCOUNTS)?;
@@ -153,8 +161,14 @@ impl Db {
     }
 
     // ========== ERC20 Token Metadata ==========
-    
-    pub fn store_token_metadata(&self, address: &str, symbol: &str, decimals: u8, name: &str) -> Result<()> {
+
+    pub fn store_token_metadata(
+        &self,
+        address: &str,
+        symbol: &str,
+        decimals: u8,
+        name: &str,
+    ) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut metadata = write_txn.open_table(TOKEN_METADATA)?;
@@ -175,7 +189,7 @@ impl Db {
     }
 
     // ========== ERC20 Deposits ==========
-    
+
     pub fn record_erc20_deposit(
         &self,
         tx_hash: &str,
@@ -200,7 +214,9 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_detected_erc20_deposits(&self) -> Result<Vec<(String, String, String, String, String)>> {
+    pub fn get_detected_erc20_deposits(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, String)>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ERC20_DEPOSITS)?;
         let mut results = Vec::new();
@@ -228,7 +244,12 @@ impl Db {
                 let current_val = deposits.get(key)?;
                 if let Some(v) = current_val {
                     let val = v.value();
-                    (val.0.to_string(), val.1.to_string(), val.2.to_string(), val.3.to_string())
+                    (
+                        val.0.to_string(),
+                        val.1.to_string(),
+                        val.2.to_string(),
+                        val.3.to_string(),
+                    )
                 } else {
                     return Ok(());
                 }

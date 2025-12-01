@@ -40,8 +40,8 @@ impl Config {
         let treasury_address = env::var("TREASURY_ADDRESS").expect("TREASURY_ADDRESS must be set");
         let faucet_mnemonic = env::var("FAUCET_MNEMONIC").expect("FAUCET_MNEMONIC must be set");
         let faucet_address = env::var("FAUCET_ADDRESS").expect("FAUCET_ADDRESS must be set");
-        let existential_deposit = env::var("EXISTENTIAL_DEPOSIT")
-            .unwrap_or_else(|_| "10000000000000000".to_string()); // Default: 0.01 ETH
+        let existential_deposit =
+            env::var("EXISTENTIAL_DEPOSIT").unwrap_or_else(|_| "10000000000000000".to_string()); // Default: 0.01 ETH
         let port = env::var("PORT")
             .unwrap_or_else(|_| "3000".to_string())
             .parse()?;
