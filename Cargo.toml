@@ -3,6 +3,15 @@ name = "evm_hot_wallet"
 version = "0.1.0"
 edition = "2021"
 
+# This project can be used as both a library and a binary
+[lib]
+name = "evm_hot_wallet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "evm_hot_wallet"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }
 axum = "0.7"

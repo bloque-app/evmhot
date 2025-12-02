@@ -1,24 +1,6 @@
-mod api;
-mod config;
-mod db;
-#[cfg(test)]
-mod e2e_tests;
-mod faucet;
-mod monitor;
-mod sweeper;
-#[cfg(test)]
-mod tests;
-pub mod traits;
-mod wallet;
+use evm_hot_wallet::{config::Config, HotWalletService};
 
-use alloy::providers::{ProviderBuilder, WsConnect};
-use config::{Config, ProviderUrl};
-use db::Db;
-use faucet::Faucet;
-use monitor::Monitor;
-use sweeper::Sweeper;
-use traits::Service;
-use wallet::Wallet;
+mod api;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,8 +13,12 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("📊 Database: {}", config.database_url);
 
     match &config.provider_url {
-        ProviderUrl::Http(url) => tracing::info!("🌐 RPC Provider (HTTP): {}", url),
-        ProviderUrl::Ws(url) => tracing::info!("🌐 RPC Provider (WebSocket): {}", url),
+        evm_hot_wallet::config::ProviderUrl::Http(url) => {
+            tracing::info!("🌐 RPC Provider (HTTP): {}", url)
+        }
+        evm_hot_wallet::config::ProviderUrl::Ws(url) => {
+            tracing::info!("🌐 RPC Provider (WebSocket): {}", url)
+        }
     }
     tracing::info!("💰 Treasury Address: {}", config.treasury_address);
     tracing::info!("🚰 Faucet Address: {}", config.faucet_address);
@@ -40,76 +26,29 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("🔄 Poll Interval: {} seconds", config.poll_interval);
     tracing::info!("🌐 API Port: {}", config.port);
 
-    let db = Db::new(&config.database_url)?;
-    let wallet = Wallet::new(config.mnemonic.clone());
+    let port = config.port;
 
     match &config.provider_url {
-        ProviderUrl::Http(url) => {
-            let provider = ProviderBuilder::new().on_http(url.parse().expect("Invalid RPC URL"));
+        evm_hot_wallet::config::ProviderUrl::Http(_) => {
+            // Create the service with HTTP provider
+            let service = HotWalletService::new_http(config).await?;
 
-            let faucet = Faucet::new(
-                config.faucet_mnemonic.clone(),
-                provider.clone(),
-                &config.existential_deposit,
-            )?;
+            // Start background services
+            service.start_background_services().await?;
 
-            // Spawn Monitor
-            tokio::spawn({
-                let config = config.clone();
-                let db = db.clone();
-                let provider = provider.clone();
-
-                async move {
-                    Monitor::new(config, db, provider).run().await;
-                }
-            });
-
-            // Spawn Sweeper
-            tokio::spawn({
-                let config = config.clone();
-                let db = db.clone();
-                let wallet = wallet.clone();
-                let provider = provider.clone();
-                async move {
-                    Sweeper::new(config, db, wallet, provider).run().await;
-                }
-            });
-
-            // Start API (blocks forever)
-            api::start_server(config, db, wallet, faucet).await;
+            // Start API server (blocks forever)
+            api::start_server(service, port).await;
         }
 
-        ProviderUrl::Ws(url) => {
-            let provider = ProviderBuilder::new().on_ws(WsConnect::new(url)).await?;
-            let faucet = Faucet::new(
-                config.faucet_mnemonic.clone(),
-                provider.clone(),
-                &config.existential_deposit,
-            )?;
+        evm_hot_wallet::config::ProviderUrl::Ws(_) => {
+            // Create the service with WebSocket provider
+            let service = HotWalletService::new_ws(config).await?;
 
-            // Spawn Monitor
-            tokio::spawn({
-                let config = config.clone();
-                let db = db.clone();
-                let provider = provider.clone();
-                async move {
-                    Monitor::new(config, db, provider).run().await;
-                }
-            });
+            // Start background services
+            service.start_background_services().await?;
 
-            // Spawn Sweeper
-            tokio::spawn({
-                let config = config.clone();
-                let db = db.clone();
-                let wallet = wallet.clone();
-                let provider = provider.clone();
-                async move {
-                    Sweeper::new(config, db, wallet, provider).run().await;
-                }
-            });
-
-            // Start API (blocks forever)
-            api::start_server(config, db, wallet, faucet).await;
+            // Start API server (blocks forever)
+            api::start_server(service, port).await;
         }
     };
 

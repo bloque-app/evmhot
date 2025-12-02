@@ -44,3 +44,4 @@ EXPOSE 3000
 # Run the binary
 CMD ["evm_hot_wallet"]
 
+

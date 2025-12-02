@@ -74,3 +74,4 @@ prod-check: ## Check production readiness
 	@grep -q "test test test" .env && echo "⚠️  Warning: .env contains test mnemonics" || echo "✅ Mnemonics appear configured"
 	@docker-compose config > /dev/null && echo "✅ docker-compose.yml is valid" || echo "❌ docker-compose.yml has errors"
 
+
