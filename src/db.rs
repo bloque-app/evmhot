@@ -223,9 +223,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_detected_erc20_deposits(
-        &self,
-    ) -> Result<Vec<Erc20Deposit>> {
+    pub fn get_detected_erc20_deposits(&self) -> Result<Vec<Erc20Deposit>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ERC20_DEPOSITS)?;
         let mut results = Vec::new();

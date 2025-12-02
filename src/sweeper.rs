@@ -1,4 +1,8 @@
-use crate::{config::Config, db::{Db, Erc20Deposit}, wallet::Wallet};
+use crate::{
+    config::Config,
+    db::{Db, Erc20Deposit},
+    wallet::Wallet,
+};
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
@@ -93,7 +97,11 @@ where
         for deposit in erc20_deposits {
             info!(
                 "Processing ERC20 deposit: key={}, token={} ({}), account={}, amount={}",
-                deposit.key, deposit.token_symbol, deposit.token_address, deposit.account_id, deposit.amount
+                deposit.key,
+                deposit.token_symbol,
+                deposit.token_address,
+                deposit.account_id,
+                deposit.amount
             );
 
             // Get account details to derive key
@@ -115,11 +123,7 @@ where
 
             // Try to sweep, but don't fail the entire loop if one sweep fails
             match self
-                .sweep_erc20_deposit(
-                    &sweep_provider,
-                    &address_str,
-                    &deposit,
-                )
+                .sweep_erc20_deposit(&sweep_provider, &address_str, &deposit)
                 .await
             {
                 Ok(_) => info!("Successfully swept ERC20 deposit: {}", deposit.key),
@@ -251,7 +255,12 @@ where
 
         info!(
             "Sweeping {} {} tokens (raw: {}) from {} to {} (native balance: {} wei)",
-            token_balance, deposit.token_symbol, token_balance, from_address, to_address, native_balance
+            token_balance,
+            deposit.token_symbol,
+            token_balance,
+            from_address,
+            to_address,
+            native_balance
         );
 
         // Build ERC20 transfer call data
