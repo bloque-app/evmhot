@@ -8,9 +8,9 @@ pub mod traits;
 mod wallet;
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod e2e_tests;
+#[cfg(test)]
+mod tests;
 
 use alloy::providers::{ProviderBuilder, WsConnect};
 use alloy::transports::Transport;
@@ -146,10 +146,7 @@ where
                     }
                 }
                 Err(e) => {
-                    error!(
-                        "Failed to fund address {}: {:?}",
-                        address_for_funding, e
-                    );
+                    error!("Failed to fund address {}: {:?}", address_for_funding, e);
 
                     // Send webhook notification for failed funding
                     if let Err(webhook_err) = send_faucet_funding_webhook(
@@ -358,4 +355,3 @@ async fn send_faucet_funding_webhook(
 
     Ok(())
 }
-

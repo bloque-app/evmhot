@@ -1,4 +1,3 @@
-use evm_hot_wallet::{HotWalletService, RegisterRequest, RegisterResponse};
 use alloy::transports::Transport;
 use axum::{
     extract::{Json, State},
@@ -7,6 +6,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use evm_hot_wallet::{HotWalletService, RegisterRequest, RegisterResponse};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
