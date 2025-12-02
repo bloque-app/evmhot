@@ -11,6 +11,15 @@ const TOKEN_METADATA: TableDefinition<&str, (&str, u64, &str)> =
 const ERC20_DEPOSITS: TableDefinition<&str, (&str, &str, &str, &str, &str)> =
     TableDefinition::new("erc20_deposits"); // tx_hash:log_index -> (account_id, amount, token_address, token_symbol, status)
 
+#[derive(Clone, Debug)]
+pub struct Erc20Deposit {
+    pub key: String,
+    pub account_id: String,
+    pub amount: String,
+    pub token_address: String,
+    pub token_symbol: String,
+}
+
 #[derive(Clone)]
 pub struct Db {
     db: Arc<Database>,
@@ -41,7 +50,7 @@ impl Db {
         let table = read_txn.open_table(ACCOUNTS)?;
         // This is inefficient O(N) but fine for MVP.
         // Better: Store a counter in STATE table.
-        let last = table.iter()?.last();
+        let last = table.iter()?.next_back();
 
         match last {
             Some(Ok((_, v))) => Ok(v.value().0 + 1),
@@ -216,7 +225,7 @@ impl Db {
 
     pub fn get_detected_erc20_deposits(
         &self,
-    ) -> Result<Vec<(String, String, String, String, String)>> {
+    ) -> Result<Vec<Erc20Deposit>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ERC20_DEPOSITS)?;
         let mut results = Vec::new();
@@ -224,13 +233,13 @@ impl Db {
             let (key, value) = item?;
             let (account_id, amount, token_address, token_symbol, status) = value.value();
             if status == "detected" {
-                results.push((
-                    key.value().to_string(), // tx_hash:log_index
-                    account_id.to_string(),
-                    amount.to_string(),
-                    token_address.to_string(),
-                    token_symbol.to_string(),
-                ));
+                results.push(Erc20Deposit {
+                    key: key.value().to_string(), // tx_hash:log_index
+                    account_id: account_id.to_string(),
+                    amount: amount.to_string(),
+                    token_address: token_address.to_string(),
+                    token_symbol: token_symbol.to_string(),
+                });
             }
         }
         Ok(results)

@@ -1,4 +1,4 @@
-use crate::{config::Config, db::Db, wallet::Wallet};
+use crate::{config::Config, db::{Db, Erc20Deposit}, wallet::Wallet};
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
@@ -90,16 +90,16 @@ where
         // Process ERC20 deposits
         let erc20_deposits = self.db.get_detected_erc20_deposits()?;
 
-        for (key, account_id, amount_str, token_address, token_symbol) in erc20_deposits {
+        for deposit in erc20_deposits {
             info!(
                 "Processing ERC20 deposit: key={}, token={} ({}), account={}, amount={}",
-                key, token_symbol, token_address, account_id, amount_str
+                deposit.key, deposit.token_symbol, deposit.token_address, deposit.account_id, deposit.amount
             );
 
             // Get account details to derive key
             let (derivation_index, address_str, _webhook_url) = self
                 .db
-                .get_account_by_id(&account_id)?
+                .get_account_by_id(&deposit.account_id)?
                 .ok_or_else(|| anyhow::anyhow!("Account not found"))?;
 
             let signer = self.wallet.get_signer(derivation_index)?;
@@ -118,17 +118,13 @@ where
                 .sweep_erc20_deposit(
                     &sweep_provider,
                     &address_str,
-                    &key,
-                    &account_id,
-                    &amount_str,
-                    &token_address,
-                    &token_symbol,
+                    &deposit,
                 )
                 .await
             {
-                Ok(_) => info!("Successfully swept ERC20 deposit: {}", key),
+                Ok(_) => info!("Successfully swept ERC20 deposit: {}", deposit.key),
                 Err(e) => {
-                    error!("Failed to sweep ERC20 deposit {}: {:?}", key, e);
+                    error!("Failed to sweep ERC20 deposit {}: {:?}", deposit.key, e);
                     // Don't return error - continue processing other deposits
                     // This deposit will be retried in the next sweep cycle
                 }
@@ -191,18 +187,14 @@ where
         &self,
         provider: &SP,
         from_address_str: &str,
-        deposit_key: &str,
-        account_id: &str,
-        amount_str: &str,
-        token_address_str: &str,
-        token_symbol: &str,
+        deposit: &Erc20Deposit,
     ) -> Result<()>
     where
         SP: Provider<T, alloy::network::Ethereum>,
     {
         let from_address = Address::from_str(from_address_str)?;
         let to_address = Address::from_str(&self.config.treasury_address)?;
-        let token_address = Address::from_str(token_address_str)?;
+        let token_address = Address::from_str(&deposit.token_address)?;
 
         // Check native balance first (need gas for ERC20 transfer)
         let native_balance = provider.get_balance(from_address).await?;
@@ -252,14 +244,14 @@ where
         if token_balance.is_zero() {
             info!(
                 "ERC20 balance is zero for {} token at {}, skipping sweep",
-                token_symbol, from_address_str
+                deposit.token_symbol, from_address_str
             );
             return Ok(());
         }
 
         info!(
             "Sweeping {} {} tokens (raw: {}) from {} to {} (native balance: {} wei)",
-            token_balance, token_symbol, token_balance, from_address, to_address, native_balance
+            token_balance, deposit.token_symbol, token_balance, from_address, to_address, native_balance
         );
 
         // Build ERC20 transfer call data
@@ -284,15 +276,15 @@ where
         );
 
         // Update DB
-        self.db.mark_erc20_deposit_swept(deposit_key)?;
+        self.db.mark_erc20_deposit_swept(&deposit.key)?;
 
         // Send Webhook
         self.send_erc20_webhook(
-            account_id,
-            deposit_key,
-            amount_str,
-            token_symbol,
-            token_address_str,
+            &deposit.account_id,
+            &deposit.key,
+            &deposit.amount,
+            &deposit.token_symbol,
+            &deposit.token_address,
         )
         .await?;
 
