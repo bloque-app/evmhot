@@ -75,3 +75,4 @@ prod-check: ## Check production readiness
 	@docker-compose config > /dev/null && echo "✅ docker-compose.yml is valid" || echo "❌ docker-compose.yml has errors"
 
 
+

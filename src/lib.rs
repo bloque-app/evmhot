@@ -219,6 +219,7 @@ impl HotWalletService<alloy::transports::http::Http<reqwest::Client>> {
             let provider = provider.clone();
 
             async move {
+                tracing::info!("Starting Monitor in Polling mode");
                 Monitor::new(config, db, provider).run().await;
             }
         });
@@ -230,6 +231,7 @@ impl HotWalletService<alloy::transports::http::Http<reqwest::Client>> {
             let wallet = self.wallet.clone();
             let provider = provider.clone();
             async move {
+                tracing::info!("Starting Sweeper in Polling mode");
                 Sweeper::new(config, db, wallet, provider).run().await;
             }
         });
@@ -281,6 +283,7 @@ impl HotWalletService<alloy::pubsub::PubSubFrontend> {
             let db = self.db.clone();
             let provider = provider.clone();
             async move {
+                tracing::info!("Starting Monitor in Streaming mode");
                 Monitor::new(config, db, provider).run().await;
             }
         });
@@ -292,6 +295,7 @@ impl HotWalletService<alloy::pubsub::PubSubFrontend> {
             let wallet = self.wallet.clone();
             let provider = provider.clone();
             async move {
+                tracing::info!("Starting Sweeper in Streaming mode");
                 Sweeper::new(config, db, wallet, provider).run().await;
             }
         });
