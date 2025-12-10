@@ -40,6 +40,8 @@ where
         // Get the latest block again to ensure we don't process blocks that aren't available yet
         let latest_block = self.provider.get_block_number().await?;
         
+        info!("Latest block: {}", latest_block);
+
         // Process max 10 blocks at a time to avoid rate limits
         // Ensure we don't exceed the latest confirmed block
         let end_block = std::cmp::min(start_block + 10, latest_block);
