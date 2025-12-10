@@ -19,6 +19,7 @@ pub struct Config {
     pub faucet_mnemonic: String,
     pub existential_deposit: String,
     pub faucet_address: String,
+    pub block_offset_from_head: u64,
 }
 
 impl Config {
@@ -48,6 +49,9 @@ impl Config {
         let poll_interval = env::var("POLL_INTERVAL")
             .unwrap_or_else(|_| "10".to_string())
             .parse()?;
+        let block_offset_from_head = env::var("BLOCK_OFFSET_FROM_HEAD")
+            .unwrap_or_else(|_| "20".to_string())
+            .parse()?;
 
         Ok(Self {
             database_url,
@@ -59,6 +63,7 @@ impl Config {
             faucet_mnemonic,
             existential_deposit,
             faucet_address,
+            block_offset_from_head,
         })
     }
 }

@@ -94,6 +94,7 @@ The service is configured via environment variables. Create a `.env` file or set
 | `DATABASE_URL` | Path to the database file | `sqlite:wallet.db` |
 | `PORT` | API server port | `3000` |
 | `POLL_INTERVAL` | Block polling interval in seconds (HTTP mode only) | `10` |
+| `BLOCK_OFFSET_FROM_HEAD` | Number of blocks to stay behind chain head for confirmation safety | `20` |
 | `EXISTENTIAL_DEPOSIT` | Amount in wei to fund new addresses with | `10000000000000000` (0.01 ETH) |
 
 ### Example `.env` File
@@ -133,6 +134,9 @@ PORT=3000
 
 # Polling interval in seconds (for monitoring new blocks)
 POLL_INTERVAL=10
+
+# Block Offset from Head (number of blocks behind current head for confirmation safety)
+BLOCK_OFFSET_FROM_HEAD=20
 ```
 
 ## Usage

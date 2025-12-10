@@ -34,6 +34,7 @@ async fn test_e2e_deposit_sweep_flow() {
         faucet_mnemonic: "test test test test test test test test test test test junk".to_string(),
         existential_deposit: "10000000000000000".to_string(),
         faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
+        block_offset_from_head: 20,
     };
 
     let wallet = Wallet::new(config.mnemonic.clone());

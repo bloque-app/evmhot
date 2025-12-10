@@ -24,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("🚰 Faucet Address: {}", config.faucet_address);
     tracing::info!("⚡ Existential Deposit: {} wei", config.existential_deposit);
     tracing::info!("🔄 Poll Interval: {} seconds", config.poll_interval);
+    tracing::info!("📦 Block Offset from Head: {} blocks", config.block_offset_from_head);
     tracing::info!("🌐 API Port: {}", config.port);
 
     let port = config.port;

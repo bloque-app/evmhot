@@ -24,7 +24,7 @@ where
     }
 
     async fn catch_up(&self) -> Result<()> {
-        let current_block = self.provider.get_block_number().await? - 20;
+        let current_block = self.provider.get_block_number().await? - self.config.block_offset_from_head;
         let last_processed = self.db.get_last_processed_block()?;
         
 
