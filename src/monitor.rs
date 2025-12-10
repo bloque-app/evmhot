@@ -64,10 +64,6 @@ where
                         let to_address_str = to.to_string();
                         let from_address_str = tx.from.to_string();
 
-                        info!("To address: {:?}", to_address_str);
-                        info!("From address: {:?}", from_address_str);
-                        info!("Value: {:?}", tx.value.to_string());
-
                         // Skip deposits from the faucet address
                         if from_address_str.eq_ignore_ascii_case(&self.config.faucet_address) {
                             info!(
@@ -163,6 +159,8 @@ where
                     } else {
                         alloy::primitives::U256::ZERO
                     };
+
+                    // log::info("Detected ERC20 deposit: Token: {}, To: {}, From: {}, Amount: {}", token_address, to_address_str, from_address_str, log.data().data);
 
                     // Fetch token metadata (symbol, decimals, name)
                     let token_info = self.get_or_fetch_token_metadata(token_address).await?;
