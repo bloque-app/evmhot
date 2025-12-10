@@ -26,27 +26,30 @@ where
     async fn catch_up(&self) -> Result<()> {
         let current_block = self.provider.get_block_number().await?;
         let last_processed = self.db.get_last_processed_block()?;
+        
 
         let start_block = if last_processed == 0 {
             current_block // Start from now if fresh
         } else {
-            last_processed + 1
+            last_processed
         };
+
+        info!("--------------------------------");
+        info!("Start block: {}", start_block);
+        info!("Current block: {}", current_block);
+        info!("Last processed block: {}", last_processed);
 
         if start_block > current_block {
             return Ok(());
         }
 
-        // Get the latest block again to ensure we don't process blocks that aren't available yet
-        let latest_block = self.provider.get_block_number().await?;
-        
-        info!("Latest block: {}", latest_block);
-
         // Process max 10 blocks at a time to avoid rate limits
         // Ensure we don't exceed the latest confirmed block
-        let end_block = std::cmp::min(start_block + 10, latest_block);
 
-        for block_num in start_block..=end_block {
+        info!("--------------------------------");
+        info!("Processing blocks from {} to {}", start_block, current_block);
+
+        for block_num in start_block..=current_block {
             self.process_single_block(block_num).await?;
         }
 
@@ -370,6 +373,7 @@ impl Service for Monitor<alloy::providers::RootProvider<Http<Client>>> {
             if let Err(e) = self.catch_up().await {
                 error!("Error in monitor loop: {:?}", e);
             }
+            info!("Sleeping for {} seconds", self.config.poll_interval);
             sleep(Duration::from_secs(self.config.poll_interval)).await;
         }
     }
