@@ -37,8 +37,12 @@ where
             return Ok(());
         }
 
+        // Get the latest block again to ensure we don't process blocks that aren't available yet
+        let latest_block = self.provider.get_block_number().await?;
+        
         // Process max 10 blocks at a time to avoid rate limits
-        let end_block = std::cmp::min(start_block + 10, current_block);
+        // Ensure we don't exceed the latest confirmed block
+        let end_block = std::cmp::min(start_block + 10, latest_block);
 
         for block_num in start_block..=end_block {
             self.process_single_block(block_num).await?;
