@@ -35,6 +35,7 @@ where
         };
 
         info!("--------------------------------");
+        info!("Offset from head: {}", self.config.block_offset_from_head);
         info!("Start block: {}", start_block);
         info!("Current block: {}", current_block);
         info!("Last processed block: {}", last_processed);
