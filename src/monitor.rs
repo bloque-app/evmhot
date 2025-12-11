@@ -131,6 +131,8 @@ where
     async fn process_erc20_transfers(&self, block_num: u64) -> Result<()> {
         use alloy::primitives::FixedBytes;
         use alloy::rpc::types::Filter;
+        use std::time::Duration;
+        use tokio::time::sleep;
 
         // ERC20 Transfer event signature: Transfer(address,address,uint256)
         let transfer_signature: FixedBytes<32> =
@@ -143,7 +145,34 @@ where
 
         info!("Filter: {:?}", filter);
 
-        let logs = self.provider.get_logs(&filter).await?;
+        // Retry get_logs up to 5 times with 200ms delay
+        let mut logs = Vec::new();
+        let max_retries = 10;
+        let mut last_error = None;
+        
+        for attempt in 1..=max_retries {
+            match self.provider.get_logs(&filter).await {
+                Ok(result) => {
+                    logs = result;
+                    if attempt > 1 {
+                        info!("get_logs succeeded on attempt {}", attempt);
+                    }
+                    break;
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < max_retries {
+                        warn!("get_logs failed on attempt {}, retrying in 200ms: {:?}", attempt, last_error);
+                        sleep(Duration::from_millis(200)).await;
+                    }
+                }
+            }
+        }
+        
+        // If all retries failed, return the last error
+        if logs.is_empty() && last_error.is_some() {
+            return Err(last_error.unwrap().into());
+        }
 
         info!(
             "Found {} Transfer events in block {}",
