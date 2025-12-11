@@ -287,6 +287,12 @@ where
         // Update DB
         self.db.mark_erc20_deposit_swept(&deposit.key)?;
 
+        // Fetch token decimals from DB
+        let token_decimals = self
+            .db
+            .get_token_metadata(&deposit.token_address)?
+            .map(|(_, decimals, _)| decimals);
+
         // Send Webhook
         self.send_erc20_webhook(
             &deposit.account_id,
@@ -294,6 +300,7 @@ where
             &deposit.amount,
             &deposit.token_symbol,
             &deposit.token_address,
+            token_decimals,
         )
         .await?;
 
@@ -336,6 +343,7 @@ where
         amount: &str,
         token_symbol: &str,
         token_address: &str,
+        token_decimals: Option<u8>,
     ) -> Result<()> {
         // Get the webhook URL for this account
         let webhook_url = match self.db.get_webhook_url(account_id)? {
@@ -347,7 +355,7 @@ where
         };
 
         let client = reqwest::Client::new();
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "event": "deposit_swept",
             "account_id": account_id,
             "original_tx_hash": deposit_key,
@@ -356,6 +364,11 @@ where
             "token_symbol": token_symbol,
             "token_address": token_address
         });
+
+        // Add decimals if available
+        if let Some(decimals) = token_decimals {
+            payload["token_decimals"] = serde_json::json!(decimals);
+        }
 
         let res = client.post(&webhook_url).json(&payload).send().await;
 

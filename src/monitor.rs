@@ -109,6 +109,7 @@ where
                                         "native",
                                         None,
                                         None,
+                                        None,
                                     )
                                     .await
                                 {
@@ -213,6 +214,7 @@ where
                                     "erc20",
                                     Some(&token_info.symbol),
                                     Some(&token_address.to_string()),
+                                    Some(token_info.decimals),
                                 )
                                 .await
                             {
@@ -309,6 +311,7 @@ where
         token_type: &str,
         token_symbol: Option<&str>,
         token_address: Option<&str>,
+        token_decimals: Option<u8>,
     ) -> Result<()> {
         // Get the webhook URL for this account
         let webhook_url = match self.db.get_webhook_url(account_id)? {
@@ -335,6 +338,9 @@ where
         }
         if let Some(address) = token_address {
             payload["token_address"] = serde_json::json!(address);
+        }
+        if let Some(decimals) = token_decimals {
+            payload["token_decimals"] = serde_json::json!(decimals);
         }
 
         let res = client.post(&webhook_url).json(&payload).send().await;
