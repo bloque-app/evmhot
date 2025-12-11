@@ -131,8 +131,6 @@ where
     async fn process_erc20_transfers(&self, block_num: u64) -> Result<()> {
         use alloy::primitives::FixedBytes;
         use alloy::rpc::types::Filter;
-        use std::time::Duration;
-        use tokio::time::sleep;
 
         // ERC20 Transfer event signature: Transfer(address,address,uint256)
         let transfer_signature: FixedBytes<32> =
@@ -145,34 +143,7 @@ where
 
         info!("Filter: {:?}", filter);
 
-        // Retry get_logs up to 5 times with 200ms delay
-        let mut logs = Vec::new();
-        let max_retries = 10;
-        let mut last_error = None;
-        
-        for attempt in 1..=max_retries {
-            match self.provider.get_logs(&filter).await {
-                Ok(result) => {
-                    logs = result;
-                    if attempt > 1 {
-                        info!("get_logs succeeded on attempt {}", attempt);
-                    }
-                    break;
-                }
-                Err(e) => {
-                    last_error = Some(e);
-                    if attempt < max_retries {
-                        warn!("get_logs failed on attempt {}, retrying in 200ms: {:?}", attempt, last_error);
-                        sleep(Duration::from_millis(200)).await;
-                    }
-                }
-            }
-        }
-        
-        // If all retries failed, return the last error
-        if logs.is_empty() && last_error.is_some() {
-            return Err(last_error.unwrap().into());
-        }
+        let logs = self.get_logs_with_retry(&filter, 10, 200).await?;
 
         info!(
             "Found {} Transfer events in block {}",
@@ -254,6 +225,39 @@ where
         }
 
         Ok(())
+    }
+
+    async fn get_logs_with_retry(
+        &self,
+        filter: &alloy::rpc::types::Filter,
+        max_retries: u32,
+        delay_ms: u64,
+    ) -> Result<Vec<alloy::rpc::types::Log>> {
+        use std::time::Duration;
+        use tokio::time::sleep;
+
+        let mut last_result = Ok(Vec::new());
+
+        for attempt in 1..=max_retries {
+            last_result = self.provider.get_logs(filter).await.map_err(|e| e.into());
+
+            match &last_result {
+                Ok(logs) if !logs.is_empty() => {
+                    if attempt > 1 {
+                        info!("get_logs succeeded with {} logs on attempt {}", logs.len(), attempt);
+                    }
+                    return last_result;
+                }
+                Ok(_) => warn!("get_logs returned empty on attempt {}/{}", attempt, max_retries),
+                Err(e) => warn!("get_logs failed on attempt {}/{}: {:?}", attempt, max_retries, e),
+            }
+
+            if attempt < max_retries {
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+
+        last_result
     }
 
     async fn get_or_fetch_token_metadata(&self, token_address: Address) -> Result<TokenInfo> {
