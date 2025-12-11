@@ -276,6 +276,85 @@ console.log(wallet.address);
 - Addresses need native balance (ETH/MATIC/etc.) to pay for ERC-20 transfer gas
 - Consider increasing `EXISTENTIAL_DEPOSIT` if you expect ERC-20 deposits
 
+## Debugging
+
+### RPC Request/Response Debugging
+
+This project includes comprehensive RPC debugging capabilities to help you troubleshoot blockchain interactions.
+
+#### Quick Start: Enable RPC Debugging
+
+Use the provided helper scripts:
+
+```bash
+# Standard debugging (recommended for most cases)
+./run-debug.sh
+
+# Maximum verbosity (shows full request/response bodies)
+./run-debug-verbose.sh
+
+# Run the debugging example
+RUST_LOG=alloy=debug cargo run --example rpc_debug_example
+```
+
+#### Manual Debugging with RUST_LOG
+
+Set the `RUST_LOG` environment variable to control logging verbosity:
+
+```bash
+# See all RPC calls with detailed timing
+RUST_LOG=alloy_transport_http=debug,alloy_rpc_client=debug cargo run
+
+# Maximum verbosity (includes request/response bodies)
+RUST_LOG=alloy=trace cargo run
+
+# Debug specific components
+RUST_LOG=evm_hot_wallet::monitor=debug,alloy=debug cargo run
+```
+
+#### What You'll See
+
+When RPC debugging is enabled, you'll see output like:
+
+```
+[DEBUG alloy_transport_http] sending request: method=eth_getBlockNumber
+[TRACE alloy_transport_http] request body: {"jsonrpc":"2.0","method":"eth_getBlockNumber","params":[],"id":1}
+[TRACE alloy_transport_http] response body: {"jsonrlog_rpc_call":"2.0","id":1,"result":"0x1234567"}
+[DEBUG alloy_transport_http] received response: status=200 duration=45ms
+```
+
+#### Log Levels
+
+- `error` - Only errors
+- `warn` - Warnings and errors
+- `info` - General information (default)
+- `debug` - Detailed debugging information, RPC method names and timing
+- `trace` - Maximum verbosity (includes full request/response JSON bodies)
+
+#### Common Debugging Scenarios
+
+**Debug block monitoring issues:**
+```bash
+RUST_LOG=evm_hot_wallet::monitor=debug,alloy_provider=debug cargo run
+```
+
+**Debug transaction issues:**
+```bash
+RUST_LOG=evm_hot_wallet::sweeper=debug,alloy_transport_http=trace cargo run
+```
+
+**Debug token transfer detection:**
+```bash
+RUST_LOG=evm_hot_wallet::monitor=debug,alloy_rpc_client=debug cargo run
+```
+
+**Save logs to a file:**
+```bash
+RUST_LOG=alloy=debug cargo run 2>&1 | tee debug.log
+```
+
+For more detailed information, see [DEBUG_RPC.md](./DEBUG_RPC.md).
+
 ## Development
 
 ### Running Tests

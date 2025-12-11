@@ -4,7 +4,21 @@ mod api;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // Enhanced logging configuration with support for RUST_LOG environment variable
+    // Examples:
+    //   RUST_LOG=debug                                  - all debug logs
+    //   RUST_LOG=alloy=debug                           - alloy debug logs
+    //   RUST_LOG=evm_hot_wallet=info,alloy=debug       - app info, alloy debug
+    //   RUST_LOG=evm_hot_wallet::rpc_debug=info        - RPC request/response logs
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+    tracing_subscriber::registry()
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "evm_hot_wallet=info,alloy=trace".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
     let config = Config::from_env()?;
 

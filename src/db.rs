@@ -101,17 +101,21 @@ impl Db {
         Ok(result.map(|v| v.value().2.to_string()))
     }
 
-    pub fn record_deposit(&self, tx_hash: &str, account_id: &str, amount: &str) -> Result<()> {
+    /// Record a deposit and return true if it was newly recorded, false if it was a duplicate
+    pub fn record_deposit(&self, tx_hash: &str, account_id: &str, amount: &str) -> Result<bool> {
         let write_txn = self.db.begin_write()?;
-        {
+        let is_new = {
             let mut deposits = write_txn.open_table(DEPOSITS)?;
-            // Check if exists to avoid overwrite if that matters, but here we just insert
+            // Check if exists to avoid overwrite and duplicates
             if deposits.get(tx_hash)?.is_none() {
                 deposits.insert(tx_hash, (account_id, amount, "detected"))?;
+                true
+            } else {
+                false
             }
-        }
+        };
         write_txn.commit()?;
-        Ok(())
+        Ok(is_new)
     }
 
     pub fn mark_deposit_swept(&self, tx_hash: &str) -> Result<()> {
@@ -199,6 +203,7 @@ impl Db {
 
     // ========== ERC20 Deposits ==========
 
+    /// Record an ERC20 deposit and return true if it was newly recorded, false if it was a duplicate
     pub fn record_erc20_deposit(
         &self,
         tx_hash: &str,
@@ -207,9 +212,9 @@ impl Db {
         amount: &str,
         token_address: &str,
         token_symbol: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let write_txn = self.db.begin_write()?;
-        {
+        let is_new = {
             let mut deposits = write_txn.open_table(ERC20_DEPOSITS)?;
             let key = format!("{}:{}", tx_hash, log_index);
             if deposits.get(key.as_str())?.is_none() {
@@ -217,10 +222,13 @@ impl Db {
                     key.as_str(),
                     (account_id, amount, token_address, token_symbol, "detected"),
                 )?;
+                true
+            } else {
+                false
             }
-        }
+        };
         write_txn.commit()?;
-        Ok(())
+        Ok(is_new)
     }
 
     pub fn get_detected_erc20_deposits(&self) -> Result<Vec<Erc20Deposit>> {

@@ -34,7 +34,7 @@ async fn test_e2e_deposit_sweep_flow() {
         faucet_mnemonic: "test test test test test test test test test test test junk".to_string(),
         existential_deposit: "10000000000000000".to_string(),
         faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
-        block_offset_from_head: 20,
+        block_offset_from_head: 0, // Use 0 for tests to avoid underflow with low block numbers
     };
 
     let wallet = Wallet::new(config.mnemonic.clone());
@@ -220,7 +220,8 @@ async fn test_e2e_deposit_sweep_flow() {
         .mount(&rpc_server)
         .await;
 
-    // Webhook Expectation (2 calls: 1 deposit_detected + 1 deposit_swept)
+    // Webhook Expectation (exactly 2 calls: 1 deposit_detected + 1 deposit_swept)
+    // Now that we have duplicate detection, we should only get exactly 2 webhook calls
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200))
         .expect(2)
