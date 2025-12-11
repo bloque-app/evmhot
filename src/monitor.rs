@@ -143,7 +143,7 @@ where
 
         info!("Filter: {:?}", filter);
 
-        let logs = self.get_logs_with_retry(&filter, 10, 200).await?;
+        let logs = self.get_logs_with_retry(&filter, 30, 50).await?;
 
         info!(
             "Found {} Transfer events in block {}",
