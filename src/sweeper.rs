@@ -95,6 +95,7 @@ where
         let erc20_deposits = self.db.get_detected_erc20_deposits()?;
 
         for deposit in erc20_deposits {
+
             info!(
                 "Processing ERC20 deposit: key={}, token={} ({}), account={}, amount={}",
                 deposit.key,
@@ -103,6 +104,12 @@ where
                 deposit.account_id,
                 deposit.amount
             );
+
+            if deposit.token_symbol == "UNKNOWN" {
+                error!("Skipping ERC20 deposit token symbol for deposit: {}", deposit.key);
+                self.db.mark_erc20_deposit_swept(&deposit.key)?;
+                continue;
+            }
 
             // Get account details to derive key
             let (derivation_index, address_str, _webhook_url) = self
