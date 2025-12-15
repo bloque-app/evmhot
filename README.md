@@ -182,7 +182,13 @@ Response:
 
 ### Webhook Notifications
 
-The service sends webhook notifications to the per-account `webhook_url` for two types of events:
+The service sends webhook notifications to the per-account `webhook_url` for deposit events. Each webhook includes a unique `id` field for idempotency and deduplication.
+
+#### Unique Identifier (`id` field)
+- **Native ETH deposits**: `id` = transaction hash (e.g., `"0xabc123..."`)
+- **ERC20 deposits**: `id` = transaction hash + log index (e.g., `"0xabc123...:0"`)
+
+This ensures unique identification even when multiple ERC20 transfers occur in the same transaction.
 
 #### 1. Deposit Detection
 When a deposit is first detected on the blockchain, a POST request is sent to the account's webhook URL:
@@ -190,9 +196,10 @@ When a deposit is first detected on the blockchain, a POST request is sent to th
 **Native ETH Deposit Detected:**
 ```json
 {
+  "id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
   "event": "deposit_detected",
   "account_id": "user_123",
-  "tx_hash": "0xabc...",
+  "tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
   "amount": "1000000000000000000",
   "token_type": "native"
 }
@@ -201,14 +208,23 @@ When a deposit is first detected on the blockchain, a POST request is sent to th
 **ERC-20 Token Deposit Detected:**
 ```json
 {
+  "id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef:0",
   "event": "deposit_detected",
   "account_id": "user_123",
-  "tx_hash": "0xdef123",
-  "amount": "1000000000000000000",
+  "tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+  "amount": "1000000",
   "token_type": "erc20",
   "token_symbol": "USDC",
-  "token_address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+  "token_address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+  "token_decimals": 6
 }
+```
+
+**Converting ERC-20 amounts to human-readable format:**
+```javascript
+// For USDC with 6 decimals and amount "1000000"
+const humanReadable = amount / Math.pow(10, token_decimals);
+// Result: 1.0 USDC
 ```
 
 #### 2. Deposit Swept
@@ -217,9 +233,10 @@ When a deposit is successfully swept to the treasury, a POST request is sent to 
 **Native ETH Deposit Swept:**
 ```json
 {
+  "id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
   "event": "deposit_swept",
   "account_id": "user_123",
-  "original_tx_hash": "0xabc...",
+  "original_tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
   "amount": "1000000000000000000",
   "token_type": "native"
 }
@@ -228,15 +245,83 @@ When a deposit is successfully swept to the treasury, a POST request is sent to 
 **ERC-20 Token Deposit Swept:**
 ```json
 {
+  "id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef:0",
   "event": "deposit_swept",
   "account_id": "user_123",
-  "original_tx_hash": "0xdef123:0",
-  "amount": "1000000000000000000",
+  "original_tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef:0",
+  "amount": "1000000",
   "token_type": "erc20",
   "token_symbol": "USDC",
-  "token_address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+  "token_address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+  "token_decimals": 6
 }
 ```
+
+#### 3. Faucet Funding
+When a newly registered address is funded with an existential deposit:
+
+**Faucet Funding Success:**
+```json
+{
+  "event": "faucet_funding",
+  "account_id": "user_123",
+  "address": "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb",
+  "success": true,
+  "tx_hash": "0xabc..."
+}
+```
+
+**Faucet Funding Failure:**
+```json
+{
+  "event": "faucet_funding",
+  "account_id": "user_123",
+  "address": "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb",
+  "success": false,
+  "error": "Insufficient faucet balance"
+}
+```
+
+#### Webhook Best Practices
+
+1. **Idempotency**: Use the `id` field as an idempotency key to prevent duplicate processing
+2. **Deduplication**: Store processed webhook IDs to avoid reprocessing the same event
+3. **Validation**: Verify `account_id` belongs to your system
+4. **Acknowledgment**: Return HTTP 2xx status code to confirm receipt
+5. **Async Processing**: Process webhooks asynchronously to avoid timeouts
+
+**Example Webhook Handler (Node.js/Express):**
+```javascript
+app.post('/webhook', async (req, res) => {
+  const { id, event, account_id, token_type } = req.body;
+  
+  // Check for duplicate using id as idempotency key
+  const exists = await db.findWebhookById(id);
+  if (exists) {
+    console.log(`Duplicate webhook ignored: ${id}`);
+    return res.status(200).send('OK');
+  }
+  
+  // Store and process webhook
+  await db.storeWebhook({ id, ...req.body });
+  
+  switch (event) {
+    case 'deposit_detected':
+      await handleDepositDetected(req.body);
+      break;
+    case 'deposit_swept':
+      await handleDepositSwept(req.body);
+      break;
+    case 'faucet_funding':
+      await handleFaucetFunding(req.body);
+      break;
+  }
+  
+  res.status(200).send('OK');
+});
+```
+
+For complete webhook specifications, see [WEBHOOK_SPEC.md](./WEBHOOK_SPEC.md).
 
 ## Troubleshooting
 
@@ -465,9 +550,10 @@ See [`Cargo.toml`](./Cargo.toml) for the complete list.
 
 ### ERC-20 Token Support
 - Monitor detects ERC-20 `Transfer` events to registered addresses
-- Fetches and caches token metadata (symbol, decimals, name)
+- Automatically fetches and caches token metadata (symbol, decimals, name)
+- Webhooks include `token_decimals` for easy amount conversion
 - Sweeper transfers ERC-20 tokens using the native balance for gas
-- Separate webhook notifications for ERC-20 sweeps with token details
+- Unique identification with `tx_hash:log_index` format for multiple transfers in same transaction
 
 ## Docker Deployment
 
@@ -583,6 +669,10 @@ Note: You may need to implement a `/health` endpoint in the API if it doesn't ex
 - [x] Smart filtering to prevent sweeping existential deposits
 - [x] Docker deployment
 - [x] Per-account webhook URLs
+- [x] Unique webhook identifiers (`id` field)
+- [x] Token decimals in ERC-20 webhooks
+- [x] Automatic token metadata caching
+- [ ] Webhook signature verification (HMAC)
 - [ ] Configurable gas price strategies
 - [ ] Multi-chain support
 - [ ] Admin dashboard
