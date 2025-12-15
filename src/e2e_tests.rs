@@ -35,6 +35,8 @@ async fn test_e2e_deposit_sweep_flow() {
         existential_deposit: "10000000000000000".to_string(),
         faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
         block_offset_from_head: 0, // Use 0 for tests to avoid underflow with low block numbers
+        get_logs_max_retries: 30,
+        get_logs_delay_ms: 50,
     };
 
     let wallet = Wallet::new(config.mnemonic.clone());

@@ -20,6 +20,8 @@ pub struct Config {
     pub existential_deposit: String,
     pub faucet_address: String,
     pub block_offset_from_head: u64,
+    pub get_logs_max_retries: u32,
+    pub get_logs_delay_ms: u64,
 }
 
 impl Config {
@@ -52,6 +54,12 @@ impl Config {
         let block_offset_from_head = env::var("BLOCK_OFFSET_FROM_HEAD")
             .unwrap_or_else(|_| "20".to_string())
             .parse()?;
+        let get_logs_max_retries = env::var("GET_LOGS_MAX_RETRIES")
+            .unwrap_or_else(|_| "30".to_string())
+            .parse()?;
+        let get_logs_delay_ms = env::var("GET_LOGS_DELAY_MS")
+            .unwrap_or_else(|_| "50".to_string())
+            .parse()?;
 
         Ok(Self {
             database_url,
@@ -64,6 +72,8 @@ impl Config {
             existential_deposit,
             faucet_address,
             block_offset_from_head,
+            get_logs_max_retries,
+            get_logs_delay_ms,
         })
     }
 }

@@ -160,7 +160,13 @@ where
 
         info!("Filter: {:?}", filter);
 
-        let logs = self.get_logs_with_retry(&filter, 30, 50).await?;
+        let logs = self
+            .get_logs_with_retry(
+                &filter,
+                self.config.get_logs_max_retries,
+                self.config.get_logs_delay_ms,
+            )
+            .await?;
 
         info!(
             "Found {} Transfer events in block {}",
