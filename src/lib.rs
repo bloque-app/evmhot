@@ -39,6 +39,63 @@ pub struct RegisterResponse {
     pub funding_tx: Option<String>,
 }
 
+/// Request structure for verifying a transfer
+#[derive(Deserialize, Clone, Debug)]
+pub struct VerifyTransferRequest {
+    /// Transaction hash to verify
+    pub tx_hash: String,
+    /// Expected recipient address
+    pub to_address: String,
+    /// Expected amount (as string to handle large numbers)
+    pub amount: String,
+    /// Token type: "native" for ETH/native currency, or "erc20" for ERC20 tokens
+    /// Defaults to "native" if not specified
+    #[serde(default = "default_token_type")]
+    pub token_type: String,
+    /// Token contract address (required for ERC20)
+    #[serde(default)]
+    pub token_address: Option<String>,
+    /// Token symbol (optional, for additional validation with ERC20)
+    #[serde(default)]
+    pub token_symbol: Option<String>,
+}
+
+fn default_token_type() -> String {
+    "native".to_string()
+}
+
+/// Response structure for transfer verification
+#[derive(Serialize, Clone, Debug)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum VerifyTransferResponse {
+    /// Transfer was successfully verified
+    Success {
+        /// Actual recipient address found in the transaction
+        actual_to: String,
+        /// Actual amount found in the transaction
+        actual_amount: String,
+        /// Token type ("native" or "erc20")
+        token_type: String,
+        /// Token symbol (for ERC20)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_symbol: Option<String>,
+        /// Block number where the transaction was included
+        #[serde(skip_serializing_if = "Option::is_none")]
+        block_number: Option<u64>,
+    },
+    /// Transfer verification failed
+    Error {
+        /// Error message describing why verification failed
+        message: String,
+        /// Token type ("native" or "erc20") if known
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_type: Option<String>,
+        /// Block number where the transaction was included (if found)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        block_number: Option<u64>,
+    },
+}
+
 /// Core Hot Wallet Service that manages background tasks and provides account registration
 pub struct HotWalletService<T>
 where
@@ -48,6 +105,7 @@ where
     db: Db,
     wallet: Wallet,
     faucet: Arc<Faucet<alloy::providers::RootProvider<T>>>,
+    provider: alloy::providers::RootProvider<T>,
 }
 
 impl<T> HotWalletService<T>
@@ -67,6 +125,249 @@ where
     /// Health check method - returns Ok if service is healthy
     pub async fn health(&self) -> anyhow::Result<String> {
         Ok("OK".to_string())
+    }
+
+    /// Verify if a transaction contains a transfer matching the expected criteria
+    pub async fn verify_transfer(
+        &self,
+        request: VerifyTransferRequest,
+    ) -> anyhow::Result<VerifyTransferResponse> {
+        use alloy::primitives::{Address, FixedBytes, U256};
+        use std::str::FromStr;
+        use tracing::info;
+
+        info!("Verifying transfer: {:?}", request);
+
+        // Parse the transaction hash
+        let tx_hash: FixedBytes<32> = request
+            .tx_hash
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid transaction hash format"))?;
+
+        // Parse expected values
+        let expected_to = Address::from_str(&request.to_address)
+            .map_err(|_| anyhow::anyhow!("Invalid to_address format"))?;
+        let expected_amount = U256::from_str(&request.amount)
+            .map_err(|_| anyhow::anyhow!("Invalid amount format"))?;
+
+        // Determine if this is a native or ERC20 transfer based on token_type
+        let is_native = request.token_type.to_lowercase() == "native";
+
+        if is_native {
+            // Verify native ETH transfer
+            self.verify_native_transfer(tx_hash, expected_to, expected_amount)
+                .await
+        } else {
+            // Verify ERC20 transfer - token_address is required
+            let token_address_str = request
+                .token_address
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("token_address is required for ERC20 transfers"))?;
+
+            let token_address = Address::from_str(token_address_str)
+                .map_err(|_| anyhow::anyhow!("Invalid token_address format"))?;
+
+            self.verify_erc20_transfer(
+                tx_hash,
+                expected_to,
+                expected_amount,
+                token_address,
+                request.token_symbol.as_deref(),
+            )
+            .await
+        }
+    }
+
+    async fn verify_native_transfer(
+        &self,
+        tx_hash: alloy::primitives::FixedBytes<32>,
+        expected_to: alloy::primitives::Address,
+        expected_amount: alloy::primitives::U256,
+    ) -> anyhow::Result<VerifyTransferResponse> {
+        use alloy::providers::Provider;
+        use tracing::info;
+
+        // Fetch the transaction
+        let tx = self
+            .provider
+            .get_transaction_by_hash(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Transaction not found"))?;
+
+        info!("Found transaction: {:?}", tx.hash);
+
+        // Get block number from transaction receipt for confirmation
+        let receipt = self.provider.get_transaction_receipt(tx_hash).await?;
+        let block_number = receipt.as_ref().and_then(|r| r.block_number);
+
+        // Check if transaction was successful
+        if let Some(ref r) = receipt {
+            if !r.status() {
+                return Ok(VerifyTransferResponse::Error {
+                    message: "Transaction failed (reverted)".to_string(),
+                    token_type: Some("native".to_string()),
+                    block_number,
+                });
+            }
+        }
+
+        // For native transfers, check the `to` field and `value` field
+        let actual_to = tx.to;
+        let actual_amount = tx.value;
+
+        let to_matches = actual_to
+            .map(|to| {
+                to.to_string()
+                    .eq_ignore_ascii_case(&expected_to.to_string())
+            })
+            .unwrap_or(false);
+        let amount_matches = actual_amount >= expected_amount;
+
+        if to_matches && amount_matches {
+            Ok(VerifyTransferResponse::Success {
+                actual_to: actual_to.map(|a| a.to_string()).unwrap_or_default(),
+                actual_amount: actual_amount.to_string(),
+                token_type: "native".to_string(),
+                token_symbol: None,
+                block_number,
+            })
+        } else {
+            Ok(VerifyTransferResponse::Error {
+                message: format!(
+                    "Mismatch: to_matches={}, amount_matches={} (expected >= {})",
+                    to_matches, amount_matches, expected_amount
+                ),
+                token_type: Some("native".to_string()),
+                block_number,
+            })
+        }
+    }
+
+    async fn verify_erc20_transfer(
+        &self,
+        tx_hash: alloy::primitives::FixedBytes<32>,
+        expected_to: alloy::primitives::Address,
+        expected_amount: alloy::primitives::U256,
+        token_address: alloy::primitives::Address,
+        expected_symbol: Option<&str>,
+    ) -> anyhow::Result<VerifyTransferResponse> {
+        use alloy::primitives::{Address, FixedBytes, U256};
+        use alloy::providers::Provider;
+        use tracing::info;
+
+        // Fetch the transaction receipt to get logs
+        let receipt = self
+            .provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Transaction receipt not found"))?;
+
+        let block_number = receipt.block_number;
+
+        // Check if transaction was successful
+        if !receipt.status() {
+            return Ok(VerifyTransferResponse::Error {
+                message: "Transaction failed (reverted)".to_string(),
+                token_type: Some("erc20".to_string()),
+                block_number,
+            });
+        }
+
+        // Fetch token symbol from chain if we need to validate it
+        let actual_symbol = self.fetch_token_symbol(token_address).await.ok();
+
+        // Validate token symbol if provided
+        if let Some(expected) = expected_symbol {
+            if let Some(ref actual) = actual_symbol {
+                if !actual.eq_ignore_ascii_case(expected) {
+                    return Ok(VerifyTransferResponse::Error {
+                        message: format!(
+                            "Token symbol mismatch: expected '{}', got '{}'",
+                            expected, actual
+                        ),
+                        token_type: Some("erc20".to_string()),
+                        block_number,
+                    });
+                }
+            }
+        }
+
+        // ERC20 Transfer event signature: Transfer(address,address,uint256)
+        let transfer_signature: FixedBytes<32> =
+            alloy::primitives::keccak256("Transfer(address,address,uint256)".as_bytes());
+
+        // Look for Transfer events from the specified token
+        for log in receipt.inner.logs() {
+            // Check if this is from the expected token contract
+            if log.address() != token_address {
+                continue;
+            }
+
+            // Check if this is a Transfer event
+            if log.topics().len() < 3 || log.topics()[0] != transfer_signature {
+                continue;
+            }
+
+            // Decode Transfer event: topic[1] = from, topic[2] = to
+            let to_address = Address::from_slice(&log.topics()[2].as_slice()[12..]);
+
+            // Decode amount from data
+            let amount = if !log.data().data.is_empty() {
+                U256::from_be_slice(&log.data().data)
+            } else {
+                U256::ZERO
+            };
+
+            info!(
+                "Found ERC20 Transfer: to={}, amount={}, symbol={:?}",
+                to_address, amount, actual_symbol
+            );
+
+            // Check if this transfer matches our criteria
+            let to_matches = to_address
+                .to_string()
+                .eq_ignore_ascii_case(&expected_to.to_string());
+            let amount_matches = amount >= expected_amount;
+
+            if to_matches && amount_matches {
+                return Ok(VerifyTransferResponse::Success {
+                    actual_to: to_address.to_string(),
+                    actual_amount: amount.to_string(),
+                    token_type: "erc20".to_string(),
+                    token_symbol: actual_symbol,
+                    block_number,
+                });
+            }
+        }
+
+        // No matching transfer found
+        Ok(VerifyTransferResponse::Error {
+            message: format!(
+                "No matching ERC20 Transfer event found to {} with amount >= {}",
+                expected_to, expected_amount
+            ),
+            token_type: Some("erc20".to_string()),
+            block_number,
+        })
+    }
+
+    /// Fetch token symbol from the blockchain
+    async fn fetch_token_symbol(
+        &self,
+        token_address: alloy::primitives::Address,
+    ) -> anyhow::Result<String> {
+        use alloy::sol;
+
+        sol! {
+            #[sol(rpc)]
+            contract IERC20Symbol {
+                function symbol() external view returns (string memory);
+            }
+        }
+
+        let contract = IERC20Symbol::new(token_address, &self.provider);
+        let symbol = contract.symbol().call().await?._0;
+        Ok(symbol)
     }
 
     /// Register a new account with the hot wallet service
@@ -190,7 +491,7 @@ impl HotWalletService<alloy::transports::http::Http<reqwest::Client>> {
         let provider = ProviderBuilder::new().on_http(url.parse()?);
         let faucet = Faucet::new(
             config.faucet_mnemonic.clone(),
-            provider,
+            provider.clone(),
             &config.existential_deposit,
         )?;
 
@@ -199,6 +500,7 @@ impl HotWalletService<alloy::transports::http::Http<reqwest::Client>> {
             db,
             wallet,
             faucet: Arc::new(faucet),
+            provider,
         })
     }
 
@@ -255,7 +557,7 @@ impl HotWalletService<alloy::pubsub::PubSubFrontend> {
         let provider = ProviderBuilder::new().on_ws(WsConnect::new(url)).await?;
         let faucet = Faucet::new(
             config.faucet_mnemonic.clone(),
-            provider,
+            provider.clone(),
             &config.existential_deposit,
         )?;
 
@@ -264,6 +566,7 @@ impl HotWalletService<alloy::pubsub::PubSubFrontend> {
             db,
             wallet,
             faucet: Arc::new(faucet),
+            provider,
         })
     }
 

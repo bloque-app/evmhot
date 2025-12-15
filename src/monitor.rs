@@ -5,6 +5,18 @@ use alloy::rpc::types::BlockNumberOrTag;
 use anyhow::Result;
 use tracing::{error, info, warn};
 
+/// Information about a detected deposit for webhook notification
+struct DepositInfo<'a> {
+    id: &'a str,
+    account_id: &'a str,
+    tx_hash: &'a str,
+    amount: &'a str,
+    token_type: &'a str,
+    token_symbol: Option<&'a str>,
+    token_address: Option<&'a str>,
+    token_decimals: Option<u8>,
+}
+
 pub struct Monitor<P> {
     config: Config,
     db: Db,
@@ -25,11 +37,10 @@ where
 
     async fn catch_up(&self) -> Result<()> {
         let latest_block = self.provider.get_block_number().await?;
-        
+
         // Use saturating_sub to prevent underflow if block_offset_from_head > latest_block
         let current_block = latest_block.saturating_sub(self.config.block_offset_from_head);
         let last_processed = self.db.get_last_processed_block()?;
-        
 
         let start_block = if last_processed == 0 {
             current_block // Start from now if fresh
@@ -51,7 +62,10 @@ where
         // Ensure we don't exceed the latest confirmed block
 
         info!("--------------------------------");
-        info!("Processing blocks from {} to {}", start_block, current_block);
+        info!(
+            "Processing blocks from {} to {}",
+            start_block, current_block
+        );
 
         for block_num in start_block..=current_block {
             self.process_single_block(block_num).await?;
@@ -91,26 +105,29 @@ where
                                 "Native ETH deposit detected! Tx: {:?}, Account: {}",
                                 tx.hash, account_id
                             );
-                            
+
                             // Only send webhook if this is a new deposit (not a duplicate)
+                            let tx_hash_str = tx.hash.to_string();
                             let is_new_deposit = self.db.record_deposit(
-                                &tx.hash.to_string(),
+                                &tx_hash_str,
                                 &account_id,
                                 &tx.value.to_string(),
                             )?;
 
                             // Send webhook notification for deposit detection only if it's new
                             if is_new_deposit {
+                                let deposit_info = DepositInfo {
+                                    id: &tx_hash_str,
+                                    account_id: &account_id,
+                                    tx_hash: &tx_hash_str,
+                                    amount: &tx.value.to_string(),
+                                    token_type: "native",
+                                    token_symbol: None,
+                                    token_address: None,
+                                    token_decimals: None,
+                                };
                                 if let Err(e) = self
-                                    .send_deposit_detected_webhook(
-                                        &account_id,
-                                        &tx.hash.to_string(),
-                                        &tx.value.to_string(),
-                                        "native",
-                                        None,
-                                        None,
-                                        None,
-                                    )
+                                    .send_deposit_detected_webhook(&deposit_info)
                                     .await
                                 {
                                     error!("Failed to send deposit detected webhook: {:?}", e);
@@ -193,10 +210,12 @@ where
                     // Store ERC20 deposit
                     if let Some(tx_hash) = log.transaction_hash {
                         let log_index = log.log_index.unwrap_or(0);
-                        
+                        let tx_hash_str = tx_hash.to_string();
+                        let deposit_id = format!("{}:{}", tx_hash_str, log_index);
+
                         // Only send webhook if this is a new deposit (not a duplicate)
                         let is_new_deposit = self.db.record_erc20_deposit(
-                            &tx_hash.to_string(),
+                            &tx_hash_str,
                             log_index,
                             &account_id,
                             &amount.to_string(),
@@ -206,16 +225,20 @@ where
 
                         // Send webhook notification for ERC20 deposit detection only if it's new
                         if is_new_deposit {
+                            let token_addr_str = token_address.to_string();
+                            let amount_str = amount.to_string();
+                            let deposit_info = DepositInfo {
+                                id: &deposit_id,
+                                account_id: &account_id,
+                                tx_hash: &tx_hash_str,
+                                amount: &amount_str,
+                                token_type: "erc20",
+                                token_symbol: Some(&token_info.symbol),
+                                token_address: Some(&token_addr_str),
+                                token_decimals: Some(token_info.decimals),
+                            };
                             if let Err(e) = self
-                                .send_deposit_detected_webhook(
-                                    &account_id,
-                                    &tx_hash.to_string(),
-                                    &amount.to_string(),
-                                    "erc20",
-                                    Some(&token_info.symbol),
-                                    Some(&token_address.to_string()),
-                                    Some(token_info.decimals),
-                                )
+                                .send_deposit_detected_webhook(&deposit_info)
                                 .await
                             {
                                 error!("Failed to send ERC20 deposit detected webhook: {:?}", e);
@@ -246,12 +269,22 @@ where
             match &last_result {
                 Ok(logs) if !logs.is_empty() => {
                     if attempt > 1 {
-                        info!("get_logs succeeded with {} logs on attempt {}", logs.len(), attempt);
+                        info!(
+                            "get_logs succeeded with {} logs on attempt {}",
+                            logs.len(),
+                            attempt
+                        );
                     }
                     return last_result;
                 }
-                Ok(_) => warn!("get_logs returned empty on attempt {}/{}", attempt, max_retries),
-                Err(e) => warn!("get_logs failed on attempt {}/{}: {:?}", attempt, max_retries, e),
+                Ok(_) => warn!(
+                    "get_logs returned empty on attempt {}/{}",
+                    attempt, max_retries
+                ),
+                Err(e) => warn!(
+                    "get_logs failed on attempt {}/{}: {:?}",
+                    attempt, max_retries, e
+                ),
             }
 
             if attempt < max_retries {
@@ -303,21 +336,12 @@ where
         }
     }
 
-    async fn send_deposit_detected_webhook(
-        &self,
-        account_id: &str,
-        tx_hash: &str,
-        amount: &str,
-        token_type: &str,
-        token_symbol: Option<&str>,
-        token_address: Option<&str>,
-        token_decimals: Option<u8>,
-    ) -> Result<()> {
+    async fn send_deposit_detected_webhook(&self, info: &DepositInfo<'_>) -> Result<()> {
         // Get the webhook URL for this account
-        let webhook_url = match self.db.get_webhook_url(account_id)? {
+        let webhook_url = match self.db.get_webhook_url(info.account_id)? {
             Some(url) => url,
             None => {
-                error!("No webhook URL found for account: {}", account_id);
+                error!("No webhook URL found for account: {}", info.account_id);
                 return Ok(());
             }
         };
@@ -325,21 +349,22 @@ where
         let client = reqwest::Client::new();
 
         let mut payload = serde_json::json!({
+            "id": info.id,
             "event": "deposit_detected",
-            "account_id": account_id,
-            "tx_hash": tx_hash,
-            "amount": amount,
-            "token_type": token_type
+            "account_id": info.account_id,
+            "tx_hash": info.tx_hash,
+            "amount": info.amount,
+            "token_type": info.token_type
         });
 
         // Add ERC20-specific fields if provided
-        if let Some(symbol) = token_symbol {
+        if let Some(symbol) = info.token_symbol {
             payload["token_symbol"] = serde_json::json!(symbol);
         }
-        if let Some(address) = token_address {
+        if let Some(address) = info.token_address {
             payload["token_address"] = serde_json::json!(address);
         }
-        if let Some(decimals) = token_decimals {
+        if let Some(decimals) = info.token_decimals {
             payload["token_decimals"] = serde_json::json!(decimals);
         }
 

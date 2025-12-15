@@ -14,6 +14,17 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info};
 
+/// Information about an ERC20 deposit for webhook notification
+struct Erc20WebhookInfo<'a> {
+    id: &'a str,
+    account_id: &'a str,
+    deposit_key: &'a str,
+    amount: &'a str,
+    token_symbol: &'a str,
+    token_address: &'a str,
+    token_decimals: Option<u8>,
+}
+
 pub struct Sweeper<P> {
     config: Config,
     db: Db,
@@ -95,7 +106,6 @@ where
         let erc20_deposits = self.db.get_detected_erc20_deposits()?;
 
         for deposit in erc20_deposits {
-
             info!(
                 "Processing ERC20 deposit: key={}, token={} ({}), account={}, amount={}",
                 deposit.key,
@@ -106,7 +116,10 @@ where
             );
 
             if deposit.token_symbol == "UNKNOWN" {
-                error!("Skipping ERC20 deposit token symbol for deposit: {}", deposit.key);
+                error!(
+                    "Skipping ERC20 deposit token symbol for deposit: {}",
+                    deposit.key
+                );
                 self.db.mark_erc20_deposit_swept(&deposit.key)?;
                 continue;
             }
@@ -188,8 +201,9 @@ where
         // Update DB
         self.db.mark_deposit_swept(tx_hash)?;
 
-        // Send Webhook
-        self.send_webhook(account_id, tx_hash, amount_str).await?;
+        // Send Webhook (for native deposits, id = tx_hash)
+        self.send_webhook(tx_hash, account_id, tx_hash, amount_str)
+            .await?;
 
         Ok(())
     }
@@ -300,21 +314,28 @@ where
             .get_token_metadata(&deposit.token_address)?
             .map(|(_, decimals, _)| decimals);
 
-        // Send Webhook
-        self.send_erc20_webhook(
-            &deposit.account_id,
-            &deposit.key,
-            &deposit.amount,
-            &deposit.token_symbol,
-            &deposit.token_address,
+        // Send Webhook (for ERC20 deposits, id = deposit.key which is tx_hash:log_index)
+        let webhook_info = Erc20WebhookInfo {
+            id: &deposit.key,
+            account_id: &deposit.account_id,
+            deposit_key: &deposit.key,
+            amount: &deposit.amount,
+            token_symbol: &deposit.token_symbol,
+            token_address: &deposit.token_address,
             token_decimals,
-        )
-        .await?;
+        };
+        self.send_erc20_webhook(&webhook_info).await?;
 
         Ok(())
     }
 
-    async fn send_webhook(&self, account_id: &str, tx_hash: &str, amount: &str) -> Result<()> {
+    async fn send_webhook(
+        &self,
+        id: &str,
+        account_id: &str,
+        tx_hash: &str,
+        amount: &str,
+    ) -> Result<()> {
         // Get the webhook URL for this account
         let webhook_url = match self.db.get_webhook_url(account_id)? {
             Some(url) => url,
@@ -326,6 +347,7 @@ where
 
         let client = reqwest::Client::new();
         let payload = serde_json::json!({
+            "id": id,
             "event": "deposit_swept",
             "account_id": account_id,
             "original_tx_hash": tx_hash,
@@ -343,37 +365,30 @@ where
         Ok(())
     }
 
-    async fn send_erc20_webhook(
-        &self,
-        account_id: &str,
-        deposit_key: &str,
-        amount: &str,
-        token_symbol: &str,
-        token_address: &str,
-        token_decimals: Option<u8>,
-    ) -> Result<()> {
+    async fn send_erc20_webhook(&self, info: &Erc20WebhookInfo<'_>) -> Result<()> {
         // Get the webhook URL for this account
-        let webhook_url = match self.db.get_webhook_url(account_id)? {
+        let webhook_url = match self.db.get_webhook_url(info.account_id)? {
             Some(url) => url,
             None => {
-                error!("No webhook URL found for account: {}", account_id);
+                error!("No webhook URL found for account: {}", info.account_id);
                 return Ok(());
             }
         };
 
         let client = reqwest::Client::new();
         let mut payload = serde_json::json!({
+            "id": info.id,
             "event": "deposit_swept",
-            "account_id": account_id,
-            "original_tx_hash": deposit_key,
-            "amount": amount,
+            "account_id": info.account_id,
+            "original_tx_hash": info.deposit_key,
+            "amount": info.amount,
             "token_type": "erc20",
-            "token_symbol": token_symbol,
-            "token_address": token_address
+            "token_symbol": info.token_symbol,
+            "token_address": info.token_address
         });
 
         // Add decimals if available
-        if let Some(decimals) = token_decimals {
+        if let Some(decimals) = info.token_decimals {
             payload["token_decimals"] = serde_json::json!(decimals);
         }
 

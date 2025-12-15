@@ -6,7 +6,10 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use evm_hot_wallet::{HotWalletService, RegisterRequest, RegisterResponse};
+use evm_hot_wallet::{
+    HotWalletService, RegisterRequest, RegisterResponse, VerifyTransferRequest,
+    VerifyTransferResponse,
+};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -29,6 +32,7 @@ where
     let app = Router::new()
         .route("/health", get(health::<T>))
         .route("/register", post(register::<T>))
+        .route("/verify_transfer", post(verify_transfer::<T>))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
@@ -57,6 +61,22 @@ where
     match state.service.register(payload).await {
         Ok(response) => Ok(Json(response)),
         Err(e) => Err(ApiError::Internal(format!("Failed to register: {}", e))),
+    }
+}
+
+async fn verify_transfer<T>(
+    State(state): State<AppState<T>>,
+    Json(payload): Json<VerifyTransferRequest>,
+) -> Result<Json<VerifyTransferResponse>, ApiError>
+where
+    T: Transport + Clone + Send + Sync + 'static,
+{
+    match state.service.verify_transfer(payload).await {
+        Ok(response) => Ok(Json(response)),
+        Err(e) => Err(ApiError::Internal(format!(
+            "Failed to verify transfer: {}",
+            e
+        ))),
     }
 }
 
