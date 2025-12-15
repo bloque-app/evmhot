@@ -126,9 +126,8 @@ where
                                     token_address: None,
                                     token_decimals: None,
                                 };
-                                if let Err(e) = self
-                                    .send_deposit_detected_webhook(&deposit_info)
-                                    .await
+                                if let Err(e) =
+                                    self.send_deposit_detected_webhook(&deposit_info).await
                                 {
                                     error!("Failed to send deposit detected webhook: {:?}", e);
                                 }
@@ -237,9 +236,7 @@ where
                                 token_address: Some(&token_addr_str),
                                 token_decimals: Some(token_info.decimals),
                             };
-                            if let Err(e) = self
-                                .send_deposit_detected_webhook(&deposit_info)
-                                .await
+                            if let Err(e) = self.send_deposit_detected_webhook(&deposit_info).await
                             {
                                 error!("Failed to send ERC20 deposit detected webhook: {:?}", e);
                             }
