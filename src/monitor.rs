@@ -8,7 +8,8 @@ use tracing::{error, info, warn};
 /// Information about a detected deposit for webhook notification
 struct DepositInfo<'a> {
     id: &'a str,
-    account_id: &'a str,
+    account_id: &'a str,        // Polygon address
+    registration_id: &'a str,   // Original id used when registering
     tx_hash: &'a str,
     amount: &'a str,
     token_type: &'a str,
@@ -100,27 +101,29 @@ where
                             continue;
                         }
 
-                        if let Some(account_id) = self.db.get_account_by_address(&to_address_str)? {
+                        if let Some(registration_id) = self.db.get_registration_id_by_address(&to_address_str)? {
                             info!(
-                                "Native ETH deposit detected! Tx: {:?}, Account: {}",
-                                tx.hash, account_id
+                                "Native ETH deposit detected! Tx: {:?}, Address: {}, Registration ID: {}",
+                                tx.hash, to_address_str, registration_id
                             );
 
                             // Only send webhook if this is a new deposit (not a duplicate)
                             let tx_hash_str = tx.hash.to_string();
                             let is_new_deposit = self.db.record_deposit(
                                 &tx_hash_str,
-                                &account_id,
+                                &registration_id,
                                 &tx.value.to_string(),
                             )?;
 
                             // Send webhook notification for deposit detection only if it's new
                             if is_new_deposit {
+                                let amount_str = tx.value.to_string();
                                 let deposit_info = DepositInfo {
                                     id: &tx_hash_str,
-                                    account_id: &account_id,
+                                    account_id: &to_address_str,
+                                    registration_id: &registration_id,
                                     tx_hash: &tx_hash_str,
-                                    amount: &tx.value.to_string(),
+                                    amount: &amount_str,
                                     token_type: "native",
                                     token_symbol: None,
                                     token_address: None,
@@ -194,7 +197,7 @@ where
                 }
 
                 // Check if this is one of our monitored addresses
-                if let Some(account_id) = self.db.get_account_by_address(&to_address_str)? {
+                if let Some(registration_id) = self.db.get_registration_id_by_address(&to_address_str)? {
                     // Decode the amount from data field
                     let amount = if !log.data().data.is_empty() {
                         alloy::primitives::U256::from_be_slice(&log.data().data)
@@ -208,8 +211,8 @@ where
                     let token_info = self.get_or_fetch_token_metadata(token_address).await?;
 
                     info!(
-                        "ERC20 deposit detected! Token: {} ({}), Amount: {}, Account: {}, Tx: {:?}",
-                        token_info.symbol, token_address, amount, account_id, log.transaction_hash
+                        "ERC20 deposit detected! Token: {} ({}), Amount: {}, Address: {}, Registration ID: {}, Tx: {:?}",
+                        token_info.symbol, token_address, amount, to_address_str, registration_id, log.transaction_hash
                     );
 
                     // Store ERC20 deposit
@@ -222,7 +225,7 @@ where
                         let is_new_deposit = self.db.record_erc20_deposit(
                             &tx_hash_str,
                             log_index,
-                            &account_id,
+                            &registration_id,
                             &amount.to_string(),
                             &token_address.to_string(),
                             &token_info.symbol,
@@ -234,7 +237,8 @@ where
                             let amount_str = amount.to_string();
                             let deposit_info = DepositInfo {
                                 id: &deposit_id,
-                                account_id: &account_id,
+                                account_id: &to_address_str,
+                                registration_id: &registration_id,
                                 tx_hash: &tx_hash_str,
                                 amount: &amount_str,
                                 token_type: "erc20",
@@ -340,13 +344,10 @@ where
     }
 
     async fn send_deposit_detected_webhook(&self, info: &DepositInfo<'_>) -> Result<()> {
-        // Get the webhook URL for this account
-        let webhook_url = match self.db.get_webhook_url(info.account_id)? {
-            Some(url) => url,
-            None => {
-                error!("No webhook URL found for account: {}", info.account_id);
-                return Ok(());
-            }
+        // Get the webhook URL for this account using registration_id
+        let Some(webhook_url) = self.db.get_webhook_url(info.registration_id)? else {
+            error!("No webhook URL found for registration_id: {}", info.registration_id);
+            return Ok(());
         };
 
         let client = reqwest::Client::new();
@@ -355,6 +356,7 @@ where
             "id": info.id,
             "event": "deposit_detected",
             "account_id": info.account_id,
+            "registration_id": info.registration_id,
             "tx_hash": info.tx_hash,
             "amount": info.amount,
             "token_type": info.token_type
@@ -375,9 +377,10 @@ where
 
         match res {
             Ok(r) => info!(
-                "Deposit detected webhook sent to {}: status={}",
+                "Deposit detected webhook sent to {}: status={}, registration_id={}",
                 webhook_url,
-                r.status()
+                r.status(),
+                info.registration_id
             ),
             Err(e) => error!(
                 "Failed to send deposit detected webhook to {}: {:?}",

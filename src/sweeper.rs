@@ -17,7 +17,8 @@ use tracing::{error, info};
 /// Information about an ERC20 deposit for webhook notification
 struct Erc20WebhookInfo<'a> {
     id: &'a str,
-    account_id: &'a str,
+    account_id: &'a str,        // Polygon address
+    registration_id: &'a str,   // Original id used when registering
     deposit_key: &'a str,
     amount: &'a str,
     token_symbol: &'a str,
@@ -72,16 +73,16 @@ where
         // Process native ETH deposits
         let deposits = self.db.get_detected_deposits()?;
 
-        for (tx_hash, account_id, amount_str) in deposits {
+        for (tx_hash, registration_id, amount_str) in deposits {
             info!(
-                "Processing native ETH deposit: tx_hash={}, account={}, amount={}",
-                tx_hash, account_id, amount_str
+                "Processing native ETH deposit: tx_hash={}, registration_id={}, amount={}",
+                tx_hash, registration_id, amount_str
             );
 
-            // Get account details to derive key
+            // Get account details to derive key (registration_id is the key in ACCOUNTS table)
             let (derivation_index, address_str, _webhook_url) = self
                 .db
-                .get_account_by_id(&account_id)?
+                .get_account_by_id(&registration_id)?
                 .ok_or_else(|| anyhow::anyhow!("Account not found"))?;
 
             let signer = self.wallet.get_signer(derivation_index)?;
@@ -96,7 +97,7 @@ where
                 &sweep_provider,
                 &address_str,
                 &tx_hash,
-                &account_id,
+                &registration_id,
                 &amount_str,
             )
             .await?;
@@ -106,12 +107,15 @@ where
         let erc20_deposits = self.db.get_detected_erc20_deposits()?;
 
         for deposit in erc20_deposits {
+            // deposit.account_id is actually the registration_id (original id from registration)
+            let registration_id = &deposit.account_id;
+            
             info!(
-                "Processing ERC20 deposit: key={}, token={} ({}), account={}, amount={}",
+                "Processing ERC20 deposit: key={}, token={} ({}), registration_id={}, amount={}",
                 deposit.key,
                 deposit.token_symbol,
                 deposit.token_address,
-                deposit.account_id,
+                registration_id,
                 deposit.amount
             );
 
@@ -124,10 +128,10 @@ where
                 continue;
             }
 
-            // Get account details to derive key
+            // Get account details to derive key (registration_id is the key in ACCOUNTS table)
             let (derivation_index, address_str, _webhook_url) = self
                 .db
-                .get_account_by_id(&deposit.account_id)?
+                .get_account_by_id(registration_id)?
                 .ok_or_else(|| anyhow::anyhow!("Account not found"))?;
 
             let signer = self.wallet.get_signer(derivation_index)?;
@@ -163,7 +167,7 @@ where
         provider: &SP,
         from_address_str: &str,
         tx_hash: &str,
-        account_id: &str,
+        registration_id: &str,
         amount_str: &str,
     ) -> Result<()>
     where
@@ -202,7 +206,8 @@ where
         self.db.mark_deposit_swept(tx_hash)?;
 
         // Send Webhook (for native deposits, id = tx_hash)
-        self.send_webhook(tx_hash, account_id, tx_hash, amount_str)
+        // account_id = Polygon address, registration_id = original id from registration
+        self.send_webhook(tx_hash, from_address_str, registration_id, tx_hash, amount_str)
             .await?;
 
         Ok(())
@@ -314,10 +319,15 @@ where
             .get_token_metadata(&deposit.token_address)?
             .map(|(_, decimals, _)| decimals);
 
+        // deposit.account_id is actually the registration_id
+        let registration_id = &deposit.account_id;
+
         // Send Webhook (for ERC20 deposits, id = deposit.key which is tx_hash:log_index)
+        // account_id = Polygon address (from_address_str), registration_id = original id from registration
         let webhook_info = Erc20WebhookInfo {
             id: &deposit.key,
-            account_id: &deposit.account_id,
+            account_id: from_address_str,
+            registration_id,
             deposit_key: &deposit.key,
             amount: &deposit.amount,
             token_symbol: &deposit.token_symbol,
@@ -333,16 +343,14 @@ where
         &self,
         id: &str,
         account_id: &str,
+        registration_id: &str,
         tx_hash: &str,
         amount: &str,
     ) -> Result<()> {
-        // Get the webhook URL for this account
-        let webhook_url = match self.db.get_webhook_url(account_id)? {
-            Some(url) => url,
-            None => {
-                error!("No webhook URL found for account: {}", account_id);
-                return Ok(());
-            }
+        // Get the webhook URL using registration_id (the key in ACCOUNTS table)
+        let Some(webhook_url) = self.db.get_webhook_url(registration_id)? else {
+            error!("No webhook URL found for registration_id: {}", registration_id);
+            return Ok(());
         };
 
         let client = reqwest::Client::new();
@@ -350,6 +358,7 @@ where
             "id": id,
             "event": "deposit_swept",
             "account_id": account_id,
+            "registration_id": registration_id,
             "original_tx_hash": tx_hash,
             "amount": amount,
             "token_type": "native"
@@ -358,7 +367,10 @@ where
         let res = client.post(&webhook_url).json(&payload).send().await;
 
         match res {
-            Ok(r) => info!("Webhook sent to {}: status={}", webhook_url, r.status()),
+            Ok(r) => info!(
+                "Webhook sent to {}: status={}, registration_id={}",
+                webhook_url, r.status(), registration_id
+            ),
             Err(e) => error!("Failed to send webhook to {}: {:?}", webhook_url, e),
         }
 
@@ -366,13 +378,10 @@ where
     }
 
     async fn send_erc20_webhook(&self, info: &Erc20WebhookInfo<'_>) -> Result<()> {
-        // Get the webhook URL for this account
-        let webhook_url = match self.db.get_webhook_url(info.account_id)? {
-            Some(url) => url,
-            None => {
-                error!("No webhook URL found for account: {}", info.account_id);
-                return Ok(());
-            }
+        // Get the webhook URL using registration_id (the key in ACCOUNTS table)
+        let Some(webhook_url) = self.db.get_webhook_url(info.registration_id)? else {
+            error!("No webhook URL found for registration_id: {}", info.registration_id);
+            return Ok(());
         };
 
         let client = reqwest::Client::new();
@@ -380,6 +389,7 @@ where
             "id": info.id,
             "event": "deposit_swept",
             "account_id": info.account_id,
+            "registration_id": info.registration_id,
             "original_tx_hash": info.deposit_key,
             "amount": info.amount,
             "token_type": "erc20",
@@ -396,9 +406,10 @@ where
 
         match res {
             Ok(r) => info!(
-                "ERC20 Webhook sent to {}: status={}",
+                "ERC20 Webhook sent to {}: status={}, registration_id={}",
                 webhook_url,
-                r.status()
+                r.status(),
+                info.registration_id
             ),
             Err(e) => error!("Failed to send ERC20 webhook to {}: {:?}", webhook_url, e),
         }

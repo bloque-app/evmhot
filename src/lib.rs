@@ -608,9 +608,11 @@ impl HotWalletService<alloy::pubsub::PubSubFrontend> {
 }
 
 /// Send webhook notification for faucet funding event
+/// registration_id: The original id used when registering the account
+/// address: The Polygon address (account_id in webhook)
 async fn send_faucet_funding_webhook(
     db: &Db,
-    account_id: &str,
+    registration_id: &str,
     address: &str,
     tx_hash: &str,
     success: bool,
@@ -618,22 +620,20 @@ async fn send_faucet_funding_webhook(
 ) -> anyhow::Result<()> {
     use tracing::{error, info};
 
-    // Get the webhook URL for this account
-    let webhook_url = match db.get_webhook_url(account_id)? {
-        Some(url) => url,
-        None => {
-            error!("No webhook URL found for account: {}", account_id);
-            return Ok(());
-        }
+    // Get the webhook URL using registration_id (the key in ACCOUNTS table)
+    let Some(webhook_url) = db.get_webhook_url(registration_id)? else {
+        error!("No webhook URL found for registration_id: {}", registration_id);
+        return Ok(());
     };
 
     let client = reqwest::Client::new();
 
     let mut payload = serde_json::json!({
         "event": "faucet_funding",
-        "account_id": account_id,
-        "address": address,
+        "account_id": address,
+        "registration_id": registration_id,
         "success": success,
+        "id": format!("{}:funding", registration_id)
     });
 
     // Add tx_hash if funding was successful
@@ -650,9 +650,10 @@ async fn send_faucet_funding_webhook(
 
     match res {
         Ok(r) => info!(
-            "Faucet funding webhook sent to {}: status={}",
+            "Faucet funding webhook sent to {}: status={}, registration_id={}",
             webhook_url,
-            r.status()
+            r.status(),
+            registration_id
         ),
         Err(e) => error!(
             "Failed to send faucet funding webhook to {}: {:?}",
