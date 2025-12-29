@@ -127,6 +127,16 @@ where
         Ok("OK".to_string())
     }
 
+    /// Set the last processed block number manually
+    pub fn set_block_number(&self, block_number: u64) -> anyhow::Result<()> {
+        self.db.set_last_processed_block(block_number)
+    }
+
+    /// Get the current last processed block number
+    pub fn get_block_number(&self) -> anyhow::Result<u64> {
+        self.db.get_last_processed_block()
+    }
+
     /// Verify if a transaction contains a transfer matching the expected criteria
     pub async fn verify_transfer(
         &self,

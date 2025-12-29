@@ -10,7 +10,18 @@ use evm_hot_wallet::{
     HotWalletService, RegisterRequest, RegisterResponse, VerifyTransferRequest,
     VerifyTransferResponse,
 };
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+#[derive(Deserialize)]
+pub struct SetBlockNumberRequest {
+    pub block_number: u64,
+}
+
+#[derive(Serialize)]
+pub struct BlockNumberResponse {
+    pub block_number: u64,
+}
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
@@ -33,6 +44,8 @@ where
         .route("/health", get(health::<T>))
         .route("/register", post(register::<T>))
         .route("/verify_transfer", post(verify_transfer::<T>))
+        .route("/block_number", get(get_block_number::<T>))
+        .route("/block_number", post(set_block_number::<T>))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
@@ -78,6 +91,35 @@ where
             e
         ))),
     }
+}
+
+async fn get_block_number<T>(
+    State(state): State<AppState<T>>,
+) -> Result<Json<BlockNumberResponse>, ApiError>
+where
+    T: Transport + Clone + Send + Sync + 'static,
+{
+    let block_number = state
+        .service
+        .get_block_number()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(BlockNumberResponse { block_number }))
+}
+
+async fn set_block_number<T>(
+    State(state): State<AppState<T>>,
+    Json(payload): Json<SetBlockNumberRequest>,
+) -> Result<Json<BlockNumberResponse>, ApiError>
+where
+    T: Transport + Clone + Send + Sync + 'static,
+{
+    state
+        .service
+        .set_block_number(payload.block_number)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(BlockNumberResponse {
+        block_number: payload.block_number,
+    }))
 }
 
 // Error handling for the API
