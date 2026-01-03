@@ -505,7 +505,7 @@ where
             "event": "deposit_swept",
             "account_id": info.account_id,
             "registration_id": info.registration_id,
-            "original_tx_hash": info.deposit_key,
+            "original_tx_hash": info.deposit_key.split(':').nth(0).unwrap(),
             "amount": info.amount,
             "token_type": "erc20",
             "token_symbol": info.token_symbol,
