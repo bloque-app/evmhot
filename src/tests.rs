@@ -1,11 +1,13 @@
 use crate::config::{Config, ProviderUrl};
 use crate::db::Db;
+use crate::faucet::Faucet;
 use crate::monitor::Monitor;
 use crate::sweeper::Sweeper;
 use crate::wallet::Wallet;
 use crate::{HotWalletService, VerifyTransferRequest, VerifyTransferResponse};
 use alloy::providers::ProviderBuilder;
 use serde_json::json;
+use std::sync::Arc;
 use tempfile::NamedTempFile;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -177,8 +179,16 @@ async fn test_sweeper_creation() {
 
     let wallet = Wallet::new(config.mnemonic.clone());
     let provider = ProviderBuilder::new().on_http("http://localhost:8545".parse().unwrap());
+    let faucet = Arc::new(
+        Faucet::new(
+            config.faucet_mnemonic.clone(),
+            provider.clone(),
+            &config.existential_deposit,
+        )
+        .unwrap(),
+    );
 
-    Sweeper::new(config, db, wallet, provider);
+    Sweeper::new(config, db, wallet, provider, faucet);
 }
 
 #[test]

@@ -1,11 +1,13 @@
 use crate::config::{Config, ProviderUrl};
 use crate::db::Db;
+use crate::faucet::Faucet;
 use crate::monitor::Monitor;
 use crate::sweeper::Sweeper;
 use crate::traits::Service;
 use crate::wallet::Wallet;
 use alloy::providers::ProviderBuilder;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 use tokio::time::sleep;
@@ -232,7 +234,15 @@ async fn test_e2e_deposit_sweep_flow() {
 
     // 5. Run Monitor & Sweeper
     let monitor = Monitor::new(config.clone(), db.clone(), provider.clone());
-    let sweeper = Sweeper::new(config.clone(), db.clone(), wallet.clone(), provider.clone());
+    let faucet = Arc::new(
+        Faucet::new(
+            config.faucet_mnemonic.clone(),
+            provider.clone(),
+            &config.existential_deposit,
+        )
+        .unwrap(),
+    );
+    let sweeper = Sweeper::new(config.clone(), db.clone(), wallet.clone(), provider.clone(), faucet);
 
     // Run monitor once (manually or spawn short lived)
     // We can't easily "run once" with the loop, but we can spawn and wait a bit.

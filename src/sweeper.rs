@@ -1,6 +1,7 @@
 use crate::{
     config::Config,
     db::{Db, Erc20Deposit},
+    faucet::Faucet,
     wallet::Wallet,
 };
 use alloy::network::TransactionBuilder;
@@ -10,6 +11,7 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use anyhow::Result;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info};
@@ -31,6 +33,7 @@ pub struct Sweeper<P> {
     db: Db,
     wallet: Wallet,
     provider: P,
+    faucet: Arc<Faucet<P>>,
 }
 
 use crate::traits::Service;
@@ -60,12 +63,14 @@ where
         db: Db,
         wallet: Wallet,
         provider: alloy::providers::RootProvider<T>,
+        faucet: Arc<Faucet<alloy::providers::RootProvider<T>>>,
     ) -> Self {
         Self {
             config,
             db,
             wallet,
             provider,
+            faucet,
         }
     }
 
@@ -93,14 +98,19 @@ where
                 .wallet(wallet)
                 .on_provider(&self.provider);
 
-            self.sweep_deposit(
+            match self.sweep_deposit(
                 &sweep_provider,
                 &address_str,
                 &tx_hash,
                 &registration_id,
                 &amount_str,
             )
-            .await?;
+            .await {
+                Ok(_) => info!("Successfully swept native ETH deposit: {}", tx_hash),
+                Err(e) => {
+                    error!("Failed to sweep native ETH deposit {}: {:?}", tx_hash, e);
+                }
+            }
         }
 
         // Process ERC20 deposits
@@ -177,16 +187,53 @@ where
         let to_address = Address::from_str(&self.config.treasury_address)?;
 
         // Check balance again to be sure (and to calculate gas)
-        let balance = provider.get_balance(from_address).await?;
+        let mut balance = provider.get_balance(from_address).await?;
 
         // Simple gas estimation/reservation (leaving some dust for gas)
         let gas_price = provider.get_gas_price().await?;
         let gas_limit = 21000; // Standard transfer
         let gas_cost = U256::from(gas_limit) * U256::from(gas_price);
 
+        // If balance is too low to cover gas, try to fund via faucet
         if balance <= gas_cost {
-            info!("Balance too low to sweep: {} <= {}", balance, gas_cost);
-            return Ok(());
+            info!(
+                "Balance too low to sweep: {} <= {}. Attempting to fund via faucet...",
+                balance, gas_cost
+            );
+
+            // Fund the address via faucet
+            match self.faucet.fund_new_address(from_address_str).await {
+                Ok(tx_hash) => {
+                    info!(
+                        "Successfully funded address {} via faucet with tx: {}. Waiting for balance update...",
+                        from_address_str, tx_hash
+                    );
+                    
+                    // Wait a bit for the transaction to be processed and balance to update
+                    sleep(Duration::from_secs(2)).await;
+                    
+                    // Re-check the balance after funding
+                    balance = provider.get_balance(from_address).await?;
+                    info!(
+                        "Updated balance after faucet funding: {} wei for address {}",
+                        balance, from_address_str
+                    );
+
+                    // Final check - if still not enough, return error
+                    if balance <= gas_cost {
+                        return Err(anyhow::anyhow!(
+                            "Still insufficient balance after faucet funding. Address: {}, Balance: {} wei, Gas cost: {} wei",
+                            from_address_str, balance, gas_cost
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to fund address {} via faucet: {}",
+                        from_address_str, e
+                    ));
+                }
+            }
         }
 
         let value_to_send = balance - gas_cost;
@@ -227,40 +274,69 @@ where
         let token_address = Address::from_str(&deposit.token_address)?;
 
         // Check native balance first (need gas for ERC20 transfer)
-        let native_balance = provider.get_balance(from_address).await?;
+        let mut native_balance = provider.get_balance(from_address).await?;
 
         info!(
             "Native balance: {} wei for address {}",
             native_balance, from_address_str
         );
 
-        if native_balance.is_zero() {
-            error!(
-                "Cannot sweep ERC20 tokens from {}: no native balance for gas. Address needs to be funded first.",
-                from_address_str
-            );
-
-            return Err(anyhow::anyhow!(
-                "Insufficient native balance for gas. Address: {}, Balance: 0",
-                from_address_str
-            ));
-        }
-
         // Estimate gas cost
         let gas_price = provider.get_gas_price().await?;
         let gas_limit = 100000u128;
         let estimated_gas_cost = U256::from(gas_limit) * U256::from(gas_price);
 
+        // If insufficient balance for gas, try to fund via faucet
         if native_balance < estimated_gas_cost {
-            error!(
-                "Insufficient native balance for gas. Address: {}, Balance: {} wei, Estimated gas cost: {} wei",
+            info!(
+                "Insufficient native balance for gas. Address: {}, Balance: {} wei, Estimated gas cost: {} wei. Attempting to fund via faucet...",
                 from_address_str, native_balance, estimated_gas_cost
             );
-            return Err(anyhow::anyhow!(
-                "Insufficient native balance for gas. Need at least {} wei, but only have {} wei",
-                estimated_gas_cost,
-                native_balance
-            ));
+
+            // Fund the address via faucet
+            match self.faucet.fund_new_address(from_address_str).await {
+                Ok(tx_hash) => {
+                    info!(
+                        "Successfully funded address {} via faucet with tx: {}. Waiting for balance update...",
+                        from_address_str, tx_hash
+                    );
+                    
+                    // Wait a bit for the transaction to be processed and balance to update
+                    sleep(Duration::from_secs(2)).await;
+                    
+                    // Re-check the balance after funding
+                    native_balance = provider.get_balance(from_address).await?;
+                    info!(
+                        "Updated native balance after faucet funding: {} wei for address {}",
+                        native_balance, from_address_str
+                    );
+
+                    // Final check - if still not enough, error out
+                    if native_balance < estimated_gas_cost {
+                        error!(
+                            "Still insufficient balance after faucet funding. Address: {}, Balance: {} wei, Required: {} wei",
+                            from_address_str, native_balance, estimated_gas_cost
+                        );
+                        return Err(anyhow::anyhow!(
+                            "Insufficient native balance for gas even after faucet funding. Need at least {} wei, but only have {} wei",
+                            estimated_gas_cost,
+                            native_balance
+                        ));
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to fund address {} via faucet: {:?}",
+                        from_address_str, e
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Insufficient native balance for gas and faucet funding failed. Address: {}, Balance: {} wei, Error: {}",
+                        from_address_str,
+                        native_balance,
+                        e
+                    ));
+                }
+            }
         }
 
         info!(

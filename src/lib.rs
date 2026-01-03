@@ -1,7 +1,7 @@
 // Library modules
 pub mod config;
 pub mod db;
-mod faucet;
+pub(crate) mod faucet;
 mod monitor;
 mod sweeper;
 pub mod traits;
@@ -536,15 +536,23 @@ impl HotWalletService<alloy::transports::http::Http<reqwest::Client>> {
             }
         });
 
+        // Create faucet for sweeper
+        let sweeper_faucet = Arc::new(Faucet::new(
+            self.config.faucet_mnemonic.clone(),
+            provider.clone(),
+            &self.config.existential_deposit,
+        )?);
+
         // Spawn Sweeper
         tokio::spawn({
             let config = self.config.clone();
             let db = self.db.clone();
             let wallet = self.wallet.clone();
             let provider = provider.clone();
+            let faucet = sweeper_faucet;
             async move {
                 tracing::info!("Starting Sweeper in Polling mode");
-                Sweeper::new(config, db, wallet, provider).run().await;
+                Sweeper::new(config, db, wallet, provider, faucet).run().await;
             }
         });
 
@@ -601,15 +609,23 @@ impl HotWalletService<alloy::pubsub::PubSubFrontend> {
             }
         });
 
+        // Create faucet for sweeper
+        let sweeper_faucet = Arc::new(Faucet::new(
+            self.config.faucet_mnemonic.clone(),
+            provider.clone(),
+            &self.config.existential_deposit,
+        )?);
+
         // Spawn Sweeper
         tokio::spawn({
             let config = self.config.clone();
             let db = self.db.clone();
             let wallet = self.wallet.clone();
             let provider = provider.clone();
+            let faucet = sweeper_faucet;
             async move {
                 tracing::info!("Starting Sweeper in Streaming mode");
-                Sweeper::new(config, db, wallet, provider).run().await;
+                Sweeper::new(config, db, wallet, provider, faucet).run().await;
             }
         });
 
