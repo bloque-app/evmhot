@@ -425,6 +425,7 @@ where
         let db = self.db.clone();
         let account_id = request.id.clone();
         let address_for_funding = address_str.clone();
+        let webhook_jwt_token = self.config.webhook_jwt_token.clone();
 
         tokio::spawn(async move {
             info!(
@@ -447,6 +448,7 @@ where
                         &tx_hash,
                         true,
                         None,
+                        webhook_jwt_token.as_deref(),
                     )
                     .await
                     {
@@ -467,6 +469,7 @@ where
                         "",
                         false,
                         Some(&e.to_string()),
+                        webhook_jwt_token.as_deref(),
                     )
                     .await
                     {
@@ -636,6 +639,7 @@ impl HotWalletService<alloy::pubsub::PubSubFrontend> {
 /// Send webhook notification for faucet funding event
 /// registration_id: The original id used when registering the account
 /// address: The Polygon address (account_id in webhook)
+/// jwt_token: Optional JWT token for authorization header
 async fn send_faucet_funding_webhook(
     db: &Db,
     registration_id: &str,
@@ -643,6 +647,7 @@ async fn send_faucet_funding_webhook(
     tx_hash: &str,
     success: bool,
     error_message: Option<&str>,
+    jwt_token: Option<&str>,
 ) -> anyhow::Result<()> {
     use tracing::{error, info};
 
@@ -672,7 +677,14 @@ async fn send_faucet_funding_webhook(
         payload["error"] = serde_json::json!(error);
     }
 
-    let res = client.post(&webhook_url).json(&payload).send().await;
+    let mut request = client.post(&webhook_url).json(&payload);
+    
+    // Add JWT authorization header if provided
+    if let Some(token) = jwt_token {
+        request = request.header("Authorization", format!("Bearer {}", token));
+    }
+
+    let res = request.send().await;
 
     match res {
         Ok(r) => info!(
