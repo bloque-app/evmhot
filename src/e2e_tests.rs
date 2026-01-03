@@ -153,6 +153,33 @@ async fn test_e2e_deposit_sweep_flow() {
         .mount(&rpc_server)
         .await;
 
+    // eth_feeHistory (for EIP-1559 fee estimation)
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_feeHistory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "baseFeePerGas": ["0x3B9ACA00", "0x3B9ACA00"], // 1 Gwei
+                "gasUsedRatio": [0.5],
+                "oldestBlock": "0x9",
+                "reward": [["0x3B9ACA00"]] // 1 Gwei priority fee
+            }
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    // eth_maxPriorityFeePerGas (fallback for EIP-1559)
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_maxPriorityFeePerGas"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": "0x3B9ACA00" // 1 Gwei
+        })))
+        .mount(&rpc_server)
+        .await;
+
     // eth_getTransactionCount (Nonce)
     Mock::given(method("POST"))
         .and(body_json_contains("eth_getTransactionCount"))
