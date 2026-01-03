@@ -39,6 +39,7 @@ async fn test_e2e_deposit_sweep_flow() {
         block_offset_from_head: 0, // Use 0 for tests to avoid underflow with low block numbers
         get_logs_max_retries: 30,
         get_logs_delay_ms: 50,
+        webhook_jwt_token: None,
     };
 
     let wallet = Wallet::new(config.mnemonic.clone());

@@ -472,7 +472,14 @@ where
             "token_type": "native"
         });
 
-        let res = client.post(&webhook_url).json(&payload).send().await;
+        let mut request = client.post(&webhook_url).json(&payload);
+        
+        // Add JWT authorization header if configured
+        if let Some(ref token) = self.config.webhook_jwt_token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let res = request.send().await;
 
         match res {
             Ok(r) => info!(
@@ -510,7 +517,14 @@ where
             payload["token_decimals"] = serde_json::json!(decimals);
         }
 
-        let res = client.post(&webhook_url).json(&payload).send().await;
+        let mut request = client.post(&webhook_url).json(&payload);
+        
+        // Add JWT authorization header if configured
+        if let Some(ref token) = self.config.webhook_jwt_token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let res = request.send().await;
 
         match res {
             Ok(r) => info!(

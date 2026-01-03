@@ -43,6 +43,10 @@ async fn main() -> anyhow::Result<()> {
         config.block_offset_from_head
     );
     tracing::info!("🌐 API Port: {}", config.port);
+    tracing::info!(
+        "🔐 Webhook JWT Auth: {}",
+        if config.webhook_jwt_token.is_some() { "Enabled" } else { "Disabled" }
+    );
 
     let port = config.port;
 

@@ -22,6 +22,8 @@ pub struct Config {
     pub block_offset_from_head: u64,
     pub get_logs_max_retries: u32,
     pub get_logs_delay_ms: u64,
+    /// Optional JWT token for webhook authorization
+    pub webhook_jwt_token: Option<String>,
 }
 
 impl Config {
@@ -60,6 +62,7 @@ impl Config {
         let get_logs_delay_ms = env::var("GET_LOGS_DELAY_MS")
             .unwrap_or_else(|_| "50".to_string())
             .parse()?;
+        let webhook_jwt_token = env::var("WEBHOOK_JWT_TOKEN").ok();
 
         Ok(Self {
             database_url,
@@ -74,6 +77,7 @@ impl Config {
             block_offset_from_head,
             get_logs_max_retries,
             get_logs_delay_ms,
+            webhook_jwt_token,
         })
     }
 }
