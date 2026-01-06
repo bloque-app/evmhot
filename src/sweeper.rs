@@ -198,7 +198,7 @@ where
         
         // Calculate gas cost with 50% buffer for price fluctuations
         let gas_cost = U256::from(gas_limit) * U256::from(max_fee_per_gas);
-        let gas_cost_with_buffer = gas_cost + (gas_cost / U256::from(2));
+        let gas_cost_with_buffer = gas_cost + (gas_cost / U256::from(10));
 
         info!(
             "Gas estimation for native ETH transfer: gas_limit={}, max_fee_per_gas={}, gas_cost={} wei (with 50% buffer: {} wei)",
@@ -295,11 +295,14 @@ where
             return Ok(());
         }
 
+        let amount = U256::from_str(&deposit.amount).unwrap_or(token_balance);
+        
         // Build ERC20 transfer call data for gas estimation
         let transfer_call = IERC20::transferCall {
             to: to_address,
-            amount: token_balance,
+            amount,
         };
+
         let call_data = transfer_call.abi_encode();
 
         // Build transaction request for gas estimation
@@ -311,17 +314,16 @@ where
         // Estimate actual gas needed for this specific transaction
         let estimated_gas = provider.estimate_gas(&tx_for_estimate).await?;
         
-        // Add 20% safety buffer for gas limit
-        let gas_limit_with_buffer = estimated_gas + (estimated_gas / 5);
+        let gas_limit_with_buffer = estimated_gas + (estimated_gas / 10);
 
         // Get current fee estimates (EIP-1559 compatible)
         let fee_estimate = provider.estimate_eip1559_fees(None).await?;
         let max_fee_per_gas = fee_estimate.max_fee_per_gas;
         
         // Calculate worst-case gas cost with safety buffer
-        // Add extra 50% buffer on top for gas price fluctuations
+        // Add extra 10% buffer on top for gas price fluctuations
         let estimated_gas_cost = U256::from(gas_limit_with_buffer) * U256::from(max_fee_per_gas);
-        let estimated_gas_cost_with_buffer = estimated_gas_cost + (estimated_gas_cost / U256::from(2));
+        let estimated_gas_cost_with_buffer = estimated_gas_cost + (estimated_gas_cost / U256::from(10));
 
         info!(
             "Gas estimation for ERC20 transfer: gas={}, max_fee_per_gas={}, estimated_cost={} wei (with 50% buffer: {} wei)",
