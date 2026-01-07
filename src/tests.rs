@@ -89,6 +89,7 @@ async fn test_monitor_creation_with_http_provider() {
         faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
         get_logs_max_retries: 30,
         get_logs_delay_ms: 50,
+        webhook_jwt_token: None,
     };
 
     // Create provider and monitor (no actual connection needed for this test)
@@ -175,6 +176,7 @@ async fn test_sweeper_creation() {
         faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
         get_logs_max_retries: 30,
         get_logs_delay_ms: 50,
+        webhook_jwt_token: None,
     };
 
     let wallet = Wallet::new(config.mnemonic.clone());
@@ -331,6 +333,7 @@ async fn test_verify_native_transfer_success() {
         faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
         get_logs_max_retries: 30,
         get_logs_delay_ms: 50,
+        webhook_jwt_token: None,
     };
 
     let to_address = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e";
@@ -446,6 +449,7 @@ async fn test_verify_native_transfer_amount_mismatch() {
         faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
         get_logs_max_retries: 30,
         get_logs_delay_ms: 50,
+        webhook_jwt_token: None,
     };
 
     let to_address = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e";
@@ -553,6 +557,7 @@ async fn test_verify_erc20_transfer_success() {
         faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
         get_logs_max_retries: 30,
         get_logs_delay_ms: 50,
+        webhook_jwt_token: None,
     };
 
     let to_address = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e";
@@ -680,6 +685,7 @@ async fn test_verify_erc20_transfer_symbol_mismatch() {
         faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
         get_logs_max_retries: 30,
         get_logs_delay_ms: 50,
+        webhook_jwt_token: None,
     };
 
     let to_address = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e";
@@ -774,6 +780,7 @@ async fn test_verify_transfer_reverted_transaction() {
         faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
         get_logs_max_retries: 30,
         get_logs_delay_ms: 50,
+        webhook_jwt_token: None,
     };
 
     let to_address = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e";

@@ -76,7 +76,7 @@ impl Db {
         write_txn.commit()?;
         Ok(())
     }
-    
+
     pub fn get_registration_id_by_address(&self, address: &str) -> Result<Option<String>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ADDRESS_TO_ID)?;
