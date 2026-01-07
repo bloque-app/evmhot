@@ -13,10 +13,7 @@ async fn main() -> anyhow::Result<()> {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
     tracing_subscriber::registry()
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "evm_hot_wallet=info,alloy=trace".into()),
-        )
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "evm_hot_wallet=info".into()))
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -45,7 +42,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("🌐 API Port: {}", config.port);
     tracing::info!(
         "🔐 Webhook JWT Auth: {}",
-        if config.webhook_jwt_token.is_some() { "Enabled" } else { "Disabled" }
+        if config.webhook_jwt_token.is_some() {
+            "Enabled"
+        } else {
+            "Disabled"
+        }
     );
 
     let port = config.port;

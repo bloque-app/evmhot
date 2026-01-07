@@ -8,8 +8,8 @@ use tracing::{error, info, warn};
 /// Information about a detected deposit for webhook notification
 struct DepositInfo<'a> {
     id: &'a str,
-    account_id: &'a str,        // Polygon address
-    registration_id: &'a str,   // Original id used when registering
+    account_id: &'a str,      // Polygon address
+    registration_id: &'a str, // Original id used when registering
     tx_hash: &'a str,
     amount: &'a str,
     token_type: &'a str,
@@ -76,7 +76,7 @@ where
     }
 
     async fn process_single_block(&self, block_num: u64) -> Result<()> {
-        info!("Processing block {}", block_num);
+        info!("🔍 Processing block {}", block_num);
 
         if let Some(block) = self
             .provider
@@ -85,8 +85,6 @@ where
         {
             // Process native ETH transfers
             if let Some(txs) = block.transactions.as_transactions() {
-                info!("Transactions: {:?}", txs.len());
-
                 for tx in txs {
                     if let Some(to) = tx.to {
                         let to_address_str = to.to_string();
@@ -101,7 +99,9 @@ where
                             continue;
                         }
 
-                        if let Some(registration_id) = self.db.get_registration_id_by_address(&to_address_str)? {
+                        if let Some(registration_id) =
+                            self.db.get_registration_id_by_address(&to_address_str)?
+                        {
                             info!(
                                 "Native ETH deposit detected! Tx: {:?}, Address: {}, Registration ID: {}",
                                 tx.hash, to_address_str, registration_id
@@ -144,6 +144,7 @@ where
             self.process_erc20_transfers(block_num).await?;
         }
 
+        // info!("Processing D {}", block_num);
         self.db.set_last_processed_block(block_num)?;
         Ok(())
     }
@@ -161,8 +162,6 @@ where
             .to_block(block_num)
             .event_signature(transfer_signature);
 
-        info!("Filter: {:?}", filter);
-
         let logs = self
             .get_logs_with_retry(
                 &filter,
@@ -170,12 +169,6 @@ where
                 self.config.get_logs_delay_ms,
             )
             .await?;
-
-        info!(
-            "Found {} Transfer events in block {}",
-            logs.len(),
-            block_num
-        );
 
         for log in logs {
             // Decode Transfer event: topic[0] = signature, topic[1] = from, topic[2] = to
@@ -197,18 +190,39 @@ where
                 }
 
                 // Check if this is one of our monitored addresses
-                if let Some(registration_id) = self.db.get_registration_id_by_address(&to_address_str)? {
-                    // Decode the amount from data field
-                    let amount = if !log.data().data.is_empty() {
+                if let Some(registration_id) =
+                    self.db.get_registration_id_by_address(&to_address_str)?
+                {
+                    // Decode the amount from data field (ABI-encoded uint256 is 32 bytes)
+                    let amount = if log.data().data.len() >= 32 {
+                        // Standard case: take first 32 bytes (ABI-encoded uint256)
+                        let amount_bytes: [u8; 32] = log.data().data[..32]
+                            .try_into()
+                            .expect("slice length is 32");
+                        alloy::primitives::U256::from_be_bytes(amount_bytes)
+                    } else if !log.data().data.is_empty() {
+                        // Short data (non-standard, but handle gracefully)
                         alloy::primitives::U256::from_be_slice(&log.data().data)
                     } else {
                         alloy::primitives::U256::ZERO
                     };
 
-                    // log::info("Detected ERC20 deposit: Token: {}, To: {}, From: {}, Amount: {}", token_address, to_address_str, from_address_str, log.data().data);
+                    info!(
+                        "Detected ERC20 deposit: Token: {}, To: {}, From: {}, Amount: {}",
+                        token_address, to_address_str, from_address_str, amount
+                    );
 
                     // Fetch token metadata (symbol, decimals, name)
                     let token_info = self.get_or_fetch_token_metadata(token_address).await?;
+
+                    // Skip tokens with symbol longer than 5 characters
+                    if token_info.symbol.len() > 5 {
+                        info!(
+                            "Skipping ERC20 deposit: token symbol '{}' exceeds 5 characters",
+                            token_info.symbol
+                        );
+                        continue;
+                    }
 
                     info!(
                         "ERC20 deposit detected! Token: {} ({}), Amount: {}, Address: {}, Registration ID: {}, Tx: {:?}",
@@ -346,7 +360,10 @@ where
     async fn send_deposit_detected_webhook(&self, info: &DepositInfo<'_>) -> Result<()> {
         // Get the webhook URL for this account using registration_id
         let Some(webhook_url) = self.db.get_webhook_url(info.registration_id)? else {
-            error!("No webhook URL found for registration_id: {}", info.registration_id);
+            error!(
+                "No webhook URL found for registration_id: {}",
+                info.registration_id
+            );
             return Ok(());
         };
 
@@ -374,7 +391,7 @@ where
         }
 
         let mut request = client.post(&webhook_url).json(&payload);
-        
+
         // Add JWT authorization header if configured
         if let Some(ref token) = self.config.webhook_jwt_token {
             request = request.header("Authorization", format!("Bearer {}", token));

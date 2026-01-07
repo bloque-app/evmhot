@@ -19,8 +19,8 @@ use tracing::{error, info};
 /// Information about an ERC20 deposit for webhook notification
 struct Erc20WebhookInfo<'a> {
     id: &'a str,
-    account_id: &'a str,        // Polygon address
-    registration_id: &'a str,   // Original id used when registering
+    account_id: &'a str,      // Polygon address
+    registration_id: &'a str, // Original id used when registering
     deposit_key: &'a str,
     amount: &'a str,
     token_symbol: &'a str,
@@ -98,14 +98,16 @@ where
                 .wallet(wallet)
                 .on_provider(&self.provider);
 
-            match self.sweep_deposit(
-                &sweep_provider,
-                &address_str,
-                &tx_hash,
-                &registration_id,
-                &amount_str,
-            )
-            .await {
+            match self
+                .sweep_deposit(
+                    &sweep_provider,
+                    &address_str,
+                    &tx_hash,
+                    &registration_id,
+                    &amount_str,
+                )
+                .await
+            {
                 Ok(_) => info!("Successfully swept native ETH deposit: {}", tx_hash),
                 Err(e) => {
                     error!("Failed to sweep native ETH deposit {}: {:?}", tx_hash, e);
@@ -119,7 +121,7 @@ where
         for deposit in erc20_deposits {
             // deposit.account_id is actually the registration_id (original id from registration)
             let registration_id = &deposit.account_id;
-            
+
             info!(
                 "Processing ERC20 deposit: key={}, token={} ({}), registration_id={}, amount={}",
                 deposit.key,
@@ -195,7 +197,7 @@ where
         // Get current fee estimates (EIP-1559 compatible)
         let fee_estimate = provider.estimate_eip1559_fees(None).await?;
         let max_fee_per_gas = fee_estimate.max_fee_per_gas;
-        
+
         // Calculate gas cost with 50% buffer for price fluctuations
         let gas_cost = U256::from(gas_limit) * U256::from(max_fee_per_gas);
         let gas_cost_with_buffer = gas_cost + (gas_cost / U256::from(10));
@@ -219,10 +221,10 @@ where
                         "Successfully funded address {} via faucet with tx: {}. Waiting for balance update...",
                         from_address_str, tx_hash
                     );
-                    
+
                     // Wait a bit for the transaction to be processed and balance to update
                     sleep(Duration::from_secs(2)).await;
-                    
+
                     // Re-check the balance after funding
                     balance = provider.get_balance(from_address).await?;
                     info!(
@@ -241,7 +243,8 @@ where
                 Err(e) => {
                     return Err(anyhow::anyhow!(
                         "Failed to fund address {} via faucet: {}",
-                        from_address_str, e
+                        from_address_str,
+                        e
                     ));
                 }
             }
@@ -265,8 +268,14 @@ where
 
         // Send Webhook (for native deposits, id = tx_hash)
         // account_id = Polygon address, registration_id = original id from registration
-        self.send_webhook(tx_hash, from_address_str, registration_id, tx_hash, amount_str)
-            .await?;
+        self.send_webhook(
+            tx_hash,
+            from_address_str,
+            registration_id,
+            tx_hash,
+            amount_str,
+        )
+        .await?;
 
         Ok(())
     }
@@ -287,6 +296,15 @@ where
         // Check token balance first
         let token_balance = get_token_balance(&self.provider, token_address, from_address).await?;
 
+        if deposit.token_symbol.len() > 5 {
+            error!(
+                "Skipping ERC20 deposit token symbol '{}' exceeds 5 characters for deposit: {}",
+                deposit.token_symbol, deposit.key
+            );
+            self.db.mark_erc20_deposit_swept(&deposit.key)?;
+            return Ok(());
+        }
+
         if token_balance.is_zero() {
             info!(
                 "ERC20 balance is zero for {} token at {}, skipping sweep",
@@ -296,7 +314,7 @@ where
         }
 
         let amount = U256::from_str(&deposit.amount).unwrap_or(token_balance);
-        
+
         // Build ERC20 transfer call data for gas estimation
         let transfer_call = IERC20::transferCall {
             to: to_address,
@@ -313,17 +331,18 @@ where
 
         // Estimate actual gas needed for this specific transaction
         let estimated_gas = provider.estimate_gas(&tx_for_estimate).await?;
-        
+
         let gas_limit_with_buffer = estimated_gas + (estimated_gas / 10);
 
         // Get current fee estimates (EIP-1559 compatible)
         let fee_estimate = provider.estimate_eip1559_fees(None).await?;
         let max_fee_per_gas = fee_estimate.max_fee_per_gas;
-        
+
         // Calculate worst-case gas cost with safety buffer
         // Add extra 10% buffer on top for gas price fluctuations
         let estimated_gas_cost = U256::from(gas_limit_with_buffer) * U256::from(max_fee_per_gas);
-        let estimated_gas_cost_with_buffer = estimated_gas_cost + (estimated_gas_cost / U256::from(10));
+        let estimated_gas_cost_with_buffer =
+            estimated_gas_cost + (estimated_gas_cost / U256::from(10));
 
         info!(
             "Gas estimation for ERC20 transfer: gas={}, max_fee_per_gas={}, estimated_cost={} wei (with 50% buffer: {} wei)",
@@ -352,10 +371,10 @@ where
                         "Successfully funded address {} via faucet with tx: {}. Waiting for balance update...",
                         from_address_str, tx_hash
                     );
-                    
+
                     // Wait a bit for the transaction to be processed and balance to update
                     sleep(Duration::from_secs(2)).await;
-                    
+
                     // Re-check the balance after funding
                     native_balance = provider.get_balance(from_address).await?;
                     info!(
@@ -412,16 +431,25 @@ where
             .with_input(call_data)
             .with_gas_limit(gas_limit_with_buffer);
 
-        let pending_tx = provider.send_transaction(tx).await?;
-        let receipt = pending_tx.get_receipt().await?;
+        info!("++++++++++++++++");
+        info!("Transaction request: {:?}", tx);
+        info!("++++++++++++++++");
 
-        info!(
-            "Swept ERC20 tokens! Tx hash: {:?}",
-            receipt.transaction_hash
-        );
+        let pending_tx = provider.send_transaction(tx).await?;
+        info!("++++++++++++++++");
+        info!("Pending transaction: {:?}", pending_tx.tx_hash());
+        info!("++++++++++++++++");
+        let receipt = pending_tx.get_receipt().await?;
+        info!("++++++++++++++++");
+        info!("Receipt: {:?}", receipt.transaction_hash);
+        info!("++++++++++++++++");
 
         // Update DB
         self.db.mark_erc20_deposit_swept(&deposit.key)?;
+
+        info!("++++++++++++++++");
+        info!("Marked ERC20 deposit swept: {:?}", deposit.key);
+        info!("++++++++++++++++");
 
         // Fetch token decimals from DB
         let token_decimals = self
@@ -439,7 +467,7 @@ where
             account_id: from_address_str,
             registration_id,
             deposit_key: &deposit.key,
-            amount: &deposit.amount,
+            amount: &amount.to_string(),
             token_symbol: &deposit.token_symbol,
             token_address: &deposit.token_address,
             token_decimals,
@@ -459,7 +487,10 @@ where
     ) -> Result<()> {
         // Get the webhook URL using registration_id (the key in ACCOUNTS table)
         let Some(webhook_url) = self.db.get_webhook_url(registration_id)? else {
-            error!("No webhook URL found for registration_id: {}", registration_id);
+            error!(
+                "No webhook URL found for registration_id: {}",
+                registration_id
+            );
             return Ok(());
         };
 
@@ -474,8 +505,13 @@ where
             "token_type": "native"
         });
 
+        info!("++++++++++++++++");
+        info!("Webhook URL: {}", webhook_url);
+        info!("Sending webhook: {:?}", payload);
+        info!("++++++++++++++++");
+
         let mut request = client.post(&webhook_url).json(&payload);
-        
+
         // Add JWT authorization header if configured
         if let Some(ref token) = self.config.webhook_jwt_token {
             request = request.header("Authorization", format!("Bearer {}", token));
@@ -486,7 +522,9 @@ where
         match res {
             Ok(r) => info!(
                 "Webhook sent to {}: status={}, registration_id={}",
-                webhook_url, r.status(), registration_id
+                webhook_url,
+                r.status(),
+                registration_id
             ),
             Err(e) => error!("Failed to send webhook to {}: {:?}", webhook_url, e),
         }
@@ -497,7 +535,10 @@ where
     async fn send_erc20_webhook(&self, info: &Erc20WebhookInfo<'_>) -> Result<()> {
         // Get the webhook URL using registration_id (the key in ACCOUNTS table)
         let Some(webhook_url) = self.db.get_webhook_url(info.registration_id)? else {
-            error!("No webhook URL found for registration_id: {}", info.registration_id);
+            error!(
+                "No webhook URL found for registration_id: {}",
+                info.registration_id
+            );
             return Ok(());
         };
 
@@ -514,13 +555,18 @@ where
             "token_address": info.token_address
         });
 
+        info!("++++++++++++++++");
+        info!("Webhook URL: {}", webhook_url);
+        info!("Sending webhook: {:?}", payload);
+        info!("++++++++++++++++");
+
         // Add decimals if available
         if let Some(decimals) = info.token_decimals {
             payload["token_decimals"] = serde_json::json!(decimals);
         }
 
         let mut request = client.post(&webhook_url).json(&payload);
-        
+
         // Add JWT authorization header if configured
         if let Some(ref token) = self.config.webhook_jwt_token {
             request = request.header("Authorization", format!("Bearer {}", token));

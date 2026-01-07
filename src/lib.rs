@@ -555,7 +555,9 @@ impl HotWalletService<alloy::transports::http::Http<reqwest::Client>> {
             let faucet = sweeper_faucet;
             async move {
                 tracing::info!("Starting Sweeper in Polling mode");
-                Sweeper::new(config, db, wallet, provider, faucet).run().await;
+                Sweeper::new(config, db, wallet, provider, faucet)
+                    .run()
+                    .await;
             }
         });
 
@@ -628,7 +630,9 @@ impl HotWalletService<alloy::pubsub::PubSubFrontend> {
             let faucet = sweeper_faucet;
             async move {
                 tracing::info!("Starting Sweeper in Streaming mode");
-                Sweeper::new(config, db, wallet, provider, faucet).run().await;
+                Sweeper::new(config, db, wallet, provider, faucet)
+                    .run()
+                    .await;
             }
         });
 
@@ -653,7 +657,10 @@ async fn send_faucet_funding_webhook(
 
     // Get the webhook URL using registration_id (the key in ACCOUNTS table)
     let Some(webhook_url) = db.get_webhook_url(registration_id)? else {
-        error!("No webhook URL found for registration_id: {}", registration_id);
+        error!(
+            "No webhook URL found for registration_id: {}",
+            registration_id
+        );
         return Ok(());
     };
 
@@ -678,7 +685,7 @@ async fn send_faucet_funding_webhook(
     }
 
     let mut request = client.post(&webhook_url).json(&payload);
-    
+
     // Add JWT authorization header if provided
     if let Some(token) = jwt_token {
         request = request.header("Authorization", format!("Bearer {}", token));

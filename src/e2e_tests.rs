@@ -270,7 +270,13 @@ async fn test_e2e_deposit_sweep_flow() {
         )
         .unwrap(),
     );
-    let sweeper = Sweeper::new(config.clone(), db.clone(), wallet.clone(), provider.clone(), faucet);
+    let sweeper = Sweeper::new(
+        config.clone(),
+        db.clone(),
+        wallet.clone(),
+        provider.clone(),
+        faucet,
+    );
 
     // Run monitor once (manually or spawn short lived)
     // We can't easily "run once" with the loop, but we can spawn and wait a bit.
