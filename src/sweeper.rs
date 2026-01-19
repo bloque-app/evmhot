@@ -310,6 +310,7 @@ where
                 "ERC20 balance is zero for {} token at {}, skipping sweep",
                 deposit.token_symbol, from_address_str
             );
+            self.db.mark_erc20_deposit_swept(&deposit.key)?;
             return Ok(());
         }
 
