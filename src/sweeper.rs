@@ -10,6 +10,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use anyhow::Result;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +27,7 @@ struct Erc20WebhookInfo<'a> {
     token_symbol: &'a str,
     token_address: &'a str,
     token_decimals: Option<u8>,
+    sweep_tx_hash: &'a str, // On-chain tx hash of the sweep (idempotency key for consumers)
 }
 
 pub struct Sweeper<P> {
@@ -53,6 +55,10 @@ where
         }
     }
 }
+
+/// After this many consecutive zero-balance checks, a deposit is assumed to have been
+/// swept as part of a consolidated sweep and is marked as swept to avoid infinite retries.
+const MAX_ZERO_BALANCE_RETRIES: u64 = 10;
 
 impl<T> Sweeper<alloy::providers::RootProvider<T>>
 where
@@ -118,6 +124,12 @@ where
         // Process ERC20 deposits
         let erc20_deposits = self.db.get_detected_erc20_deposits()?;
 
+        // Track (address, token) pairs already swept in this cycle to avoid redundant attempts.
+        // After sweeping the full token_balance for one deposit, all other deposits for the same
+        // address+token are already marked as swept by the bulk mark method. Any remaining ones
+        // would see zero balance and harmlessly skip, but we can avoid the RPC call entirely.
+        let mut swept_pairs: HashSet<(String, String)> = HashSet::new();
+
         for deposit in erc20_deposits {
             // deposit.account_id is actually the registration_id (original id from registration)
             let registration_id = &deposit.account_id;
@@ -146,6 +158,16 @@ where
                 .get_account_by_id(registration_id)?
                 .ok_or_else(|| anyhow::anyhow!("Account not found"))?;
 
+            // Skip if we already swept this (address, token) pair in this cycle
+            let pair_key = (address_str.clone(), deposit.token_address.clone());
+            if swept_pairs.contains(&pair_key) {
+                info!(
+                    "Skipping ERC20 deposit {} - already swept address {} for token {} in this cycle",
+                    deposit.key, address_str, deposit.token_symbol
+                );
+                continue;
+            }
+
             let signer = self.wallet.get_signer(derivation_index)?;
 
             info!("Signer address: {}", signer.address());
@@ -162,7 +184,10 @@ where
                 .sweep_erc20_deposit(&sweep_provider, &address_str, &deposit)
                 .await
             {
-                Ok(_) => info!("Successfully swept ERC20 deposit: {}", deposit.key),
+                Ok(_) => {
+                    info!("Successfully swept ERC20 deposit: {}", deposit.key);
+                    swept_pairs.insert(pair_key);
+                }
                 Err(e) => {
                     error!("Failed to sweep ERC20 deposit {}: {:?}", deposit.key, e);
                     // Don't return error - continue processing other deposits
@@ -306,14 +331,25 @@ where
         }
 
         if token_balance.is_zero() {
-            info!(
-                "ERC20 balance is zero for {} token at {}, skipping sweep",
-                deposit.token_symbol, from_address_str
-            );
+            let retry_count = self.db.increment_zero_balance_count(&deposit.key)?;
+            if retry_count >= MAX_ZERO_BALANCE_RETRIES {
+                self.db.mark_erc20_deposit_swept(&deposit.key)?;
+                info!(
+                    "Marking deposit {} as swept after {} zero-balance retries (funds likely consolidated in a prior sweep)",
+                    deposit.key, retry_count
+                );
+            } else {
+                info!(
+                    "ERC20 balance is zero for {} at {}, retry {}/{} (will retry next cycle)",
+                    deposit.token_symbol, from_address_str, retry_count, MAX_ZERO_BALANCE_RETRIES
+                );
+            }
             return Ok(());
         }
 
-        let amount = U256::from_str(&deposit.amount).unwrap_or(token_balance);
+        // Sweep the full on-chain token balance to ensure all funds are moved to treasury,
+        // regardless of how many individual deposits contributed to this balance.
+        let amount = token_balance;
 
         // Build ERC20 transfer call data for gas estimation
         let transfer_call = IERC20::transferCall {
@@ -444,12 +480,26 @@ where
         info!("Receipt: {:?}", receipt.transaction_hash);
         info!("++++++++++++++++");
 
-        // Update DB
-        self.db.mark_erc20_deposit_swept(&deposit.key)?;
+        let sweep_tx_hash = receipt.transaction_hash.to_string();
 
-        info!("++++++++++++++++");
-        info!("Marked ERC20 deposit swept: {:?}", deposit.key);
-        info!("++++++++++++++++");
+        // Mark ALL detected deposits for this account+token as swept (consolidates multi-deposit sweeps)
+        let registration_id = &deposit.account_id;
+        let marked_keys = self
+            .db
+            .mark_erc20_deposits_swept_for_account_token(registration_id, &deposit.token_address)?;
+
+        // Store sweep tx hash for all marked deposits (audit trail + webhook idempotency key)
+        self.db
+            .set_sweep_tx_hash_for_keys(&marked_keys, &sweep_tx_hash)?;
+
+        info!(
+            "Marked {} ERC20 deposit(s) as swept for account={}, token={}, sweep_tx={}: {:?}",
+            marked_keys.len(),
+            registration_id,
+            deposit.token_symbol,
+            sweep_tx_hash,
+            marked_keys
+        );
 
         // Fetch token decimals from DB
         let token_decimals = self
@@ -457,20 +507,18 @@ where
             .get_token_metadata(&deposit.token_address)?
             .map(|(_, decimals, _)| decimals);
 
-        // deposit.account_id is actually the registration_id
-        let registration_id = &deposit.account_id;
-
-        // Send Webhook (for ERC20 deposits, id = deposit.key which is tx_hash:log_index)
-        // account_id = Polygon address (from_address_str), registration_id = original id from registration
+        // Send Webhook with the actual swept amount and the sweep tx hash for consumer deduplication
+        let swept_amount_str = amount.to_string();
         let webhook_info = Erc20WebhookInfo {
             id: &deposit.key,
             account_id: from_address_str,
             registration_id,
             deposit_key: &deposit.key,
-            amount: &amount.to_string(),
+            amount: &swept_amount_str,
             token_symbol: &deposit.token_symbol,
             token_address: &deposit.token_address,
             token_decimals,
+            sweep_tx_hash: &sweep_tx_hash,
         };
         self.send_erc20_webhook(&webhook_info).await?;
 
@@ -552,7 +600,8 @@ where
             "amount": info.amount,
             "token_type": "erc20",
             "token_symbol": info.token_symbol,
-            "token_address": info.token_address
+            "token_address": info.token_address,
+            "sweep_tx_hash": info.sweep_tx_hash
         });
 
         info!("++++++++++++++++");

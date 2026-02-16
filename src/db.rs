@@ -10,6 +10,7 @@ const TOKEN_METADATA: TableDefinition<&str, (&str, u64, &str)> =
     TableDefinition::new("token_metadata"); // token_address -> (symbol, decimals, name)
 const ERC20_DEPOSITS: TableDefinition<&str, (&str, &str, &str, &str, &str)> =
     TableDefinition::new("erc20_deposits"); // tx_hash:log_index -> (account_id, amount, token_address, token_symbol, status)
+const SWEEP_META: TableDefinition<&str, (&str, u64)> = TableDefinition::new("sweep_meta"); // deposit_key -> (sweep_tx_hash, zero_balance_retry_count)
 
 #[derive(Clone, Debug)]
 pub struct Erc20Deposit {
@@ -38,6 +39,7 @@ impl Db {
             let _ = write_txn.open_table(STATE)?;
             let _ = write_txn.open_table(TOKEN_METADATA)?;
             let _ = write_txn.open_table(ERC20_DEPOSITS)?;
+            let _ = write_txn.open_table(SWEEP_META)?;
         }
         write_txn.commit()?;
 
@@ -290,5 +292,121 @@ impl Db {
         }
         write_txn.commit()?;
         Ok(())
+    }
+
+    /// Mark all detected ERC20 deposits for a given (account_id, token_address) as swept.
+    /// Returns the list of deposit keys that were marked.
+    pub fn mark_erc20_deposits_swept_for_account_token(
+        &self,
+        account_id: &str,
+        token_address: &str,
+    ) -> Result<Vec<String>> {
+        let write_txn = self.db.begin_write()?;
+        let mut marked_keys = Vec::new();
+        {
+            let mut deposits = write_txn.open_table(ERC20_DEPOSITS)?;
+
+            // First pass: collect keys that need updating
+            let keys_to_update: Vec<(String, String, String, String)> = {
+                let mut to_update = Vec::new();
+                for item in deposits.iter()? {
+                    let (key, value) = item?;
+                    let (acc_id, amount, tok_addr, tok_symbol, status) = value.value();
+                    if status == "detected" && acc_id == account_id && tok_addr == token_address {
+                        to_update.push((
+                            key.value().to_string(),
+                            amount.to_string(),
+                            tok_symbol.to_string(),
+                            acc_id.to_string(),
+                        ));
+                    }
+                }
+                to_update
+            };
+
+            // Second pass: update the entries
+            for (key, amount, tok_symbol, acc_id) in &keys_to_update {
+                deposits.insert(
+                    key.as_str(),
+                    (
+                        acc_id.as_str(),
+                        amount.as_str(),
+                        token_address,
+                        tok_symbol.as_str(),
+                        "swept",
+                    ),
+                )?;
+                marked_keys.push(key.clone());
+            }
+        }
+        write_txn.commit()?;
+        Ok(marked_keys)
+    }
+
+    // ========== Sweep Metadata (new table, existing schemas unchanged) ==========
+
+    /// Increment zero-balance retry count for a deposit. Returns the new count.
+    pub fn increment_zero_balance_count(&self, key: &str) -> Result<u64> {
+        let write_txn = self.db.begin_write()?;
+        let new_count = {
+            let mut meta = write_txn.open_table(SWEEP_META)?;
+            let (sweep_tx_hash, count) = match meta.get(key)? {
+                Some(v) => {
+                    let val = v.value();
+                    (val.0.to_string(), val.1)
+                }
+                None => (String::new(), 0),
+            };
+            let new_count = count + 1;
+            meta.insert(key, (sweep_tx_hash.as_str(), new_count))?;
+            new_count
+        };
+        write_txn.commit()?;
+        Ok(new_count)
+    }
+
+    /// Store the on-chain sweep tx hash for a single deposit key.
+    #[allow(dead_code)]
+    pub fn set_sweep_tx_hash(&self, key: &str, tx_hash: &str) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut meta = write_txn.open_table(SWEEP_META)?;
+            let count = match meta.get(key)? {
+                Some(v) => v.value().1,
+                None => 0,
+            };
+            meta.insert(key, (tx_hash, count))?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Store the on-chain sweep tx hash for multiple deposit keys in one transaction.
+    pub fn set_sweep_tx_hash_for_keys(&self, keys: &[String], tx_hash: &str) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut meta = write_txn.open_table(SWEEP_META)?;
+            for key in keys {
+                let count = match meta.get(key.as_str())? {
+                    Some(v) => v.value().1,
+                    None => 0,
+                };
+                meta.insert(key.as_str(), (tx_hash, count))?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Read sweep metadata for a deposit key.
+    #[allow(dead_code)]
+    pub fn get_sweep_meta(&self, key: &str) -> Result<Option<(String, u64)>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SWEEP_META)?;
+        let result = table.get(key)?;
+        Ok(result.map(|v| {
+            let val = v.value();
+            (val.0.to_string(), val.1)
+        }))
     }
 }

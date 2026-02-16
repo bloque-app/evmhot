@@ -6,9 +6,7 @@
 # Database files
 *.db
 *.db-shm
-*.db-wal
-
-# Docker
+*.db-wal# Docker
 docker-compose.override.yml
 
 # Backups
