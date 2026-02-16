@@ -10,8 +10,7 @@ const TOKEN_METADATA: TableDefinition<&str, (&str, u64, &str)> =
     TableDefinition::new("token_metadata"); // token_address -> (symbol, decimals, name)
 const ERC20_DEPOSITS: TableDefinition<&str, (&str, &str, &str, &str, &str)> =
     TableDefinition::new("erc20_deposits"); // tx_hash:log_index -> (account_id, amount, token_address, token_symbol, status)
-const SWEEP_META: TableDefinition<&str, (&str, u64)> =
-    TableDefinition::new("sweep_meta"); // deposit_key -> (sweep_tx_hash, zero_balance_retry_count)
+const SWEEP_META: TableDefinition<&str, (&str, u64)> = TableDefinition::new("sweep_meta"); // deposit_key -> (sweep_tx_hash, zero_balance_retry_count)
 
 #[derive(Clone, Debug)]
 pub struct Erc20Deposit {
@@ -313,10 +312,7 @@ impl Db {
                 for item in deposits.iter()? {
                     let (key, value) = item?;
                     let (acc_id, amount, tok_addr, tok_symbol, status) = value.value();
-                    if status == "detected"
-                        && acc_id == account_id
-                        && tok_addr == token_address
-                    {
+                    if status == "detected" && acc_id == account_id && tok_addr == token_address {
                         to_update.push((
                             key.value().to_string(),
                             amount.to_string(),
