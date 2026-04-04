@@ -862,3 +862,49 @@ async fn test_verify_transfer_reverted_transaction() {
         }
     }
 }
+
+// ========== Sweep Failure Tracking Tests ==========
+
+#[test]
+fn test_erc20_deposit_failure_tracking() {
+    let db_file = NamedTempFile::new().unwrap();
+    let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
+
+    db.record_erc20_deposit("0xabc", 1, "user_1", "1000000", "0xtoken", "USDC")
+        .unwrap();
+
+    assert_eq!(db.get_detected_erc20_deposits().unwrap().len(), 1);
+
+    for i in 1..=5 {
+        let count = db.increment_sweep_failure_count("0xabc:1").unwrap();
+        assert_eq!(count, i);
+    }
+
+    db.mark_erc20_deposit_failed("0xabc:1").unwrap();
+
+    assert_eq!(db.get_detected_erc20_deposits().unwrap().len(), 0);
+}
+
+#[test]
+fn test_erc20_bulk_mark_failed_for_account_token() {
+    let db_file = NamedTempFile::new().unwrap();
+    let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
+
+    db.record_erc20_deposit("0xaaa", 1, "user_1", "1000000", "0xtoken_a", "USDC")
+        .unwrap();
+    db.record_erc20_deposit("0xbbb", 2, "user_1", "2000000", "0xtoken_a", "USDC")
+        .unwrap();
+    db.record_erc20_deposit("0xccc", 3, "user_1", "3000000", "0xtoken_b", "USDT")
+        .unwrap();
+
+    assert_eq!(db.get_detected_erc20_deposits().unwrap().len(), 3);
+
+    let failed = db
+        .mark_erc20_deposits_failed_for_account_token("user_1", "0xtoken_a")
+        .unwrap();
+    assert_eq!(failed.len(), 2);
+
+    let remaining = db.get_detected_erc20_deposits().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].token_symbol, "USDT");
+}

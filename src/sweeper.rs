@@ -60,6 +60,10 @@ where
 /// swept as part of a consolidated sweep and is marked as swept to avoid infinite retries.
 const MAX_ZERO_BALANCE_RETRIES: u64 = 10;
 
+/// After this many consecutive sweep failures (e.g. "buffer overrun while deserializing"),
+/// a deposit is marked as permanently failed to stop wasting RPC credits on deterministic errors.
+const MAX_SWEEP_RETRIES: u64 = 5;
+
 impl<T> Sweeper<alloy::providers::RootProvider<T>>
 where
     T: alloy::transports::Transport + Clone,
@@ -190,8 +194,25 @@ where
                 }
                 Err(e) => {
                     error!("Failed to sweep ERC20 deposit {}: {:?}", deposit.key, e);
-                    // Don't return error - continue processing other deposits
-                    // This deposit will be retried in the next sweep cycle
+                    if let Ok(failures) = self.db.increment_sweep_failure_count(&deposit.key) {
+                        if failures >= MAX_SWEEP_RETRIES {
+                            let registration_id = &deposit.account_id;
+                            match self.db.mark_erc20_deposits_failed_for_account_token(
+                                registration_id,
+                                &deposit.token_address,
+                            ) {
+                                Ok(failed_keys) => {
+                                    error!(
+                                        "Permanently marked {} deposit(s) as failed for account={}, token={} after {} attempts: {:?}",
+                                        failed_keys.len(), registration_id, deposit.token_symbol, failures, e
+                                    );
+                                }
+                                Err(db_err) => {
+                                    error!("Failed to mark deposits as failed: {:?}", db_err);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

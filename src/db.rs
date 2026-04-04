@@ -11,6 +11,7 @@ const TOKEN_METADATA: TableDefinition<&str, (&str, u64, &str)> =
 const ERC20_DEPOSITS: TableDefinition<&str, (&str, &str, &str, &str, &str)> =
     TableDefinition::new("erc20_deposits"); // tx_hash:log_index -> (account_id, amount, token_address, token_symbol, status)
 const SWEEP_META: TableDefinition<&str, (&str, u64)> = TableDefinition::new("sweep_meta"); // deposit_key -> (sweep_tx_hash, zero_balance_retry_count)
+const SWEEP_FAILURES: TableDefinition<&str, u64> = TableDefinition::new("sweep_failures"); // deposit_key -> consecutive_failure_count
 
 #[derive(Clone, Debug)]
 pub struct Erc20Deposit {
@@ -40,6 +41,7 @@ impl Db {
             let _ = write_txn.open_table(TOKEN_METADATA)?;
             let _ = write_txn.open_table(ERC20_DEPOSITS)?;
             let _ = write_txn.open_table(SWEEP_META)?;
+            let _ = write_txn.open_table(SWEEP_FAILURES)?;
         }
         write_txn.commit()?;
 
@@ -408,5 +410,106 @@ impl Db {
             let val = v.value();
             (val.0.to_string(), val.1)
         }))
+    }
+
+    // ========== Sweep Failure Tracking ==========
+
+    /// Increment the sweep failure count for a deposit. Returns the new count.
+    pub fn increment_sweep_failure_count(&self, key: &str) -> Result<u64> {
+        let write_txn = self.db.begin_write()?;
+        let new_count = {
+            let mut failures = write_txn.open_table(SWEEP_FAILURES)?;
+            let count = match failures.get(key)? {
+                Some(v) => v.value(),
+                None => 0,
+            };
+            let new_count = count + 1;
+            failures.insert(key, new_count)?;
+            new_count
+        };
+        write_txn.commit()?;
+        Ok(new_count)
+    }
+
+    /// Mark a single ERC20 deposit as permanently failed.
+    pub fn mark_erc20_deposit_failed(&self, key: &str) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut deposits = write_txn.open_table(ERC20_DEPOSITS)?;
+            let (account_id, amount, token_address, token_symbol) = {
+                let current_val = deposits.get(key)?;
+                if let Some(v) = current_val {
+                    let val = v.value();
+                    (
+                        val.0.to_string(),
+                        val.1.to_string(),
+                        val.2.to_string(),
+                        val.3.to_string(),
+                    )
+                } else {
+                    return Ok(());
+                }
+            };
+
+            deposits.insert(
+                key,
+                (
+                    account_id.as_str(),
+                    amount.as_str(),
+                    token_address.as_str(),
+                    token_symbol.as_str(),
+                    "failed",
+                ),
+            )?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Mark all detected ERC20 deposits for a given (account_id, token_address) as permanently failed.
+    /// Returns the list of deposit keys that were marked.
+    pub fn mark_erc20_deposits_failed_for_account_token(
+        &self,
+        account_id: &str,
+        token_address: &str,
+    ) -> Result<Vec<String>> {
+        let write_txn = self.db.begin_write()?;
+        let mut marked_keys = Vec::new();
+        {
+            let mut deposits = write_txn.open_table(ERC20_DEPOSITS)?;
+
+            let keys_to_update: Vec<(String, String, String, String)> = {
+                let mut to_update = Vec::new();
+                for item in deposits.iter()? {
+                    let (key, value) = item?;
+                    let (acc_id, amount, tok_addr, tok_symbol, status) = value.value();
+                    if status == "detected" && acc_id == account_id && tok_addr == token_address {
+                        to_update.push((
+                            key.value().to_string(),
+                            amount.to_string(),
+                            tok_symbol.to_string(),
+                            acc_id.to_string(),
+                        ));
+                    }
+                }
+                to_update
+            };
+
+            for (key, amount, tok_symbol, acc_id) in &keys_to_update {
+                deposits.insert(
+                    key.as_str(),
+                    (
+                        acc_id.as_str(),
+                        amount.as_str(),
+                        token_address,
+                        tok_symbol.as_str(),
+                        "failed",
+                    ),
+                )?;
+                marked_keys.push(key.clone());
+            }
+        }
+        write_txn.commit()?;
+        Ok(marked_keys)
     }
 }
