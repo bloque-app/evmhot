@@ -1,15 +1,18 @@
-use crate::{config::Config, db::Db};
+use crate::{config::ChainConfig, db::Db};
 use alloy::primitives::Address;
-use alloy::providers::Provider;
+use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::BlockNumberOrTag;
+use alloy::transports::BoxTransport;
 use anyhow::Result;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Information about a detected deposit for webhook notification
 struct DepositInfo<'a> {
     id: &'a str,
-    account_id: &'a str,      // Polygon address
-    registration_id: &'a str, // Original id used when registering
+    chain: &'a str,
+    chain_id: u64,
+    account_id: &'a str,
+    registration_id: &'a str,
     tx_hash: &'a str,
     amount: &'a str,
     token_type: &'a str,
@@ -18,19 +21,23 @@ struct DepositInfo<'a> {
     token_decimals: Option<u8>,
 }
 
-pub struct Monitor<P> {
-    config: Config,
+pub struct Monitor {
+    chain: ChainConfig,
+    webhook_jwt_token: Option<String>,
     db: Db,
-    provider: P,
+    provider: RootProvider<BoxTransport>,
 }
 
-impl<T> Monitor<alloy::providers::RootProvider<T>>
-where
-    T: alloy::transports::Transport + Clone,
-{
-    pub fn new(config: Config, db: Db, provider: alloy::providers::RootProvider<T>) -> Self {
+impl Monitor {
+    pub fn new(
+        chain: ChainConfig,
+        webhook_jwt_token: Option<String>,
+        db: Db,
+        provider: RootProvider<BoxTransport>,
+    ) -> Self {
         Self {
-            config,
+            chain,
+            webhook_jwt_token,
             db,
             provider,
         }
@@ -38,34 +45,35 @@ where
 
     async fn catch_up(&self) -> Result<()> {
         let latest_block = self.provider.get_block_number().await?;
-
-        // Use saturating_sub to prevent underflow if block_offset_from_head > latest_block
-        let current_block = latest_block.saturating_sub(self.config.block_offset_from_head);
-        let last_processed = self.db.get_last_processed_block()?;
+        let current_block = latest_block.saturating_sub(self.chain.block_offset_from_head);
+        let last_processed = self.db.get_last_processed_block(&self.chain.name)?;
 
         let start_block = if last_processed == 0 {
-            current_block // Start from now if fresh
+            current_block
         } else {
             last_processed
         };
 
         info!("--------------------------------");
-        info!("Offset from head: {}", self.config.block_offset_from_head);
-        info!("Start block: {}", start_block);
-        info!("Current block: {}", current_block);
-        info!("Last processed block: {}", last_processed);
+        info!(
+            "[{}] Offset from head: {}",
+            self.chain.name, self.chain.block_offset_from_head
+        );
+        info!("[{}] Start block: {}", self.chain.name, start_block);
+        info!("[{}] Current block: {}", self.chain.name, current_block);
+        info!(
+            "[{}] Last processed block: {}",
+            self.chain.name, last_processed
+        );
 
         if start_block > current_block {
             return Ok(());
         }
 
-        // Process max 10 blocks at a time to avoid rate limits
-        // Ensure we don't exceed the latest confirmed block
-
         info!("--------------------------------");
         info!(
-            "Processing blocks from {} to {}",
-            start_block, current_block
+            "[{}] Processing blocks from {} to {}",
+            self.chain.name, start_block, current_block
         );
 
         for block_num in start_block..=current_block {
@@ -76,25 +84,23 @@ where
     }
 
     async fn process_single_block(&self, block_num: u64) -> Result<()> {
-        info!("🔍 Processing block {}", block_num);
+        info!("[{}] Processing block {}", self.chain.name, block_num);
 
         if let Some(block) = self
             .provider
             .get_block_by_number(BlockNumberOrTag::Number(block_num), true)
             .await?
         {
-            // Process native ETH transfers
             if let Some(txs) = block.transactions.as_transactions() {
                 for tx in txs {
                     if let Some(to) = tx.to {
                         let to_address_str = to.to_string();
                         let from_address_str = tx.from.to_string();
 
-                        // Skip deposits from the faucet address
-                        if from_address_str.eq_ignore_ascii_case(&self.config.faucet_address) {
+                        if from_address_str.eq_ignore_ascii_case(&self.chain.faucet_address) {
                             info!(
-                                "Skipping deposit from faucet address: {:?}, Account: {}",
-                                tx.hash, to_address_str
+                                "[{}] Skipping deposit from faucet: {:?}, Account: {}",
+                                self.chain.name, tx.hash, to_address_str
                             );
                             continue;
                         }
@@ -102,24 +108,34 @@ where
                         if let Some(registration_id) =
                             self.db.get_registration_id_by_address(&to_address_str)?
                         {
+                            if tx.value < self.chain.min_deposits.native {
+                                info!(
+                                    "[{}] Skipping native deposit below minimum: tx={:?}, amount={}, min={}",
+                                    self.chain.name, tx.hash, tx.value, self.chain.min_deposits.native
+                                );
+                                continue;
+                            }
+
                             info!(
-                                "Native ETH deposit detected! Tx: {:?}, Address: {}, Registration ID: {}",
-                                tx.hash, to_address_str, registration_id
+                                "[{}] Native deposit detected! Tx: {:?}, Address: {}, Registration ID: {}",
+                                self.chain.name, tx.hash, to_address_str, registration_id
                             );
 
-                            // Only send webhook if this is a new deposit (not a duplicate)
                             let tx_hash_str = tx.hash.to_string();
                             let is_new_deposit = self.db.record_deposit(
+                                &self.chain.name,
                                 &tx_hash_str,
                                 &registration_id,
                                 &tx.value.to_string(),
                             )?;
 
-                            // Send webhook notification for deposit detection only if it's new
                             if is_new_deposit {
                                 let amount_str = tx.value.to_string();
+                                let deposit_id = format!("{}:{}", self.chain.name, tx_hash_str);
                                 let deposit_info = DepositInfo {
-                                    id: &tx_hash_str,
+                                    id: &deposit_id,
+                                    chain: &self.chain.name,
+                                    chain_id: self.chain.chain_id,
                                     account_id: &to_address_str,
                                     registration_id: &registration_id,
                                     tx_hash: &tx_hash_str,
@@ -132,7 +148,10 @@ where
                                 if let Err(e) =
                                     self.send_deposit_detected_webhook(&deposit_info).await
                                 {
-                                    error!("Failed to send deposit detected webhook: {:?}", e);
+                                    error!(
+                                        "[{}] Failed to send deposit detected webhook: {:?}",
+                                        self.chain.name, e
+                                    );
                                 }
                             }
                         }
@@ -140,12 +159,11 @@ where
                 }
             }
 
-            // Process ERC20 Transfer events
             self.process_erc20_transfers(block_num).await?;
         }
 
-        // info!("Processing D {}", block_num);
-        self.db.set_last_processed_block(block_num)?;
+        self.db
+            .set_last_processed_block(&self.chain.name, block_num)?;
         Ok(())
     }
 
@@ -153,7 +171,6 @@ where
         use alloy::primitives::FixedBytes;
         use alloy::rpc::types::Filter;
 
-        // ERC20 Transfer event signature: Transfer(address,address,uint256)
         let transfer_signature: FixedBytes<32> =
             alloy::primitives::keccak256("Transfer(address,address,uint256)".as_bytes());
 
@@ -165,78 +182,78 @@ where
         let logs = self
             .get_logs_with_retry(
                 &filter,
-                self.config.get_logs_max_retries,
-                self.config.get_logs_delay_ms,
+                self.chain.get_logs_max_retries,
+                self.chain.get_logs_delay_ms,
             )
             .await?;
 
         for log in logs {
-            // Decode Transfer event: topic[0] = signature, topic[1] = from, topic[2] = to
             if log.topics().len() >= 3 {
                 let token_address = log.address();
-                let from_address = Address::from_slice(&log.topics()[1].as_slice()[12..]); // Last 20 bytes of topic[1]
-                let to_address = Address::from_slice(&log.topics()[2].as_slice()[12..]); // Last 20 bytes of topic[2]
+                let from_address = Address::from_slice(&log.topics()[1].as_slice()[12..]);
+                let to_address = Address::from_slice(&log.topics()[2].as_slice()[12..]);
 
                 let from_address_str = from_address.to_string();
                 let to_address_str = to_address.to_string();
 
-                // Skip deposits from the faucet address
-                if from_address_str.eq_ignore_ascii_case(&self.config.faucet_address) {
+                if from_address_str.eq_ignore_ascii_case(&self.chain.faucet_address) {
                     info!(
-                        "Skipping ERC20 deposit from faucet address: Token: {}, To: {}",
-                        token_address, to_address_str
+                        "[{}] Skipping ERC20 deposit from faucet: Token: {}, To: {}",
+                        self.chain.name, token_address, to_address_str
                     );
                     continue;
                 }
 
-                // Check if this is one of our monitored addresses
                 if let Some(registration_id) =
                     self.db.get_registration_id_by_address(&to_address_str)?
                 {
-                    // Decode the amount from data field (ABI-encoded uint256 is 32 bytes)
+                    if !self.chain.is_token_allowed(&token_address.to_string()) {
+                        debug!(
+                            "[{}] Skipping non-allowlisted ERC20 token: {}",
+                            self.chain.name, token_address
+                        );
+                        continue;
+                    }
+
                     let amount = if log.data().data.len() >= 32 {
-                        // Standard case: take first 32 bytes (ABI-encoded uint256)
                         let amount_bytes: [u8; 32] = log.data().data[..32]
                             .try_into()
                             .expect("slice length is 32");
                         alloy::primitives::U256::from_be_bytes(amount_bytes)
                     } else if !log.data().data.is_empty() {
-                        // Short data (non-standard, but handle gracefully)
                         alloy::primitives::U256::from_be_slice(&log.data().data)
                     } else {
                         alloy::primitives::U256::ZERO
                     };
 
-                    info!(
-                        "Detected ERC20 deposit: Token: {}, To: {}, From: {}, Amount: {}",
-                        token_address, to_address_str, from_address_str, amount
-                    );
-
-                    // Fetch token metadata (symbol, decimals, name)
-                    let token_info = self.get_or_fetch_token_metadata(token_address).await?;
-
-                    // Skip tokens with symbol longer than 5 characters
-                    if token_info.symbol.len() > 5 {
+                    let token_address_lc = token_address.to_string().to_lowercase();
+                    let min_deposit = self.chain.min_deposits.for_token(&token_address_lc);
+                    if amount < min_deposit {
                         info!(
-                            "Skipping ERC20 deposit: token symbol '{}' exceeds 5 characters",
-                            token_info.symbol
+                            "[{}] Skipping ERC20 deposit below minimum: token={}, amount={}, min={}",
+                            self.chain.name, token_address, amount, min_deposit
                         );
                         continue;
                     }
 
-                    info!(
-                        "ERC20 deposit detected! Token: {} ({}), Amount: {}, Address: {}, Registration ID: {}, Tx: {:?}",
-                        token_info.symbol, token_address, amount, to_address_str, registration_id, log.transaction_hash
-                    );
+                    let token_info = self.get_or_fetch_token_metadata(token_address).await?;
 
-                    // Store ERC20 deposit
+                    if token_info.symbol.len() > 5 {
+                        info!(
+                            "[{}] Skipping ERC20 deposit: token symbol '{}' exceeds 5 characters",
+                            self.chain.name, token_info.symbol
+                        );
+                        continue;
+                    }
+
                     if let Some(tx_hash) = log.transaction_hash {
                         let log_index = log.log_index.unwrap_or(0);
                         let tx_hash_str = tx_hash.to_string();
-                        let deposit_id = format!("{}:{}", tx_hash_str, log_index);
+                        let deposit_id =
+                            format!("{}:{}:{}", self.chain.name, tx_hash_str, log_index);
 
-                        // Only send webhook if this is a new deposit (not a duplicate)
                         let is_new_deposit = self.db.record_erc20_deposit(
+                            &self.chain.name,
                             &tx_hash_str,
                             log_index,
                             &registration_id,
@@ -245,12 +262,13 @@ where
                             &token_info.symbol,
                         )?;
 
-                        // Send webhook notification for ERC20 deposit detection only if it's new
                         if is_new_deposit {
                             let token_addr_str = token_address.to_string();
                             let amount_str = amount.to_string();
                             let deposit_info = DepositInfo {
                                 id: &deposit_id,
+                                chain: &self.chain.name,
+                                chain_id: self.chain.chain_id,
                                 account_id: &to_address_str,
                                 registration_id: &registration_id,
                                 tx_hash: &tx_hash_str,
@@ -262,7 +280,10 @@ where
                             };
                             if let Err(e) = self.send_deposit_detected_webhook(&deposit_info).await
                             {
-                                error!("Failed to send ERC20 deposit detected webhook: {:?}", e);
+                                error!(
+                                    "[{}] Failed to send ERC20 deposit detected webhook: {:?}",
+                                    self.chain.name, e
+                                );
                             }
                         }
                     }
@@ -291,7 +312,8 @@ where
                 Ok(logs) if !logs.is_empty() => {
                     if attempt > 1 {
                         info!(
-                            "get_logs succeeded with {} logs on attempt {}",
+                            "[{}] get_logs succeeded with {} logs on attempt {}",
+                            self.chain.name,
                             logs.len(),
                             attempt
                         );
@@ -299,12 +321,12 @@ where
                     return last_result;
                 }
                 Ok(_) => warn!(
-                    "get_logs returned empty on attempt {}/{}",
-                    attempt, max_retries
+                    "[{}] get_logs returned empty on attempt {}/{}",
+                    self.chain.name, attempt, max_retries
                 ),
                 Err(e) => warn!(
-                    "get_logs failed on attempt {}/{}: {:?}",
-                    attempt, max_retries, e
+                    "[{}] get_logs failed on attempt {}/{}: {:?}",
+                    self.chain.name, attempt, max_retries, e
                 ),
             }
 
@@ -319,8 +341,10 @@ where
     async fn get_or_fetch_token_metadata(&self, token_address: Address) -> Result<TokenInfo> {
         let token_address_str = token_address.to_string();
 
-        // Check cache first
-        if let Some((symbol, decimals, name)) = self.db.get_token_metadata(&token_address_str)? {
+        if let Some((symbol, decimals, name)) = self
+            .db
+            .get_token_metadata(&self.chain.name, &token_address_str)?
+        {
             return Ok(TokenInfo {
                 address: token_address_str,
                 symbol,
@@ -329,11 +353,10 @@ where
             });
         }
 
-        // Fetch from blockchain
         match get_token_info(&self.provider, token_address).await {
             Ok(token_info) => {
-                // Cache it
                 self.db.store_token_metadata(
+                    &self.chain.name,
                     &token_address_str,
                     &token_info.symbol,
                     token_info.decimals,
@@ -343,10 +366,9 @@ where
             }
             Err(e) => {
                 warn!(
-                    "Failed to fetch token metadata for {}: {:?}",
-                    token_address, e
+                    "[{}] Failed to fetch token metadata for {}: {:?}",
+                    self.chain.name, token_address, e
                 );
-                // Return a default token info
                 Ok(TokenInfo {
                     address: token_address_str.clone(),
                     symbol: "UNKNOWN".to_string(),
@@ -358,7 +380,6 @@ where
     }
 
     async fn send_deposit_detected_webhook(&self, info: &DepositInfo<'_>) -> Result<()> {
-        // Get the webhook URL for this account using registration_id
         let Some(webhook_url) = self.db.get_webhook_url(info.registration_id)? else {
             error!(
                 "No webhook URL found for registration_id: {}",
@@ -371,6 +392,8 @@ where
 
         let mut payload = serde_json::json!({
             "id": info.id,
+            "chain": info.chain,
+            "chain_id": info.chain_id,
             "event": "deposit_detected",
             "account_id": info.account_id,
             "registration_id": info.registration_id,
@@ -379,7 +402,6 @@ where
             "token_type": info.token_type
         });
 
-        // Add ERC20-specific fields if provided
         if let Some(symbol) = info.token_symbol {
             payload["token_symbol"] = serde_json::json!(symbol);
         }
@@ -392,8 +414,7 @@ where
 
         let mut request = client.post(&webhook_url).json(&payload);
 
-        // Add JWT authorization header if configured
-        if let Some(ref token) = self.config.webhook_jwt_token {
+        if let Some(ref token) = self.webhook_jwt_token {
             request = request.header("Authorization", format!("Bearer {}", token));
         }
 
@@ -401,14 +422,15 @@ where
 
         match res {
             Ok(r) => info!(
-                "Deposit detected webhook sent to {}: status={}, registration_id={}",
+                "[{}] Deposit detected webhook sent to {}: status={}, registration_id={}",
+                info.chain,
                 webhook_url,
                 r.status(),
                 info.registration_id
             ),
             Err(e) => error!(
-                "Failed to send deposit detected webhook to {}: {:?}",
-                webhook_url, e
+                "[{}] Failed to send deposit detected webhook to {}: {:?}",
+                info.chain, webhook_url, e
             ),
         }
 
@@ -416,7 +438,6 @@ where
     }
 }
 
-// ERC20 helper types and functions
 use alloy::sol;
 
 sol! {
@@ -442,13 +463,10 @@ struct TokenInfo {
     name: String,
 }
 
-async fn get_token_info<T>(
-    provider: &alloy::providers::RootProvider<T>,
+async fn get_token_info(
+    provider: &RootProvider<BoxTransport>,
     token_address: Address,
-) -> Result<TokenInfo>
-where
-    T: alloy::transports::Transport + Clone,
-{
+) -> Result<TokenInfo> {
     let contract = IERC20::new(token_address, provider);
 
     let symbol = contract.symbol().call().await?._0;
@@ -466,59 +484,18 @@ where
 use crate::traits::Service;
 use async_trait::async_trait;
 
-use alloy::transports::http::Http;
-use reqwest::Client;
-
-// Implementation for HTTP Provider (Polling)
 #[async_trait]
-impl Service for Monitor<alloy::providers::RootProvider<Http<Client>>> {
+impl Service for Monitor {
     async fn run(&self) {
         use std::time::Duration;
         use tokio::time::sleep;
 
-        info!("Starting Monitor in Polling mode");
+        info!("[{}] Starting Monitor in Polling mode", self.chain.name);
         loop {
             if let Err(e) = self.catch_up().await {
-                error!("Error in monitor loop: {:?}", e);
+                error!("[{}] Error in monitor loop: {:?}", self.chain.name, e);
             }
-            info!("Sleeping for {} seconds", self.config.poll_interval);
-            sleep(Duration::from_secs(self.config.poll_interval)).await;
-        }
-    }
-}
-
-// Implementation for WebSocket Provider (Streaming)
-#[async_trait]
-impl Service for Monitor<alloy::providers::RootProvider<alloy::pubsub::PubSubFrontend>> {
-    async fn run(&self) {
-        use std::time::Duration;
-        use tokio::time::sleep;
-
-        info!("Starting Monitor in Streaming mode");
-        loop {
-            // 1. Catch up first
-            if let Err(e) = self.catch_up().await {
-                error!("Error during catch-up: {:?}", e);
-            }
-
-            // 2. Subscribe
-            match self.provider.subscribe_blocks().await {
-                Ok(mut stream) => {
-                    while let Ok(header) = stream.recv().await {
-                        if let Some(block_num) = header.header.number {
-                            info!("New block received via WS: {}", block_num);
-                            if let Err(e) = self.process_single_block(block_num).await {
-                                error!("Error processing block {}: {:?}", block_num, e);
-                            }
-                        }
-                    }
-                    error!("WebSocket stream ended");
-                }
-                Err(e) => error!("Failed to subscribe to blocks: {:?}", e),
-            }
-
-            // Reconnect delay
-            sleep(Duration::from_secs(5)).await;
+            sleep(Duration::from_secs(self.chain.poll_interval)).await;
         }
     }
 }

@@ -1,11 +1,12 @@
-use crate::config::{Config, ProviderUrl};
+use crate::config::{parse_allowed_token_addresses_env, Config, MinDepositSettings};
 use crate::db::Db;
 use crate::faucet::Faucet;
 use crate::monitor::Monitor;
 use crate::sweeper::Sweeper;
+use crate::test_support::{self, http_provider_boxed, test_chain_config, test_config, TEST_CHAIN};
+use crate::traits::Service;
 use crate::wallet::Wallet;
-use crate::{HotWalletService, VerifyTransferRequest, VerifyTransferResponse};
-use alloy::providers::ProviderBuilder;
+use crate::{HotWalletService, RegisterRequest, RetrySweepRequest, VerifyTransferRequest, VerifyTransferResponse};
 use serde_json::json;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
@@ -55,16 +56,16 @@ fn test_db_operations() {
     // Test Deposits
     let tx_hash = "0xabc";
     let amount = "100";
-    db.record_deposit(tx_hash, id, amount).unwrap();
+    db.record_deposit(TEST_CHAIN, tx_hash, id, amount).unwrap();
 
-    let deposits = db.get_detected_deposits().unwrap();
+    let deposits = db.get_detected_deposits(TEST_CHAIN).unwrap();
     assert_eq!(deposits.len(), 1);
     assert_eq!(deposits[0].0, tx_hash);
     assert_eq!(deposits[0].2, amount);
 
     // Test Sweep Mark
-    db.mark_deposit_swept(tx_hash).unwrap();
-    let deposits_after = db.get_detected_deposits().unwrap();
+    db.mark_deposit_swept(TEST_CHAIN, tx_hash).unwrap();
+    let deposits_after = db.get_detected_deposits(TEST_CHAIN).unwrap();
     assert_eq!(deposits_after.len(), 0);
 }
 
@@ -76,25 +77,16 @@ async fn test_monitor_creation_with_http_provider() {
     let db_file = NamedTempFile::new().unwrap();
     let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
 
-    let config = Config {
-        database_url: db_file.path().to_str().unwrap().to_string(),
-        provider_url: ProviderUrl::Http("http://localhost:8545".to_string()),
-        mnemonic: "test test test test test test test test test test test junk".to_string(),
-        treasury_address: "0x9999999999999999999999999999999999999999".to_string(),
-        port: 3000,
-        poll_interval: 1,
-        block_offset_from_head: 0,
-        faucet_mnemonic: "test test test test test test test test test test test junk".to_string(),
-        existential_deposit: "10000000000000000".to_string(),
-        faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
-        get_logs_max_retries: 30,
-        get_logs_delay_ms: 50,
-        webhook_jwt_token: None,
-    };
+    let config = test_config(db_file.path().to_str().unwrap(), "http://localhost:8545");
 
     // Create provider and monitor (no actual connection needed for this test)
-    let provider = ProviderBuilder::new().on_http("http://localhost:8545".parse().unwrap());
-    let _monitor = Monitor::new(config, db.clone(), provider);
+    let provider = http_provider_boxed("http://localhost:8545");
+    let _monitor = Monitor::new(
+        test_chain_config("http://localhost:8545"),
+        config.webhook_jwt_token.clone(),
+        db.clone(),
+        provider,
+    );
 }
 
 #[test]
@@ -112,22 +104,22 @@ fn test_monitor_db_operations() {
         .unwrap();
 
     // Verify no deposits initially
-    let deposits_before = db.get_detected_deposits().unwrap();
+    let deposits_before = db.get_detected_deposits(TEST_CHAIN).unwrap();
     assert_eq!(deposits_before.len(), 0);
 
     // Simulate Monitor recording a deposit
-    db.record_deposit("0xtxhash", "test_user", "1000000000000000000")
+    db.record_deposit(TEST_CHAIN, "0xtxhash", "test_user", "1000000000000000000")
         .unwrap();
 
-    let deposits_after = db.get_detected_deposits().unwrap();
+    let deposits_after = db.get_detected_deposits(TEST_CHAIN).unwrap();
     assert_eq!(deposits_after.len(), 1);
     assert_eq!(deposits_after[0].0, "0xtxhash");
     assert_eq!(deposits_after[0].1, "test_user");
     assert_eq!(deposits_after[0].2, "1000000000000000000");
 
     // Test block tracking
-    db.set_last_processed_block(100).unwrap();
-    assert_eq!(db.get_last_processed_block().unwrap(), 100);
+    db.set_last_processed_block(TEST_CHAIN, 100).unwrap();
+    assert_eq!(db.get_last_processed_block(TEST_CHAIN).unwrap(), 100);
 }
 
 #[test]
@@ -163,34 +155,27 @@ async fn test_sweeper_creation() {
     let db_file = NamedTempFile::new().unwrap();
     let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
 
-    let config = Config {
-        database_url: db_file.path().to_str().unwrap().to_string(),
-        provider_url: ProviderUrl::Http("http://localhost:8545".to_string()),
-        mnemonic: "test test test test test test test test test test test junk".to_string(),
-        treasury_address: "0x9999999999999999999999999999999999999999".to_string(),
-        port: 3000,
-        poll_interval: 1,
-        block_offset_from_head: 0,
-        faucet_mnemonic: "test test test test test test test test test test test junk".to_string(),
-        existential_deposit: "10000000000000000".to_string(),
-        faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
-        get_logs_max_retries: 30,
-        get_logs_delay_ms: 50,
-        webhook_jwt_token: None,
-    };
+    let config = test_config(db_file.path().to_str().unwrap(), "http://localhost:8545");
 
     let wallet = Wallet::new(config.mnemonic.clone());
-    let provider = ProviderBuilder::new().on_http("http://localhost:8545".parse().unwrap());
+    let provider = http_provider_boxed("http://localhost:8545");
     let faucet = Arc::new(
         Faucet::new(
             config.faucet_mnemonic.clone(),
             provider.clone(),
-            &config.existential_deposit,
+            &test_support::chain_existential(&config),
         )
         .unwrap(),
     );
 
-    Sweeper::new(config, db, wallet, provider, faucet);
+    Sweeper::new(
+        config.chains[0].clone(),
+        config.webhook_jwt_token.clone(),
+        db,
+        wallet,
+        provider.clone(),
+        faucet,
+    );
 }
 
 #[test]
@@ -206,18 +191,18 @@ fn test_sweeper_deposit_workflow() {
     // Register account and create a deposit
     db.register_account("test_user", 0, &user_address, "https://webhook.example.com")
         .unwrap();
-    db.record_deposit("0xtx123", "test_user", "1000000000000000000")
+    db.record_deposit(TEST_CHAIN, "0xtx123", "test_user", "1000000000000000000")
         .unwrap();
 
     // Verify deposit exists
-    let deposits_before = db.get_detected_deposits().unwrap();
+    let deposits_before = db.get_detected_deposits(TEST_CHAIN).unwrap();
     assert_eq!(deposits_before.len(), 1);
     assert_eq!(deposits_before[0].0, "0xtx123");
     assert_eq!(deposits_before[0].1, "test_user");
 
     // Simulate sweep completion
-    db.mark_deposit_swept("0xtx123").unwrap();
-    let deposits_after = db.get_detected_deposits().unwrap();
+    db.mark_deposit_swept(TEST_CHAIN, "0xtx123").unwrap();
+    let deposits_after = db.get_detected_deposits(TEST_CHAIN).unwrap();
     assert_eq!(deposits_after.len(), 0);
 
     // Verify the account details are correct for deriving keys
@@ -272,28 +257,28 @@ fn test_sweeper_multiple_deposits() {
         .unwrap();
 
     // Record deposits for each
-    db.record_deposit("0xtx1", "user_0", "1000000000000000000")
+    db.record_deposit(TEST_CHAIN, "0xtx1", "user_0", "1000000000000000000")
         .unwrap();
-    db.record_deposit("0xtx2", "user_1", "2000000000000000000")
+    db.record_deposit(TEST_CHAIN, "0xtx2", "user_1", "2000000000000000000")
         .unwrap();
-    db.record_deposit("0xtx3", "user_2", "3000000000000000000")
+    db.record_deposit(TEST_CHAIN, "0xtx3", "user_2", "3000000000000000000")
         .unwrap();
 
     // Verify all deposits are tracked
-    let deposits = db.get_detected_deposits().unwrap();
+    let deposits = db.get_detected_deposits(TEST_CHAIN).unwrap();
     assert_eq!(deposits.len(), 3);
 
     // Process one deposit at a time
-    db.mark_deposit_swept("0xtx1").unwrap();
-    let deposits_after_1 = db.get_detected_deposits().unwrap();
+    db.mark_deposit_swept(TEST_CHAIN, "0xtx1").unwrap();
+    let deposits_after_1 = db.get_detected_deposits(TEST_CHAIN).unwrap();
     assert_eq!(deposits_after_1.len(), 2);
 
-    db.mark_deposit_swept("0xtx2").unwrap();
-    let deposits_after_2 = db.get_detected_deposits().unwrap();
+    db.mark_deposit_swept(TEST_CHAIN, "0xtx2").unwrap();
+    let deposits_after_2 = db.get_detected_deposits(TEST_CHAIN).unwrap();
     assert_eq!(deposits_after_2.len(), 1);
 
-    db.mark_deposit_swept("0xtx3").unwrap();
-    let deposits_after_3 = db.get_detected_deposits().unwrap();
+    db.mark_deposit_swept(TEST_CHAIN, "0xtx3").unwrap();
+    let deposits_after_3 = db.get_detected_deposits(TEST_CHAIN).unwrap();
     assert_eq!(deposits_after_3.len(), 0);
 }
 
@@ -312,6 +297,37 @@ impl wiremock::Match for BodyContains {
     }
 }
 
+fn empty_block_rpc_response() -> serde_json::Value {
+    let block_hash = "0x000000000000000000000000000000000000000000000000000000000000000a";
+    let parent_hash = "0x0000000000000000000000000000000000000000000000000000000000000009";
+    let root_hash = "0x0000000000000000000000000000000000000000000000000000000000000000";
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "number": "0xA",
+            "hash": block_hash,
+            "parentHash": parent_hash,
+            "nonce": "0x0000000000000000",
+            "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "transactionsRoot": root_hash,
+            "stateRoot": root_hash,
+            "receiptsRoot": root_hash,
+            "miner": "0x0000000000000000000000000000000000000000",
+            "difficulty": "0x0",
+            "totalDifficulty": "0x0",
+            "extraData": "0x",
+            "size": "0x0",
+            "gasLimit": "0x0",
+            "gasUsed": "0x0",
+            "timestamp": "0x0",
+            "transactions": [],
+            "uncles": []
+        }
+    })
+}
+
 #[tokio::test]
 async fn test_verify_native_transfer_success() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -320,21 +336,7 @@ async fn test_verify_native_transfer_success() {
     let rpc_server = MockServer::start().await;
     let db_file = NamedTempFile::new().unwrap();
 
-    let config = Config {
-        database_url: db_file.path().to_str().unwrap().to_string(),
-        provider_url: ProviderUrl::Http(rpc_server.uri()),
-        mnemonic: "test test test test test test test test test test test junk".to_string(),
-        treasury_address: "0x9999999999999999999999999999999999999999".to_string(),
-        port: 3000,
-        poll_interval: 1,
-        block_offset_from_head: 0,
-        faucet_mnemonic: "test test test test test test test test test test test junk".to_string(),
-        existential_deposit: "10000000000000000".to_string(),
-        faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
-        get_logs_max_retries: 30,
-        get_logs_delay_ms: 50,
-        webhook_jwt_token: None,
-    };
+    let config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
 
     let to_address = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e";
     let tx_hash = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
@@ -395,10 +397,11 @@ async fn test_verify_native_transfer_success() {
         .await;
 
     // Create the service
-    let service = HotWalletService::new_http(config).await.unwrap();
+    let service = HotWalletService::new(config).await.unwrap();
 
     // Test verification
     let request = VerifyTransferRequest {
+        chain: TEST_CHAIN.to_string(),
         tx_hash: tx_hash.to_string(),
         to_address: to_address.to_string(),
         amount: amount.to_string(),
@@ -436,21 +439,7 @@ async fn test_verify_native_transfer_amount_mismatch() {
     let rpc_server = MockServer::start().await;
     let db_file = NamedTempFile::new().unwrap();
 
-    let config = Config {
-        database_url: db_file.path().to_str().unwrap().to_string(),
-        provider_url: ProviderUrl::Http(rpc_server.uri()),
-        mnemonic: "test test test test test test test test test test test junk".to_string(),
-        treasury_address: "0x9999999999999999999999999999999999999999".to_string(),
-        port: 3000,
-        poll_interval: 1,
-        block_offset_from_head: 0,
-        faucet_mnemonic: "test test test test test test test test test test test junk".to_string(),
-        existential_deposit: "10000000000000000".to_string(),
-        faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
-        get_logs_max_retries: 30,
-        get_logs_delay_ms: 50,
-        webhook_jwt_token: None,
-    };
+    let config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
 
     let to_address = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e";
     let tx_hash = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
@@ -508,10 +497,11 @@ async fn test_verify_native_transfer_amount_mismatch() {
         .mount(&rpc_server)
         .await;
 
-    let service = HotWalletService::new_http(config).await.unwrap();
+    let service = HotWalletService::new(config).await.unwrap();
 
     // Request expects 2 ETH but tx only has 1 ETH
     let request = VerifyTransferRequest {
+        chain: TEST_CHAIN.to_string(),
         tx_hash: tx_hash.to_string(),
         to_address: to_address.to_string(),
         amount: "2000000000000000000".to_string(), // 2 ETH - more than actual
@@ -544,21 +534,7 @@ async fn test_verify_erc20_transfer_success() {
     let rpc_server = MockServer::start().await;
     let db_file = NamedTempFile::new().unwrap();
 
-    let config = Config {
-        database_url: db_file.path().to_str().unwrap().to_string(),
-        provider_url: ProviderUrl::Http(rpc_server.uri()),
-        mnemonic: "test test test test test test test test test test test junk".to_string(),
-        treasury_address: "0x9999999999999999999999999999999999999999".to_string(),
-        port: 3000,
-        poll_interval: 1,
-        block_offset_from_head: 0,
-        faucet_mnemonic: "test test test test test test test test test test test junk".to_string(),
-        existential_deposit: "10000000000000000".to_string(),
-        faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
-        get_logs_max_retries: 30,
-        get_logs_delay_ms: 50,
-        webhook_jwt_token: None,
-    };
+    let config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
 
     let to_address = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e";
     let token_address = "0xdAC17F958D2ee523a2206206994597C13D831ec7"; // USDT
@@ -632,9 +608,10 @@ async fn test_verify_erc20_transfer_success() {
         .mount(&rpc_server)
         .await;
 
-    let service = HotWalletService::new_http(config).await.unwrap();
+    let service = HotWalletService::new(config).await.unwrap();
 
     let request = VerifyTransferRequest {
+        chain: TEST_CHAIN.to_string(),
         tx_hash: tx_hash.to_string(),
         to_address: to_address.to_string(),
         amount: amount.to_string(),
@@ -672,21 +649,7 @@ async fn test_verify_erc20_transfer_symbol_mismatch() {
     let rpc_server = MockServer::start().await;
     let db_file = NamedTempFile::new().unwrap();
 
-    let config = Config {
-        database_url: db_file.path().to_str().unwrap().to_string(),
-        provider_url: ProviderUrl::Http(rpc_server.uri()),
-        mnemonic: "test test test test test test test test test test test junk".to_string(),
-        treasury_address: "0x9999999999999999999999999999999999999999".to_string(),
-        port: 3000,
-        poll_interval: 1,
-        block_offset_from_head: 0,
-        faucet_mnemonic: "test test test test test test test test test test test junk".to_string(),
-        existential_deposit: "10000000000000000".to_string(),
-        faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
-        get_logs_max_retries: 30,
-        get_logs_delay_ms: 50,
-        webhook_jwt_token: None,
-    };
+    let config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
 
     let to_address = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e";
     let token_address = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
@@ -729,10 +692,11 @@ async fn test_verify_erc20_transfer_symbol_mismatch() {
         .mount(&rpc_server)
         .await;
 
-    let service = HotWalletService::new_http(config).await.unwrap();
+    let service = HotWalletService::new(config).await.unwrap();
 
     // Request expects USDC but contract returns USDT
     let request = VerifyTransferRequest {
+        chain: TEST_CHAIN.to_string(),
         tx_hash: tx_hash.to_string(),
         to_address: to_address.to_string(),
         amount: "1000000".to_string(),
@@ -767,21 +731,7 @@ async fn test_verify_transfer_reverted_transaction() {
     let rpc_server = MockServer::start().await;
     let db_file = NamedTempFile::new().unwrap();
 
-    let config = Config {
-        database_url: db_file.path().to_str().unwrap().to_string(),
-        provider_url: ProviderUrl::Http(rpc_server.uri()),
-        mnemonic: "test test test test test test test test test test test junk".to_string(),
-        treasury_address: "0x9999999999999999999999999999999999999999".to_string(),
-        port: 3000,
-        poll_interval: 1,
-        block_offset_from_head: 0,
-        faucet_mnemonic: "test test test test test test test test test test test junk".to_string(),
-        existential_deposit: "10000000000000000".to_string(),
-        faucet_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
-        get_logs_max_retries: 30,
-        get_logs_delay_ms: 50,
-        webhook_jwt_token: None,
-    };
+    let config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
 
     let to_address = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e";
     let tx_hash = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
@@ -840,9 +790,10 @@ async fn test_verify_transfer_reverted_transaction() {
         .mount(&rpc_server)
         .await;
 
-    let service = HotWalletService::new_http(config).await.unwrap();
+    let service = HotWalletService::new(config).await.unwrap();
 
     let request = VerifyTransferRequest {
+        chain: TEST_CHAIN.to_string(),
         tx_hash: tx_hash.to_string(),
         to_address: to_address.to_string(),
         amount: "1000000000000000000".to_string(),
@@ -870,19 +821,23 @@ fn test_erc20_deposit_failure_tracking() {
     let db_file = NamedTempFile::new().unwrap();
     let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
 
-    db.record_erc20_deposit("0xabc", 1, "user_1", "1000000", "0xtoken", "USDC")
-        .unwrap();
+    db.record_erc20_deposit(
+        TEST_CHAIN, "0xabc", 1, "user_1", "1000000", "0xtoken", "USDC",
+    )
+    .unwrap();
 
-    assert_eq!(db.get_detected_erc20_deposits().unwrap().len(), 1);
+    assert_eq!(db.get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(), 1);
 
     for i in 1..=5 {
-        let count = db.increment_sweep_failure_count("0xabc:1").unwrap();
+        let count = db
+            .increment_sweep_failure_count(TEST_CHAIN, "0xabc:1")
+            .unwrap();
         assert_eq!(count, i);
     }
 
-    db.mark_erc20_deposit_failed("0xabc:1").unwrap();
+    db.mark_erc20_deposit_failed(TEST_CHAIN, "0xabc:1").unwrap();
 
-    assert_eq!(db.get_detected_erc20_deposits().unwrap().len(), 0);
+    assert_eq!(db.get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(), 0);
 }
 
 #[test]
@@ -890,21 +845,1464 @@ fn test_erc20_bulk_mark_failed_for_account_token() {
     let db_file = NamedTempFile::new().unwrap();
     let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
 
-    db.record_erc20_deposit("0xaaa", 1, "user_1", "1000000", "0xtoken_a", "USDC")
-        .unwrap();
-    db.record_erc20_deposit("0xbbb", 2, "user_1", "2000000", "0xtoken_a", "USDC")
-        .unwrap();
-    db.record_erc20_deposit("0xccc", 3, "user_1", "3000000", "0xtoken_b", "USDT")
-        .unwrap();
+    db.record_erc20_deposit(
+        TEST_CHAIN,
+        "0xaaa",
+        1,
+        "user_1",
+        "1000000",
+        "0xtoken_a",
+        "USDC",
+    )
+    .unwrap();
+    db.record_erc20_deposit(
+        TEST_CHAIN,
+        "0xbbb",
+        2,
+        "user_1",
+        "2000000",
+        "0xtoken_a",
+        "USDC",
+    )
+    .unwrap();
+    db.record_erc20_deposit(
+        TEST_CHAIN,
+        "0xccc",
+        3,
+        "user_1",
+        "3000000",
+        "0xtoken_b",
+        "USDT",
+    )
+    .unwrap();
 
-    assert_eq!(db.get_detected_erc20_deposits().unwrap().len(), 3);
+    assert_eq!(db.get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(), 3);
 
     let failed = db
-        .mark_erc20_deposits_failed_for_account_token("user_1", "0xtoken_a")
+        .mark_erc20_deposits_failed_for_account_token(TEST_CHAIN, "user_1", "0xtoken_a")
         .unwrap();
     assert_eq!(failed.len(), 2);
 
-    let remaining = db.get_detected_erc20_deposits().unwrap();
+    let remaining = db.get_detected_erc20_deposits(TEST_CHAIN).unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].token_symbol, "USDT");
+}
+
+// ========== Dust Attack / Min Deposit Tests ==========
+
+#[test]
+fn test_parse_min_deposits_env_valid_and_empty() {
+    use crate::config::parse_min_deposits_env;
+    use alloy::primitives::U256;
+
+    let empty = parse_min_deposits_env(String::new()).unwrap();
+    assert!(empty.is_empty());
+
+    let parsed = parse_min_deposits_env(
+        "0xAbC=10000,0xc2132d05d31c914a87c6611c10748aeb04b58e8f=20000".to_string(),
+    )
+    .unwrap();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed.get("0xabc").copied(), Some(U256::from(10000u64)));
+    assert_eq!(
+        parsed
+            .get("0xc2132d05d31c914a87c6611c10748aeb04b58e8f")
+            .copied(),
+        Some(U256::from(20000u64))
+    );
+}
+
+#[test]
+fn test_parse_min_deposits_env_skips_malformed_segments() {
+    use crate::config::parse_min_deposits_env;
+    use alloy::primitives::U256;
+
+    let parsed = parse_min_deposits_env("badsegment,0xabc=10000,also-bad".to_string()).unwrap();
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed.get("0xabc").copied(), Some(U256::from(10000u64)));
+}
+
+#[test]
+fn test_min_deposit_for_token_matches_checksummed_address() {
+    use alloy::primitives::U256;
+    use std::collections::HashMap;
+
+    let mut per_token = HashMap::new();
+    per_token.insert(
+        "0xc2132d05d31c914a87c6611c10748aeb04b58e8f".to_string(),
+        U256::from(10000u64),
+    );
+    let settings = MinDepositSettings {
+        per_token,
+        default: U256::from(500u64),
+        native: U256::ZERO,
+    };
+
+    assert_eq!(
+        settings.for_token("0xc2132D05D31c914a87C6611C10748AEb04B58e8F"),
+        U256::from(10000u64)
+    );
+    assert_eq!(
+        settings.for_token("0x0000000000000000000000000000000000000001"),
+        U256::from(500u64)
+    );
+}
+
+#[test]
+fn test_erc20_bulk_mark_swept_returns_key_and_amount() {
+    let db_file = NamedTempFile::new().unwrap();
+    let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
+
+    db.record_erc20_deposit(
+        TEST_CHAIN,
+        "0xaaa",
+        1,
+        "user_1",
+        "3000000000",
+        "0xtoken_a",
+        "USDT",
+    )
+    .unwrap();
+    db.record_erc20_deposit(TEST_CHAIN, "0xbbb", 2, "user_1", "30", "0xtoken_a", "USDT")
+        .unwrap();
+
+    let swept = db
+        .mark_erc20_deposits_swept_for_account_token(TEST_CHAIN, "user_1", "0xtoken_a")
+        .unwrap();
+
+    assert_eq!(swept.len(), 2);
+    assert!(swept.contains(&("0xaaa:1".to_string(), "3000000000".to_string())));
+    assert!(swept.contains(&("0xbbb:2".to_string(), "30".to_string())));
+    assert_eq!(db.get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_monitor_skips_erc20_below_min_deposit() {
+    use alloy::primitives::U256;
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let addr = wallet.derive_address(0).unwrap().to_string();
+
+    let token_address = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+    let mut per_token = HashMap::new();
+    per_token.insert(
+        "0xc2132d05d31c914a87c6611c10748aeb04b58e8f".to_string(),
+        U256::from(10000u64),
+    );
+
+    let config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
+
+    let db = Db::new(&config.database_url).unwrap();
+    db.register_account("user_1", 0, &addr, "http://localhost/webhook")
+        .unwrap();
+
+    let transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    let from_topic = "0x0000000000000000000000000000000000000000000000000000000000000001";
+    let to_topic = format!("0x000000000000000000000000{}", &addr[2..].to_lowercase());
+    // 30 raw units, below threshold of 10000
+    let amount_data = "0x000000000000000000000000000000000000000000000000000000000000001e";
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_blockNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0xA"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBlockByNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "number": "0xA",
+                "hash": "0x000000000000000000000000000000000000000000000000000000000000000a",
+                "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000009",
+                "transactions": []
+            }
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [{
+                "address": token_address,
+                "topics": [transfer_topic, from_topic, to_topic],
+                "data": amount_data,
+                "blockNumber": "0xA",
+                "transactionHash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+                "transactionIndex": "0x0",
+                "blockHash": "0x000000000000000000000000000000000000000000000000000000000000000a",
+                "logIndex": "0x0",
+                "removed": false
+            }]
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let monitor = Monitor::new(
+        config.chains[0].clone(),
+        config.webhook_jwt_token.clone(),
+        db.clone(),
+        provider.clone(),
+    );
+    let handle = tokio::spawn(async move {
+        monitor.run().await;
+    });
+
+    sleep(Duration::from_millis(1500)).await;
+    handle.abort();
+
+    assert_eq!(db.get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_erc20_sweep_emits_per_deposit_webhooks() {
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rpc_server = MockServer::start().await;
+    let webhook_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let addr = wallet.derive_address(0).unwrap().to_string();
+    let token_address = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+
+    let config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
+
+    let db = Db::new(&config.database_url).unwrap();
+    db.register_account("user_1", 0, &addr, &webhook_server.uri())
+        .unwrap();
+    db.store_token_metadata(TEST_CHAIN, token_address, "USDT", 6, "Tether USD")
+        .unwrap();
+    db.record_erc20_deposit(
+        TEST_CHAIN,
+        "0xaaa",
+        1,
+        "user_1",
+        "3000000000",
+        token_address,
+        "USDT",
+    )
+    .unwrap();
+    db.record_erc20_deposit(
+        TEST_CHAIN,
+        "0xbbb",
+        2,
+        "user_1",
+        "30",
+        token_address,
+        "USDT",
+    )
+    .unwrap();
+
+    // balanceOf -> 3000000030 (aggregate on-chain balance)
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_call"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": "0x00000000000000000000000000000000000000000000000000000000b2d05e06"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_estimateGas"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x186a0"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_feeHistory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "baseFeePerGas": ["0x3B9ACA00", "0x3B9ACA00"],
+                "gasUsedRatio": [0.5],
+                "oldestBlock": "0x9",
+                "reward": [["0x3B9ACA00"]]
+            }
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBalance"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x0DE0B6B3A7640000"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getTransactionCount"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x00"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_chainId"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x89"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    let sweep_tx_hash = "0x00000000000000000000000000000000000000000000000000000000000000f1";
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_sendRawTransaction"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": sweep_tx_hash
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getTransactionReceipt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "transactionHash": sweep_tx_hash,
+                "transactionIndex": "0x1",
+                "blockHash": "0x000000000000000000000000000000000000000000000000000000000000000b",
+                "blockNumber": "0xB",
+                "from": addr,
+                "to": token_address,
+                "cumulativeGasUsed": "0x186a0",
+                "gasUsed": "0x186a0",
+                "contractAddress": null,
+                "logs": [],
+                "status": "0x1",
+                "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                "type": "0x0",
+                "effectiveGasPrice": "0x3B9ACA00"
+            }
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let faucet = Arc::new(
+        Faucet::new(
+            config.faucet_mnemonic.clone(),
+            provider.clone(),
+            &test_support::chain_existential(&config),
+        )
+        .unwrap(),
+    );
+    let sweeper = Sweeper::new(
+        config.chains[0].clone(),
+        config.webhook_jwt_token.clone(),
+        db.clone(),
+        wallet,
+        provider.clone(),
+        faucet,
+    );
+    let handle = tokio::spawn(async move {
+        sweeper.run().await;
+    });
+
+    let mut swept = false;
+    for _ in 0..20 {
+        if db
+            .get_detected_erc20_deposits(TEST_CHAIN)
+            .unwrap()
+            .is_empty()
+        {
+            swept = true;
+            break;
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
+    handle.abort();
+    assert!(swept, "ERC20 deposits should be marked swept");
+
+    sleep(Duration::from_millis(300)).await;
+
+    let requests = webhook_server.received_requests().await.unwrap();
+    let swept_events: Vec<_> = requests
+        .iter()
+        .filter(|req| {
+            let body = String::from_utf8_lossy(&req.body);
+            body.contains("deposit_swept")
+        })
+        .collect();
+
+    assert_eq!(
+        swept_events.len(),
+        2,
+        "expected one deposit_swept per deposit"
+    );
+
+    let mut amounts = Vec::new();
+    let mut original_hashes = Vec::new();
+    let mut sweep_hashes = Vec::new();
+    for req in swept_events {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        amounts.push(body["amount"].as_str().unwrap().to_string());
+        original_hashes.push(body["original_tx_hash"].as_str().unwrap().to_string());
+        sweep_hashes.push(body["sweep_tx_hash"].as_str().unwrap().to_string());
+    }
+
+    amounts.sort();
+    assert_eq!(amounts, vec!["30".to_string(), "3000000000".to_string()]);
+    assert!(original_hashes.contains(&"0xaaa".to_string()));
+    assert!(original_hashes.contains(&"0xbbb".to_string()));
+    assert!(sweep_hashes.iter().all(|h| h == sweep_tx_hash));
+    assert!(
+        !amounts.contains(&"3000000030".to_string()),
+        "webhook must not use aggregate on-chain balance"
+    );
+}
+
+#[tokio::test]
+async fn test_erc20_sweep_webhook_best_effort_on_failure() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rpc_server = MockServer::start().await;
+    let webhook_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let addr = wallet.derive_address(0).unwrap().to_string();
+    let token_address = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+
+    let config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
+
+    let db = Db::new(&config.database_url).unwrap();
+    db.register_account("user_1", 0, &addr, &webhook_server.uri())
+        .unwrap();
+    db.store_token_metadata(TEST_CHAIN, token_address, "USDT", 6, "Tether USD")
+        .unwrap();
+    db.record_erc20_deposit(
+        TEST_CHAIN,
+        "0xaaa",
+        1,
+        "user_1",
+        "3000000000",
+        token_address,
+        "USDT",
+    )
+    .unwrap();
+    db.record_erc20_deposit(
+        TEST_CHAIN,
+        "0xbbb",
+        2,
+        "user_1",
+        "30",
+        token_address,
+        "USDT",
+    )
+    .unwrap();
+
+    let webhook_attempts = StdArc::new(AtomicUsize::new(0));
+    let attempts_for_mock = webhook_attempts.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |req: &wiremock::Request| {
+            let count = attempts_for_mock.fetch_add(1, Ordering::SeqCst);
+            let body = String::from_utf8_lossy(&req.body);
+            if body.contains("deposit_swept") && count == 0 {
+                ResponseTemplate::new(503)
+            } else {
+                ResponseTemplate::new(200)
+            }
+        })
+        .mount(&webhook_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_call"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": "0x00000000000000000000000000000000000000000000000000000000b2d05e06"
+        })))
+        .mount(&rpc_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_estimateGas"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x186a0"
+        })))
+        .mount(&rpc_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_feeHistory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "baseFeePerGas": ["0x3B9ACA00", "0x3B9ACA00"],
+                "gasUsedRatio": [0.5],
+                "oldestBlock": "0x9",
+                "reward": [["0x3B9ACA00"]]
+            }
+        })))
+        .mount(&rpc_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBalance"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x0DE0B6B3A7640000"
+        })))
+        .mount(&rpc_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getTransactionCount"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x00"
+        })))
+        .mount(&rpc_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_chainId"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x89"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    let sweep_tx_hash = "0x00000000000000000000000000000000000000000000000000000000000000f2";
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_sendRawTransaction"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": sweep_tx_hash
+        })))
+        .mount(&rpc_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getTransactionReceipt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "transactionHash": sweep_tx_hash,
+                "transactionIndex": "0x1",
+                "blockHash": "0x000000000000000000000000000000000000000000000000000000000000000b",
+                "blockNumber": "0xB",
+                "from": addr,
+                "to": token_address,
+                "cumulativeGasUsed": "0x186a0",
+                "gasUsed": "0x186a0",
+                "contractAddress": null,
+                "logs": [],
+                "status": "0x1",
+                "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                "type": "0x0",
+                "effectiveGasPrice": "0x3B9ACA00"
+            }
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let faucet = Arc::new(
+        Faucet::new(
+            config.faucet_mnemonic.clone(),
+            provider.clone(),
+            &test_support::chain_existential(&config),
+        )
+        .unwrap(),
+    );
+    let sweeper = Sweeper::new(
+        config.chains[0].clone(),
+        config.webhook_jwt_token.clone(),
+        db.clone(),
+        wallet,
+        provider.clone(),
+        faucet,
+    );
+    let handle = tokio::spawn(async move {
+        sweeper.run().await;
+    });
+
+    for _ in 0..20 {
+        if db
+            .get_detected_erc20_deposits(TEST_CHAIN)
+            .unwrap()
+            .is_empty()
+        {
+            break;
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
+    handle.abort();
+
+    sleep(Duration::from_millis(300)).await;
+    assert!(
+        webhook_attempts.load(Ordering::SeqCst) >= 2,
+        "best-effort loop should attempt webhook for each deposit even after first failure"
+    );
+}
+
+// ========== Token Allowlist Tests ==========
+
+fn test_config_with_allowlist(allowlist: std::collections::HashSet<String>) -> Config {
+    let mut config = test_config(":memory:", "http://localhost:8545");
+    config.chains[0].allowed_token_addresses = allowlist;
+    config
+}
+
+#[test]
+fn test_is_token_allowed_empty_allowlist_allows_all() {
+    let config = test_config_with_allowlist(Default::default());
+    assert!(config.chains[0].is_token_allowed("0xdead000000000000000000000000000000000001"));
+    assert!(config.chains[0].is_token_allowed("dead000000000000000000000000000000000001"));
+}
+
+#[test]
+fn test_is_token_allowed_with_entries() {
+    let mut allowlist = std::collections::HashSet::new();
+    allowlist.insert("0xc2132d05d31c914a87c6611c10748aeb04b58e8f".to_string());
+    let config = test_config_with_allowlist(allowlist);
+
+    assert!(config.chains[0].is_token_allowed("0xC2132D05D31c914a87C6611C10748AEb04B58e8F"));
+    assert!(config.chains[0].is_token_allowed("c2132d05d31c914a87c6611c10748aeb04b58e8f"));
+    assert!(!config.chains[0].is_token_allowed("0xdead000000000000000000000000000000000001"));
+}
+
+#[test]
+fn test_parse_allowed_token_addresses_env() {
+    let set = parse_allowed_token_addresses_env(
+        " 0xC2132D05D31c914a87C6611C10748AEb04B58e8F , 0xdead000000000000000000000000000000000001 , , ".to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(set.len(), 2);
+    assert!(set.contains("0xc2132d05d31c914a87c6611c10748aeb04b58e8f"));
+    assert!(set.contains("0xdead000000000000000000000000000000000001"));
+
+    assert!(parse_allowed_token_addresses_env(String::new())
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn test_monitor_skips_non_allowlisted_erc20_token() {
+    use std::collections::HashSet;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let addr = wallet.derive_address(0).unwrap().to_string();
+
+    let allowed_token = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+    let spam_token = "0xdead000000000000000000000000000000000001";
+
+    let mut allowlist = HashSet::new();
+    allowlist.insert(allowed_token.to_lowercase());
+
+    let mut config = test_config_with_allowlist(allowlist);
+    config.database_url = db_file.path().to_str().unwrap().to_string();
+    config.chains[0].rpc_url = rpc_server.uri();
+    config.chains[0].get_logs_max_retries = 1;
+    config.chains[0].get_logs_delay_ms = 1;
+
+    let db = Db::new(&config.database_url).unwrap();
+    db.register_account("user_1", 0, &addr, "http://localhost/webhook")
+        .unwrap();
+
+    let transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    let from_topic = "0x0000000000000000000000000000000000000000000000000000000000000001";
+    let to_topic = format!("0x000000000000000000000000{}", &addr[2..].to_lowercase());
+    let amount_data = "0x00000000000000000000000000000000000000000000000000000000000f4240";
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_blockNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0xA"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBlockByNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_block_rpc_response()))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [{
+                "address": spam_token,
+                "topics": [transfer_topic, from_topic, to_topic],
+                "data": amount_data,
+                "blockNumber": "0xA",
+                "transactionHash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+                "transactionIndex": "0x0",
+                "blockHash": "0x000000000000000000000000000000000000000000000000000000000000000a",
+                "logIndex": "0x0",
+                "removed": false
+            }]
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_call"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x"
+        })))
+        .expect(0)
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let monitor = Monitor::new(
+        config.chains[0].clone(),
+        config.webhook_jwt_token.clone(),
+        db.clone(),
+        provider.clone(),
+    );
+    let handle = tokio::spawn(async move {
+        monitor.run().await;
+    });
+
+    sleep(Duration::from_millis(1500)).await;
+    handle.abort();
+
+    assert_eq!(db.get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_monitor_records_allowlisted_erc20_token() {
+    use std::collections::HashSet;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let addr = wallet.derive_address(0).unwrap().to_string();
+
+    let allowed_token = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+
+    let mut allowlist = HashSet::new();
+    allowlist.insert(allowed_token.to_lowercase());
+
+    let mut config = test_config_with_allowlist(allowlist);
+    config.database_url = db_file.path().to_str().unwrap().to_string();
+    config.chains[0].rpc_url = rpc_server.uri();
+    config.chains[0].get_logs_max_retries = 1;
+    config.chains[0].get_logs_delay_ms = 1;
+
+    let db = Db::new(&config.database_url).unwrap();
+    db.register_account("user_1", 0, &addr, "http://localhost/webhook")
+        .unwrap();
+    db.store_token_metadata(TEST_CHAIN, allowed_token, "USDT", 6, "Tether USD")
+        .unwrap();
+
+    let transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    let from_topic = "0x0000000000000000000000000000000000000000000000000000000000000001";
+    let to_topic = format!("0x000000000000000000000000{}", &addr[2..].to_lowercase());
+    let amount_data = "0x00000000000000000000000000000000000000000000000000000000000f4240";
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_blockNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0xA"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBlockByNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_block_rpc_response()))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [{
+                "address": allowed_token,
+                "topics": [transfer_topic, from_topic, to_topic],
+                "data": amount_data,
+                "blockNumber": "0xA",
+                "transactionHash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+                "transactionIndex": "0x0",
+                "blockHash": "0x000000000000000000000000000000000000000000000000000000000000000a",
+                "logIndex": "0x0",
+                "removed": false
+            }]
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let monitor = Monitor::new(
+        config.chains[0].clone(),
+        config.webhook_jwt_token.clone(),
+        db.clone(),
+        provider.clone(),
+    );
+    let handle = tokio::spawn(async move {
+        monitor.run().await;
+    });
+
+    sleep(Duration::from_millis(1500)).await;
+    handle.abort();
+
+    assert_eq!(db.get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_sweeper_marks_non_allowlisted_deposit_failed_without_rpc() {
+    use std::collections::HashSet;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let addr = wallet.derive_address(0).unwrap().to_string();
+
+    let allowed_token = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+    let spam_token = "0xdead000000000000000000000000000000000001";
+
+    let mut allowlist = HashSet::new();
+    allowlist.insert(allowed_token.to_lowercase());
+
+    let mut config = test_config_with_allowlist(allowlist);
+    config.database_url = db_file.path().to_str().unwrap().to_string();
+    config.chains[0].rpc_url = rpc_server.uri();
+
+    let db = Db::new(&config.database_url).unwrap();
+    db.register_account("user_1", 0, &addr, "http://localhost/webhook")
+        .unwrap();
+    db.record_erc20_deposit(
+        TEST_CHAIN, "0xspam", 1, "user_1", "1000000", spam_token, "USDC",
+    )
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_call"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x"
+        })))
+        .expect(0)
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let faucet = Arc::new(
+        Faucet::new(
+            config.faucet_mnemonic.clone(),
+            provider.clone(),
+            &test_support::chain_existential(&config),
+        )
+        .unwrap(),
+    );
+    let sweeper = Sweeper::new(
+        config.chains[0].clone(),
+        config.webhook_jwt_token.clone(),
+        db.clone(),
+        wallet,
+        provider.clone(),
+        faucet,
+    );
+    let handle = tokio::spawn(async move {
+        sweeper.run().await;
+    });
+
+    for _ in 0..10 {
+        if db
+            .get_detected_erc20_deposits(TEST_CHAIN)
+            .unwrap()
+            .is_empty()
+        {
+            break;
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
+    handle.abort();
+
+    assert_eq!(db.get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_erc20_faucet_failure_keeps_deposit_detected() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let addr = wallet.derive_address(0).unwrap().to_string();
+    let token_address = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+
+    let config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
+    let db = Db::new(&config.database_url).unwrap();
+    db.register_account("user_1", 0, &addr, "http://localhost/webhook")
+        .unwrap();
+    db.record_erc20_deposit(
+        TEST_CHAIN,
+        "0xabc",
+        1,
+        "user_1",
+        "1000000",
+        token_address,
+        "USDT",
+    )
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_call"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": "0x00000000000000000000000000000000000000000000000000000000000f4240"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_estimateGas"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x186a0"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_feeHistory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "baseFeePerGas": ["0x3B9ACA00", "0x3B9ACA00"],
+                "gasUsedRatio": [0.5],
+                "oldestBlock": "0x9",
+                "reward": [["0x3B9ACA00"]]
+            }
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBalance"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x0"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let faucet = Arc::new(
+        Faucet::new(
+            config.faucet_mnemonic.clone(),
+            provider.clone(),
+            &test_support::chain_existential(&config),
+        )
+        .unwrap(),
+    );
+    let sweeper = Sweeper::new(
+        config.chains[0].clone(),
+        config.webhook_jwt_token.clone(),
+        db.clone(),
+        wallet,
+        provider,
+        faucet,
+    );
+
+    for _ in 0..12 {
+        sweeper.process_deposits_once().await.unwrap();
+    }
+
+    assert_eq!(db.get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(), 1);
+    assert_eq!(db.get_sweep_failure_count(TEST_CHAIN, "0xabc:1").unwrap(), 0);
+}
+
+#[test]
+fn test_retry_sweep_service_requeues_failed_erc20_deposit() {
+    let tmp = NamedTempFile::new().unwrap();
+    let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+    db.record_erc20_deposit(
+        TEST_CHAIN,
+        "0xabc",
+        120,
+        "user_1",
+        "100",
+        "0xtoken",
+        "USDC",
+    )
+    .unwrap();
+    db.mark_erc20_deposit_failed(TEST_CHAIN, "0xabc:120").unwrap();
+
+    let config = test_config(tmp.path().to_str().unwrap(), "http://localhost:0");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let service = rt.block_on(HotWalletService::new(config)).unwrap();
+
+    let response = service
+        .retry_sweep(RetrySweepRequest {
+            chain: TEST_CHAIN.to_string(),
+            tx_hash: "0xabc".to_string(),
+            log_index: Some(120),
+        })
+        .unwrap();
+
+    assert!(response.retried);
+    assert_eq!(response.token_type, "erc20");
+    assert_eq!(
+        service.db().get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(),
+        1
+    );
+}
+
+// ========== Faucet Tests ==========
+
+async fn mount_faucet_gas_mocks(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_estimateGas"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x5208"
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_feeHistory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "baseFeePerGas": ["0x3B9ACA00", "0x3B9ACA00"],
+                "gasUsedRatio": [0.5],
+                "oldestBlock": "0x9",
+                "reward": [["0x3B9ACA00"]]
+            }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_maxPriorityFeePerGas"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x3B9ACA00"
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_gasPrice"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x3B9ACA00"
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_chainId"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x89"
+        })))
+        .mount(server)
+        .await;
+}
+
+fn faucet_send_raw_tx_nonce(body: &[u8]) -> Option<u64> {
+    use alloy::consensus::{transaction::Transaction, TxEnvelope};
+    use alloy::eips::eip2718::Decodable2718;
+    let body_str = String::from_utf8_lossy(body);
+    let v: serde_json::Value = serde_json::from_str(&body_str).ok()?;
+    let raw = v["params"][0].as_str()?;
+    let bytes = alloy::hex::decode(raw.trim_start_matches("0x")).ok()?;
+    let mut buf = bytes.as_slice();
+    TxEnvelope::decode_2718(&mut buf).ok().map(|tx| tx.nonce())
+}
+
+fn faucet_receipt_response(tx_hash: &str) -> serde_json::Value {
+    json!({
+        "jsonrpc": "2.0", "id": 1,
+        "result": {
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x0",
+            "blockHash": "0x000000000000000000000000000000000000000000000000000000000000000b",
+            "blockNumber": "0xb",
+            "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "to": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "contractAddress": null,
+            "logs": [],
+            "status": "0x1",
+            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "type": "0x2",
+            "effectiveGasPrice": "0x3B9ACA00"
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_faucet_insufficient_balance() {
+    let rpc_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBalance"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x0"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let faucet = Faucet::new(
+        "test test test test test test test test test test test junk".to_string(),
+        provider,
+        "10000000000000000",
+    )
+    .unwrap();
+
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let to = wallet.derive_address(1).unwrap().to_string();
+
+    let err = faucet.fund_new_address(&to).await.unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("Faucet has insufficient balance to fund new address"));
+}
+
+#[tokio::test]
+async fn test_faucet_happy_path_single_fund() {
+    let rpc_server = MockServer::start().await;
+    mount_faucet_gas_mocks(&rpc_server).await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBalance"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x0DE0B6B3A7640000"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getTransactionCount"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x0"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    let tx_hash = "0x0000000000000000000000000000000000000000000000000000000000000001";
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_sendRawTransaction"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": tx_hash
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getTransactionReceipt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(faucet_receipt_response(tx_hash)))
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let faucet = Faucet::new(
+        "test test test test test test test test test test test junk".to_string(),
+        provider,
+        "10000000000000000",
+    )
+    .unwrap();
+
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let to = wallet.derive_address(1).unwrap().to_string();
+
+    let result = faucet.fund_new_address(&to).await.unwrap();
+    assert_eq!(result, tx_hash);
+}
+
+#[tokio::test]
+async fn test_faucet_concurrent_funds_use_distinct_nonces() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    let rpc_server = MockServer::start().await;
+    mount_faucet_gas_mocks(&rpc_server).await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBalance"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x0DE0B6B3A7640000"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    let nonce_rpc_calls = StdArc::new(AtomicUsize::new(0));
+    let nonce_calls_for_mock = nonce_rpc_calls.clone();
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getTransactionCount"))
+        .respond_with(move |_: &wiremock::Request| {
+            nonce_calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "result": "0x0"
+            }))
+        })
+        .mount(&rpc_server)
+        .await;
+
+    let captured_nonces = StdArc::new(StdMutex::new(Vec::<u64>::new()));
+    let nonces_for_mock = captured_nonces.clone();
+    let send_count = StdArc::new(AtomicUsize::new(0));
+    let send_count_for_mock = send_count.clone();
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_sendRawTransaction"))
+        .respond_with(move |req: &wiremock::Request| {
+            if let Some(n) = faucet_send_raw_tx_nonce(&req.body) {
+                nonces_for_mock.lock().unwrap().push(n);
+            }
+            let idx = send_count_for_mock.fetch_add(1, Ordering::SeqCst);
+            let hash = format!("0x{:064x}", idx + 1);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "result": hash
+            }))
+        })
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getTransactionReceipt"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body_str = String::from_utf8_lossy(&req.body);
+            let v: serde_json::Value =
+                serde_json::from_str(&body_str).unwrap_or(json!({"params": []}));
+            let tx_hash = v["params"][0]
+                .as_str()
+                .unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000001");
+            ResponseTemplate::new(200).set_body_json(faucet_receipt_response(tx_hash))
+        })
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let faucet = StdArc::new(
+        Faucet::new(
+            "test test test test test test test test test test test junk".to_string(),
+            provider,
+            "10000000000000000",
+        )
+        .unwrap(),
+    );
+
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let to1 = wallet.derive_address(1).unwrap().to_string();
+    let to2 = wallet.derive_address(2).unwrap().to_string();
+
+    let faucet_a = faucet.clone();
+    let faucet_b = faucet.clone();
+    let (r1, r2) = tokio::join!(
+        faucet_a.fund_new_address(&to1),
+        faucet_b.fund_new_address(&to2),
+    );
+
+    assert!(r1.is_ok(), "first concurrent fund failed: {r1:?}");
+    assert!(r2.is_ok(), "second concurrent fund failed: {r2:?}");
+    assert_ne!(r1.unwrap(), r2.unwrap(), "expected distinct tx hashes");
+
+    let mut nonces = captured_nonces.lock().unwrap().clone();
+    nonces.sort_unstable();
+    assert_eq!(nonces, vec![0, 1], "expected sequential nonces 0 and 1");
+    assert_eq!(
+        nonce_rpc_calls.load(Ordering::SeqCst),
+        1,
+        "expected a single eth_getTransactionCount (cached nonce reused)"
+    );
+}
+
+#[tokio::test]
+async fn test_faucet_send_failure_resets_nonce_cache() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+
+    let rpc_server = MockServer::start().await;
+    mount_faucet_gas_mocks(&rpc_server).await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBalance"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x0DE0B6B3A7640000"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    let nonce_rpc_calls = StdArc::new(AtomicUsize::new(0));
+    let nonce_calls_for_mock = nonce_rpc_calls.clone();
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getTransactionCount"))
+        .respond_with(move |_: &wiremock::Request| {
+            nonce_calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "result": "0x0"
+            }))
+        })
+        .mount(&rpc_server)
+        .await;
+
+    let send_attempts = StdArc::new(AtomicUsize::new(0));
+    let send_attempts_for_mock = send_attempts.clone();
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_sendRawTransaction"))
+        .respond_with(move |_: &wiremock::Request| {
+            let attempt = send_attempts_for_mock.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                ResponseTemplate::new(500)
+            } else {
+                let tx_hash = "0x00000000000000000000000000000000000000000000000000000000000000ab";
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": 1, "result": tx_hash
+                }))
+            }
+        })
+        .mount(&rpc_server)
+        .await;
+
+    let tx_hash = "0x00000000000000000000000000000000000000000000000000000000000000ab";
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getTransactionReceipt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(faucet_receipt_response(tx_hash)))
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let faucet = Faucet::new(
+        "test test test test test test test test test test test junk".to_string(),
+        provider,
+        "10000000000000000",
+    )
+    .unwrap();
+
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let to = wallet.derive_address(1).unwrap().to_string();
+
+    assert!(faucet.fund_new_address(&to).await.is_err());
+    assert_eq!(nonce_rpc_calls.load(Ordering::SeqCst), 1);
+
+    let result = faucet.fund_new_address(&to).await.unwrap();
+    assert_eq!(result, tx_hash);
+    assert_eq!(
+        nonce_rpc_calls.load(Ordering::SeqCst),
+        2,
+        "expected nonce cache reset to re-fetch eth_getTransactionCount"
+    );
+}
+
+#[tokio::test]
+async fn test_register_does_not_fund_at_registration() {
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_sendRawTransaction"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0xdead"
+        })))
+        .expect(0)
+        .mount(&rpc_server)
+        .await;
+
+    let service = HotWalletService::new(config).await.unwrap();
+    let response = service
+        .register(RegisterRequest {
+            id: "lazy_user".to_string(),
+            webhook_url: "http://localhost/webhook".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert!(response.funding_tx.is_none());
+}
+
+#[test]
+fn test_same_tx_hash_isolated_per_chain() {
+    let tmp = NamedTempFile::new().unwrap();
+    let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+    db.record_deposit("base", "0xsame", "user1", "100").unwrap();
+    db.record_deposit("polygon", "0xsame", "user2", "200")
+        .unwrap();
+
+    let base = db.get_detected_deposits("base").unwrap();
+    let polygon = db.get_detected_deposits("polygon").unwrap();
+
+    assert_eq!(base[0].1, "user1");
+    assert_eq!(polygon[0].1, "user2");
+}
+
+#[tokio::test]
+async fn test_verify_transfer_unknown_chain() {
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
+    let service = HotWalletService::new(config).await.unwrap();
+
+    let result = service
+        .verify_transfer(VerifyTransferRequest {
+            chain: "ethereum".to_string(),
+            tx_hash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                .to_string(),
+            to_address: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
+            amount: "1".to_string(),
+            token_type: "native".to_string(),
+            token_address: None,
+            token_symbol: None,
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("Unknown chain"));
+}
+
+#[tokio::test]
+async fn test_block_number_unknown_chain() {
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
+    let service = HotWalletService::new(config).await.unwrap();
+
+    let err = service.get_block_number("unknown").unwrap_err();
+    assert!(err.to_string().contains("Unknown chain"));
 }

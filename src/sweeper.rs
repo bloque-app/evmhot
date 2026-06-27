@@ -1,82 +1,95 @@
 use crate::{
-    config::Config,
+    config::ChainConfig,
     db::{Db, Erc20Deposit},
     faucet::Faucet,
     wallet::Wallet,
 };
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, U256};
-use alloy::providers::Provider;
+use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
+use alloy::transports::BoxTransport;
 use anyhow::Result;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-/// Information about an ERC20 deposit for webhook notification
 struct Erc20WebhookInfo<'a> {
     id: &'a str,
-    account_id: &'a str,      // Polygon address
-    registration_id: &'a str, // Original id used when registering
+    chain: &'a str,
+    chain_id: u64,
+    account_id: &'a str,
+    registration_id: &'a str,
     deposit_key: &'a str,
     amount: &'a str,
     token_symbol: &'a str,
     token_address: &'a str,
     token_decimals: Option<u8>,
-    sweep_tx_hash: &'a str, // On-chain tx hash of the sweep (idempotency key for consumers)
+    sweep_tx_hash: &'a str,
 }
 
-pub struct Sweeper<P> {
-    config: Config,
+pub struct Sweeper {
+    chain: ChainConfig,
+    webhook_jwt_token: Option<String>,
     db: Db,
     wallet: Wallet,
-    provider: P,
-    faucet: Arc<Faucet<P>>,
+    provider: RootProvider<BoxTransport>,
+    faucet: Arc<Faucet>,
 }
 
 use crate::traits::Service;
 use async_trait::async_trait;
 
 #[async_trait]
-impl<T> Service for Sweeper<alloy::providers::RootProvider<T>>
-where
-    T: alloy::transports::Transport + Clone,
-{
+impl Service for Sweeper {
     async fn run(&self) {
+        self.log_deposit_queue("startup").await;
+        let mut cycle: u64 = 0;
         loop {
             if let Err(e) = self.process_deposits().await {
-                error!("Error in sweeper loop: {:?}", e);
+                error!("[{}] Error in sweeper loop: {:?}", self.chain.name, e);
             }
-            sleep(Duration::from_secs(self.config.poll_interval)).await;
+            cycle += 1;
+            if cycle.is_multiple_of(QUEUE_LOG_INTERVAL_CYCLES) {
+                self.log_deposit_queue("periodic").await;
+            }
+            sleep(Duration::from_secs(self.chain.poll_interval)).await;
         }
     }
 }
 
-/// After this many consecutive zero-balance checks, a deposit is assumed to have been
-/// swept as part of a consolidated sweep and is marked as swept to avoid infinite retries.
 const MAX_ZERO_BALANCE_RETRIES: u64 = 10;
-
-/// After this many consecutive sweep failures (e.g. "buffer overrun while deserializing"),
-/// a deposit is marked as permanently failed to stop wasting RPC credits on deterministic errors.
 const MAX_SWEEP_RETRIES: u64 = 5;
+const QUEUE_LOG_INTERVAL_CYCLES: u64 = 60;
 
-impl<T> Sweeper<alloy::providers::RootProvider<T>>
-where
-    T: alloy::transports::Transport + Clone,
-{
+fn is_permanent_sweep_error(err_debug: &str) -> bool {
+    let s = err_debug.to_ascii_lowercase();
+    s.contains("buffer overrun") || s.contains("deserializ")
+}
+
+fn is_transient_funding_error(err_debug: &str) -> bool {
+    let s = err_debug.to_ascii_lowercase();
+    s.contains("faucet has insufficient balance")
+        || s.contains("insufficient native balance for gas")
+        || s.contains("still insufficient balance after faucet")
+}
+
+impl Sweeper {
     pub fn new(
-        config: Config,
+        chain: ChainConfig,
+        webhook_jwt_token: Option<String>,
         db: Db,
         wallet: Wallet,
-        provider: alloy::providers::RootProvider<T>,
-        faucet: Arc<Faucet<alloy::providers::RootProvider<T>>>,
+        provider: RootProvider<BoxTransport>,
+        faucet: Arc<Faucet>,
     ) -> Self {
         Self {
-            config,
+            chain,
+            webhook_jwt_token,
             db,
             wallet,
             provider,
@@ -84,17 +97,43 @@ where
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn process_deposits_once(&self) -> Result<()> {
+        self.process_deposits().await
+    }
+
+    async fn log_deposit_queue(&self, reason: &str) {
+        match self.db.deposit_queue_counts(&self.chain.name) {
+            Ok(counts) => {
+                if counts.has_pending() {
+                    info!(
+                        "[{}] Sweeper queue ({reason}): native detected={}, native failed={}, erc20 detected={}, erc20 failed={}",
+                        self.chain.name,
+                        counts.native_detected,
+                        counts.native_failed,
+                        counts.erc20_detected,
+                        counts.erc20_failed
+                    );
+                }
+            }
+            Err(e) => {
+                error!(
+                    "[{}] Failed to read deposit queue counts: {:?}",
+                    self.chain.name, e
+                );
+            }
+        }
+    }
+
     async fn process_deposits(&self) -> Result<()> {
-        // Process native ETH deposits
-        let deposits = self.db.get_detected_deposits()?;
+        let deposits = self.db.get_detected_deposits(&self.chain.name)?;
 
         for (tx_hash, registration_id, amount_str) in deposits {
             info!(
-                "Processing native ETH deposit: tx_hash={}, registration_id={}, amount={}",
-                tx_hash, registration_id, amount_str
+                "[{}] Processing native deposit: tx_hash={}, registration_id={}, amount={}",
+                self.chain.name, tx_hash, registration_id, amount_str
             );
 
-            // Get account details to derive key (registration_id is the key in ACCOUNTS table)
             let (derivation_index, address_str, _webhook_url) = self
                 .db
                 .get_account_by_id(&registration_id)?
@@ -118,64 +157,60 @@ where
                 )
                 .await
             {
-                Ok(_) => info!("Successfully swept native ETH deposit: {}", tx_hash),
+                Ok(_) => info!(
+                    "[{}] Successfully swept native deposit: {}",
+                    self.chain.name, tx_hash
+                ),
                 Err(e) => {
-                    error!("Failed to sweep native ETH deposit {}: {:?}", tx_hash, e);
+                    let err_str = format!("{:?}", e);
+                    if is_transient_funding_error(&err_str) {
+                        warn!(
+                            "[{}] Native deposit {} waiting for faucet funding: {}",
+                            self.chain.name, tx_hash, err_str
+                        );
+                    } else {
+                        error!(
+                            "[{}] Failed to sweep native deposit {}: {}",
+                            self.chain.name, tx_hash, err_str
+                        );
+                    }
                 }
             }
         }
 
-        // Process ERC20 deposits
-        let erc20_deposits = self.db.get_detected_erc20_deposits()?;
-
-        // Track (address, token) pairs already swept in this cycle to avoid redundant attempts.
-        // After sweeping the full token_balance for one deposit, all other deposits for the same
-        // address+token are already marked as swept by the bulk mark method. Any remaining ones
-        // would see zero balance and harmlessly skip, but we can avoid the RPC call entirely.
+        let erc20_deposits = self.db.get_detected_erc20_deposits(&self.chain.name)?;
         let mut swept_pairs: HashSet<(String, String)> = HashSet::new();
 
         for deposit in erc20_deposits {
-            // deposit.account_id is actually the registration_id (original id from registration)
             let registration_id = &deposit.account_id;
 
-            info!(
-                "Processing ERC20 deposit: key={}, token={} ({}), registration_id={}, amount={}",
-                deposit.key,
-                deposit.token_symbol,
-                deposit.token_address,
-                registration_id,
-                deposit.amount
-            );
-
-            if deposit.token_symbol == "UNKNOWN" {
-                error!(
-                    "Skipping ERC20 deposit token symbol for deposit: {}",
-                    deposit.key
+            if !self.chain.is_token_allowed(&deposit.token_address) {
+                info!(
+                    "[{}] Skipping non-allowlisted ERC20 deposit: key={}, token={}",
+                    self.chain.name, deposit.key, deposit.token_address
                 );
-                self.db.mark_erc20_deposit_swept(&deposit.key)?;
+                self.db
+                    .mark_erc20_deposit_failed(&self.chain.name, &deposit.key)?;
                 continue;
             }
 
-            // Get account details to derive key (registration_id is the key in ACCOUNTS table)
+            if deposit.token_symbol == "UNKNOWN" {
+                self.db
+                    .mark_erc20_deposit_swept(&self.chain.name, &deposit.key)?;
+                continue;
+            }
+
             let (derivation_index, address_str, _webhook_url) = self
                 .db
                 .get_account_by_id(registration_id)?
                 .ok_or_else(|| anyhow::anyhow!("Account not found"))?;
 
-            // Skip if we already swept this (address, token) pair in this cycle
             let pair_key = (address_str.clone(), deposit.token_address.clone());
             if swept_pairs.contains(&pair_key) {
-                info!(
-                    "Skipping ERC20 deposit {} - already swept address {} for token {} in this cycle",
-                    deposit.key, address_str, deposit.token_symbol
-                );
                 continue;
             }
 
             let signer = self.wallet.get_signer(derivation_index)?;
-
-            info!("Signer address: {}", signer.address());
-
             let wallet = alloy::network::EthereumWallet::from(signer);
 
             let sweep_provider = alloy::providers::ProviderBuilder::new()
@@ -183,32 +218,52 @@ where
                 .wallet(wallet)
                 .on_provider(&self.provider);
 
-            // Try to sweep, but don't fail the entire loop if one sweep fails
             match self
                 .sweep_erc20_deposit(&sweep_provider, &address_str, &deposit)
                 .await
             {
                 Ok(_) => {
-                    info!("Successfully swept ERC20 deposit: {}", deposit.key);
                     swept_pairs.insert(pair_key);
                 }
                 Err(e) => {
-                    error!("Failed to sweep ERC20 deposit {}: {:?}", deposit.key, e);
-                    if let Ok(failures) = self.db.increment_sweep_failure_count(&deposit.key) {
-                        if failures >= MAX_SWEEP_RETRIES {
-                            let registration_id = &deposit.account_id;
-                            match self.db.mark_erc20_deposits_failed_for_account_token(
+                    let err_str = format!("{:?}", e);
+                    if is_transient_funding_error(&err_str) {
+                        warn!(
+                            "[{}] ERC20 deposit {} waiting for faucet funding: {}",
+                            self.chain.name, deposit.key, err_str
+                        );
+                    } else {
+                        error!(
+                            "[{}] Failed to sweep ERC20 deposit {}: {}",
+                            self.chain.name, deposit.key, err_str
+                        );
+                        if is_permanent_sweep_error(&err_str) {
+                            let failed = self.db.mark_erc20_deposits_failed_for_account_token(
+                                &self.chain.name,
                                 registration_id,
                                 &deposit.token_address,
-                            ) {
-                                Ok(failed_keys) => {
-                                    error!(
-                                        "Permanently marked {} deposit(s) as failed for account={}, token={} after {} attempts: {:?}",
-                                        failed_keys.len(), registration_id, deposit.token_symbol, failures, e
+                            )?;
+                            for key in failed {
+                                warn!(
+                                    "[{}] Permanently failed ERC20 deposit {} (permanent sweep error)",
+                                    self.chain.name, key
+                                );
+                            }
+                        } else if let Ok(failures) = self
+                            .db
+                            .increment_sweep_failure_count(&self.chain.name, &deposit.key)
+                        {
+                            if failures >= MAX_SWEEP_RETRIES {
+                                let failed = self.db.mark_erc20_deposits_failed_for_account_token(
+                                    &self.chain.name,
+                                    registration_id,
+                                    &deposit.token_address,
+                                )?;
+                                for key in failed {
+                                    warn!(
+                                        "[{}] Permanently failed ERC20 deposit {} after {} attempts: {}",
+                                        self.chain.name, key, failures, err_str
                                     );
-                                }
-                                Err(db_err) => {
-                                    error!("Failed to mark deposits as failed: {:?}", db_err);
                                 }
                             }
                         }
@@ -229,74 +284,33 @@ where
         amount_str: &str,
     ) -> Result<()>
     where
-        SP: Provider<T, alloy::network::Ethereum>,
+        SP: Provider<BoxTransport, alloy::network::Ethereum>,
     {
         let from_address = Address::from_str(from_address_str)?;
-        let to_address = Address::from_str(&self.config.treasury_address)?;
+        let to_address = Address::from_str(&self.chain.treasury_address)?;
 
-        // Check balance again to be sure (and to calculate gas)
         let mut balance = provider.get_balance(from_address).await?;
-
-        // Standard ETH transfer gas limit
         let gas_limit: u128 = 21000;
-
-        // Get current fee estimates (EIP-1559 compatible)
         let fee_estimate = provider.estimate_eip1559_fees(None).await?;
         let max_fee_per_gas = fee_estimate.max_fee_per_gas;
-
-        // Calculate gas cost with 50% buffer for price fluctuations
         let gas_cost = U256::from(gas_limit) * U256::from(max_fee_per_gas);
         let gas_cost_with_buffer = gas_cost + (gas_cost / U256::from(10));
 
-        info!(
-            "Gas estimation for native ETH transfer: gas_limit={}, max_fee_per_gas={}, gas_cost={} wei (with 50% buffer: {} wei)",
-            gas_limit, max_fee_per_gas, gas_cost, gas_cost_with_buffer
-        );
-
-        // If balance is too low to cover gas, try to fund via faucet
         if balance <= gas_cost_with_buffer {
-            info!(
-                "Balance too low to sweep: {} <= {}. Attempting to fund via faucet...",
-                balance, gas_cost_with_buffer
-            );
-
-            // Fund the address via faucet
             match self.faucet.fund_new_address(from_address_str).await {
-                Ok(tx_hash) => {
-                    info!(
-                        "Successfully funded address {} via faucet with tx: {}. Waiting for balance update...",
-                        from_address_str, tx_hash
-                    );
-
-                    // Wait a bit for the transaction to be processed and balance to update
+                Ok(_) => {
                     sleep(Duration::from_secs(2)).await;
-
-                    // Re-check the balance after funding
                     balance = provider.get_balance(from_address).await?;
-                    info!(
-                        "Updated balance after faucet funding: {} wei for address {}",
-                        balance, from_address_str
-                    );
-
-                    // Final check - if still not enough, return error
                     if balance <= gas_cost_with_buffer {
                         return Err(anyhow::anyhow!(
-                            "Still insufficient balance after faucet funding. Address: {}, Balance: {} wei, Gas cost: {} wei",
-                            from_address_str, balance, gas_cost_with_buffer
+                            "Still insufficient balance after faucet funding"
                         ));
                     }
                 }
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to fund address {} via faucet: {}",
-                        from_address_str,
-                        e
-                    ));
-                }
+                Err(e) => return Err(e),
             }
         }
 
-        // Use actual gas cost (without buffer) for value calculation to maximize sweep amount
         let value_to_send = balance - gas_cost_with_buffer;
 
         let tx = TransactionRequest::default()
@@ -307,21 +321,22 @@ where
         let pending_tx = provider.send_transaction(tx).await?;
         let receipt = pending_tx.get_receipt().await?;
 
-        info!("Swept funds! Tx hash: {:?}", receipt.transaction_hash);
+        self.db.mark_deposit_swept(&self.chain.name, tx_hash)?;
 
-        // Update DB
-        self.db.mark_deposit_swept(tx_hash)?;
-
-        // Send Webhook (for native deposits, id = tx_hash)
-        // account_id = Polygon address, registration_id = original id from registration
+        let webhook_id = format!("{}:{}", self.chain.name, tx_hash);
         self.send_webhook(
-            tx_hash,
+            &webhook_id,
             from_address_str,
             registration_id,
             tx_hash,
             amount_str,
         )
         .await?;
+
+        info!(
+            "[{}] Swept funds! Tx hash: {:?}",
+            self.chain.name, receipt.transaction_hash
+        );
 
         Ok(())
     }
@@ -333,215 +348,115 @@ where
         deposit: &Erc20Deposit,
     ) -> Result<()>
     where
-        SP: Provider<T, alloy::network::Ethereum>,
+        SP: Provider<BoxTransport, alloy::network::Ethereum>,
     {
         let from_address = Address::from_str(from_address_str)?;
-        let to_address = Address::from_str(&self.config.treasury_address)?;
+        let to_address = Address::from_str(&self.chain.treasury_address)?;
         let token_address = Address::from_str(&deposit.token_address)?;
 
-        // Check token balance first
         let token_balance = get_token_balance(&self.provider, token_address, from_address).await?;
 
         if deposit.token_symbol.len() > 5 {
-            error!(
-                "Skipping ERC20 deposit token symbol '{}' exceeds 5 characters for deposit: {}",
-                deposit.token_symbol, deposit.key
-            );
-            self.db.mark_erc20_deposit_swept(&deposit.key)?;
+            self.db
+                .mark_erc20_deposit_swept(&self.chain.name, &deposit.key)?;
             return Ok(());
         }
 
         if token_balance.is_zero() {
-            let retry_count = self.db.increment_zero_balance_count(&deposit.key)?;
+            let retry_count = self
+                .db
+                .increment_zero_balance_count(&self.chain.name, &deposit.key)?;
             if retry_count >= MAX_ZERO_BALANCE_RETRIES {
-                self.db.mark_erc20_deposit_swept(&deposit.key)?;
-                info!(
-                    "Marking deposit {} as swept after {} zero-balance retries (funds likely consolidated in a prior sweep)",
-                    deposit.key, retry_count
-                );
-            } else {
-                info!(
-                    "ERC20 balance is zero for {} at {}, retry {}/{} (will retry next cycle)",
-                    deposit.token_symbol, from_address_str, retry_count, MAX_ZERO_BALANCE_RETRIES
-                );
+                self.db
+                    .mark_erc20_deposit_swept(&self.chain.name, &deposit.key)?;
             }
             return Ok(());
         }
 
-        // Sweep the full on-chain token balance to ensure all funds are moved to treasury,
-        // regardless of how many individual deposits contributed to this balance.
         let amount = token_balance;
-
-        // Build ERC20 transfer call data for gas estimation
         let transfer_call = IERC20::transferCall {
             to: to_address,
             amount,
         };
-
         let call_data = transfer_call.abi_encode();
 
-        // Build transaction request for gas estimation
         let tx_for_estimate = TransactionRequest::default()
             .with_from(from_address)
             .with_to(token_address)
             .with_input(call_data.clone());
 
-        // Estimate actual gas needed for this specific transaction
         let estimated_gas = provider.estimate_gas(&tx_for_estimate).await?;
-
         let gas_limit_with_buffer = estimated_gas + (estimated_gas / 10);
-
-        // Get current fee estimates (EIP-1559 compatible)
         let fee_estimate = provider.estimate_eip1559_fees(None).await?;
         let max_fee_per_gas = fee_estimate.max_fee_per_gas;
-
-        // Calculate worst-case gas cost with safety buffer
-        // Add extra 10% buffer on top for gas price fluctuations
         let estimated_gas_cost = U256::from(gas_limit_with_buffer) * U256::from(max_fee_per_gas);
         let estimated_gas_cost_with_buffer =
             estimated_gas_cost + (estimated_gas_cost / U256::from(10));
 
-        info!(
-            "Gas estimation for ERC20 transfer: gas={}, max_fee_per_gas={}, estimated_cost={} wei (with 50% buffer: {} wei)",
-            gas_limit_with_buffer, max_fee_per_gas, estimated_gas_cost, estimated_gas_cost_with_buffer
-        );
-
-        // Check native balance (need gas for ERC20 transfer)
         let mut native_balance = provider.get_balance(from_address).await?;
 
-        info!(
-            "Native balance: {} wei for address {}",
-            native_balance, from_address_str
-        );
-
-        // If insufficient balance for gas, try to fund via faucet
         if native_balance < estimated_gas_cost_with_buffer {
-            info!(
-                "Insufficient native balance for gas. Address: {}, Balance: {} wei, Estimated gas cost: {} wei. Attempting to fund via faucet...",
-                from_address_str, native_balance, estimated_gas_cost_with_buffer
-            );
-
-            // Fund the address via faucet
             match self.faucet.fund_new_address(from_address_str).await {
-                Ok(tx_hash) => {
-                    info!(
-                        "Successfully funded address {} via faucet with tx: {}. Waiting for balance update...",
-                        from_address_str, tx_hash
-                    );
-
-                    // Wait a bit for the transaction to be processed and balance to update
+                Ok(_) => {
                     sleep(Duration::from_secs(2)).await;
-
-                    // Re-check the balance after funding
                     native_balance = provider.get_balance(from_address).await?;
-                    info!(
-                        "Updated native balance after faucet funding: {} wei for address {}",
-                        native_balance, from_address_str
-                    );
-
-                    // Final check - if still not enough, error out
                     if native_balance < estimated_gas_cost_with_buffer {
-                        error!(
-                            "Still insufficient balance after faucet funding. Address: {}, Balance: {} wei, Required: {} wei",
-                            from_address_str, native_balance, estimated_gas_cost_with_buffer
-                        );
                         return Err(anyhow::anyhow!(
-                            "Insufficient native balance for gas even after faucet funding. Need at least {} wei, but only have {} wei",
-                            estimated_gas_cost_with_buffer,
-                            native_balance
+                            "Insufficient native balance for gas even after faucet funding"
                         ));
                     }
                 }
-                Err(e) => {
-                    error!(
-                        "Failed to fund address {} via faucet: {:?}",
-                        from_address_str, e
-                    );
-                    return Err(anyhow::anyhow!(
-                        "Insufficient native balance for gas and faucet funding failed. Address: {}, Balance: {} wei, Error: {}",
-                        from_address_str,
-                        native_balance,
-                        e
-                    ));
-                }
+                Err(e) => return Err(e),
             }
         }
 
-        info!(
-            "Native balance check passed: {} wei (gas estimate with buffer: {} wei)",
-            native_balance, estimated_gas_cost_with_buffer
-        );
-
-        info!(
-            "Sweeping {} {} tokens (raw: {}) from {} to {} (native balance: {} wei)",
-            token_balance,
-            deposit.token_symbol,
-            token_balance,
-            from_address,
-            to_address,
-            native_balance
-        );
-
-        // Build final transaction with estimated gas limit
         let tx = TransactionRequest::default()
             .with_to(token_address)
             .with_input(call_data)
             .with_gas_limit(gas_limit_with_buffer);
 
-        info!("++++++++++++++++");
-        info!("Transaction request: {:?}", tx);
-        info!("++++++++++++++++");
-
         let pending_tx = provider.send_transaction(tx).await?;
-        info!("++++++++++++++++");
-        info!("Pending transaction: {:?}", pending_tx.tx_hash());
-        info!("++++++++++++++++");
         let receipt = pending_tx.get_receipt().await?;
-        info!("++++++++++++++++");
-        info!("Receipt: {:?}", receipt.transaction_hash);
-        info!("++++++++++++++++");
-
         let sweep_tx_hash = receipt.transaction_hash.to_string();
 
-        // Mark ALL detected deposits for this account+token as swept (consolidates multi-deposit sweeps)
         let registration_id = &deposit.account_id;
-        let marked_keys = self
-            .db
-            .mark_erc20_deposits_swept_for_account_token(registration_id, &deposit.token_address)?;
-
-        // Store sweep tx hash for all marked deposits (audit trail + webhook idempotency key)
-        self.db
-            .set_sweep_tx_hash_for_keys(&marked_keys, &sweep_tx_hash)?;
-
-        info!(
-            "Marked {} ERC20 deposit(s) as swept for account={}, token={}, sweep_tx={}: {:?}",
-            marked_keys.len(),
+        let swept = self.db.mark_erc20_deposits_swept_for_account_token(
+            &self.chain.name,
             registration_id,
-            deposit.token_symbol,
-            sweep_tx_hash,
-            marked_keys
-        );
+            &deposit.token_address,
+        )?;
 
-        // Fetch token decimals from DB
+        let keys: Vec<String> = swept.iter().map(|(k, _)| k.clone()).collect();
+        self.db
+            .set_sweep_tx_hash_for_keys(&self.chain.name, &keys, &sweep_tx_hash)?;
+
         let token_decimals = self
             .db
-            .get_token_metadata(&deposit.token_address)?
+            .get_token_metadata(&self.chain.name, &deposit.token_address)?
             .map(|(_, decimals, _)| decimals);
 
-        // Send Webhook with the actual swept amount and the sweep tx hash for consumer deduplication
-        let swept_amount_str = amount.to_string();
-        let webhook_info = Erc20WebhookInfo {
-            id: &deposit.key,
-            account_id: from_address_str,
-            registration_id,
-            deposit_key: &deposit.key,
-            amount: &swept_amount_str,
-            token_symbol: &deposit.token_symbol,
-            token_address: &deposit.token_address,
-            token_decimals,
-            sweep_tx_hash: &sweep_tx_hash,
-        };
-        self.send_erc20_webhook(&webhook_info).await?;
+        for (key, dep_amount) in &swept {
+            let webhook_id = format!("{}:{}", self.chain.name, key);
+            let webhook_info = Erc20WebhookInfo {
+                id: &webhook_id,
+                chain: &self.chain.name,
+                chain_id: self.chain.chain_id,
+                account_id: from_address_str,
+                registration_id,
+                deposit_key: key,
+                amount: dep_amount,
+                token_symbol: &deposit.token_symbol,
+                token_address: &deposit.token_address,
+                token_decimals,
+                sweep_tx_hash: &sweep_tx_hash,
+            };
+            if let Err(e) = self.send_erc20_webhook(&webhook_info).await {
+                error!(
+                    "[{}] swept webhook failed for {key}: {e:?}",
+                    self.chain.name
+                );
+            }
+        }
 
         Ok(())
     }
@@ -554,18 +469,15 @@ where
         tx_hash: &str,
         amount: &str,
     ) -> Result<()> {
-        // Get the webhook URL using registration_id (the key in ACCOUNTS table)
         let Some(webhook_url) = self.db.get_webhook_url(registration_id)? else {
-            error!(
-                "No webhook URL found for registration_id: {}",
-                registration_id
-            );
             return Ok(());
         };
 
         let client = reqwest::Client::new();
         let payload = serde_json::json!({
             "id": id,
+            "chain": self.chain.name,
+            "chain_id": self.chain.chain_id,
             "event": "deposit_swept",
             "account_id": account_id,
             "registration_id": registration_id,
@@ -574,50 +486,28 @@ where
             "token_type": "native"
         });
 
-        info!("++++++++++++++++");
-        info!("Webhook URL: {}", webhook_url);
-        info!("Sending webhook: {:?}", payload);
-        info!("++++++++++++++++");
-
         let mut request = client.post(&webhook_url).json(&payload);
-
-        // Add JWT authorization header if configured
-        if let Some(ref token) = self.config.webhook_jwt_token {
+        if let Some(ref token) = self.webhook_jwt_token {
             request = request.header("Authorization", format!("Bearer {}", token));
         }
-
-        let res = request.send().await;
-
-        match res {
-            Ok(r) => info!(
-                "Webhook sent to {}: status={}, registration_id={}",
-                webhook_url,
-                r.status(),
-                registration_id
-            ),
-            Err(e) => error!("Failed to send webhook to {}: {:?}", webhook_url, e),
-        }
-
+        let _ = request.send().await;
         Ok(())
     }
 
     async fn send_erc20_webhook(&self, info: &Erc20WebhookInfo<'_>) -> Result<()> {
-        // Get the webhook URL using registration_id (the key in ACCOUNTS table)
         let Some(webhook_url) = self.db.get_webhook_url(info.registration_id)? else {
-            error!(
-                "No webhook URL found for registration_id: {}",
-                info.registration_id
-            );
             return Ok(());
         };
 
         let client = reqwest::Client::new();
         let mut payload = serde_json::json!({
             "id": info.id,
+            "chain": info.chain,
+            "chain_id": info.chain_id,
             "event": "deposit_swept",
             "account_id": info.account_id,
             "registration_id": info.registration_id,
-            "original_tx_hash": info.deposit_key.split(':').nth(0).unwrap(),
+            "original_tx_hash": info.deposit_key.split(':').next().unwrap_or(info.deposit_key),
             "amount": info.amount,
             "token_type": "erc20",
             "token_symbol": info.token_symbol,
@@ -625,40 +515,19 @@ where
             "sweep_tx_hash": info.sweep_tx_hash
         });
 
-        info!("++++++++++++++++");
-        info!("Webhook URL: {}", webhook_url);
-        info!("Sending webhook: {:?}", payload);
-        info!("++++++++++++++++");
-
-        // Add decimals if available
         if let Some(decimals) = info.token_decimals {
             payload["token_decimals"] = serde_json::json!(decimals);
         }
 
         let mut request = client.post(&webhook_url).json(&payload);
-
-        // Add JWT authorization header if configured
-        if let Some(ref token) = self.config.webhook_jwt_token {
+        if let Some(ref token) = self.webhook_jwt_token {
             request = request.header("Authorization", format!("Bearer {}", token));
         }
-
-        let res = request.send().await;
-
-        match res {
-            Ok(r) => info!(
-                "ERC20 Webhook sent to {}: status={}, registration_id={}",
-                webhook_url,
-                r.status(),
-                info.registration_id
-            ),
-            Err(e) => error!("Failed to send ERC20 webhook to {}: {:?}", webhook_url, e),
-        }
-
+        let _ = request.send().await;
         Ok(())
     }
 }
 
-// ERC20 helper types and functions
 use alloy::sol;
 
 sol! {
@@ -675,15 +544,44 @@ sol! {
     }
 }
 
-async fn get_token_balance<T>(
-    provider: &alloy::providers::RootProvider<T>,
+async fn get_token_balance(
+    provider: &RootProvider<BoxTransport>,
     token_address: Address,
     owner_address: Address,
-) -> Result<U256>
-where
-    T: alloy::transports::Transport + Clone,
-{
+) -> Result<U256> {
     let contract = IERC20::new(token_address, provider);
     let balance = contract.balanceOf(owner_address).call().await?._0;
     Ok(balance)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_permanent_sweep_error, is_transient_funding_error};
+
+    #[test]
+    fn test_is_permanent_sweep_error() {
+        assert!(is_permanent_sweep_error(
+            "buffer overrun while deserializing"
+        ));
+        assert!(is_permanent_sweep_error(
+            "ABI decode failed: Deserialization error"
+        ));
+        assert!(!is_permanent_sweep_error("execution reverted"));
+        assert!(!is_permanent_sweep_error("network timeout"));
+    }
+
+    #[test]
+    fn test_is_transient_funding_error() {
+        assert!(is_transient_funding_error(
+            "Faucet has insufficient balance to fund new address"
+        ));
+        assert!(is_transient_funding_error(
+            "Insufficient native balance for gas even after faucet funding"
+        ));
+        assert!(is_transient_funding_error(
+            "Still insufficient balance after faucet funding"
+        ));
+        assert!(!is_transient_funding_error("execution reverted"));
+        assert!(!is_transient_funding_error("buffer overrun while deserializing"));
+    }
 }

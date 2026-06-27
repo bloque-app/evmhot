@@ -1,0 +1,38 @@
+# Copy to chains.toml (or set CHAINS_CONFIG=/path/to/chains.toml)
+# Secrets (MNEMONIC, FAUCET_MNEMONIC, DATABASE_URL, PORT, WEBHOOK_JWT_TOKEN, LEGACY_CHAIN) stay in env.
+#
+# Each [[chains]] block runs its own Monitor + Sweeper in one process.
+# Registration is chain-agnostic; the same derived address receives deposits on all chains.
+# RPC URLs are polled over HTTP(S) only (no WebSocket streaming).
+# Lazy faucet: addresses are funded for gas at sweep time, not at registration.
+
+[[chains]]
+name = "base"
+chain_id = 8453
+rpc_url = "https://base-mainnet.g.alchemy.com/v2/YOUR_KEY"
+treasury_address = "0x1111111111111111111111111111111111111111"
+faucet_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+existential_deposit = "10000000000000000"
+allowed_token_addresses = [
+  "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", # USDC on Base
+]
+block_offset_from_head = 20
+poll_interval = 10
+get_logs_max_retries = 30
+get_logs_delay_ms = 50
+min_deposit_default = "0"
+min_deposit_native = "0"
+
+[[chains]]
+name = "polygon"
+chain_id = 137
+rpc_url = "https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY"
+treasury_address = "0x2222222222222222222222222222222222222222"
+faucet_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+existential_deposit = "10000000000000000"
+allowed_token_addresses = [
+  "0xc2132D05D31c914a87C6611C10748AEb04B58e8f", # USDT on Polygon
+]
+min_deposit_native = "0"
+[chains.min_deposits]
+"0xc2132d05d31c914a87c6611c10748aeb04b58e8f" = "10000"
