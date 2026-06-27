@@ -15,6 +15,8 @@ const SWEEP_FAILURES: TableDefinition<&str, u64> = TableDefinition::new("sweep_f
 
 pub const SCHEMA_VERSION: u32 = 2;
 
+type Erc20DepositRow = (String, String, i64, String, String, String, String, String);
+
 #[derive(Clone)]
 pub struct RedbStore {
     db: Arc<Database>,
@@ -25,7 +27,7 @@ pub struct RedbSnapshot {
     pub accounts: Vec<(String, u32, String, String)>,
     pub address_to_id: Vec<(String, String)>,
     pub deposits: Vec<(String, String, String, String, String)>,
-    pub erc20_deposits: Vec<(String, String, i64, String, String, String, String, String)>,
+    pub erc20_deposits: Vec<Erc20DepositRow>,
     pub token_metadata: Vec<(String, String, String, u8, String)>,
     pub state: Vec<(String, String)>,
     pub sweep_meta: Vec<(String, String, i64, String, u64)>,
@@ -119,6 +121,7 @@ impl RedbStore {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_v2_erc20_deposit_for_test(
         &self,
         chain: &str,

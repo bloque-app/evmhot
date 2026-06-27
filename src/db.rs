@@ -295,6 +295,7 @@ impl Db {
         .map_err(Into::into)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_erc20_deposit(
         &self,
         chain: &str,

@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use crate::config::{ChainConfig, Config, MinDepositSettings};
 use crate::db::Db;
 use crate::webhook::WebhookDeliverer;
