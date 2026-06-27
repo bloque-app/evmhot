@@ -4,6 +4,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection, OptionalExtension};
 use rusqlite_migration::{Migrations, M};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DepositQueueCounts {
@@ -20,6 +21,19 @@ impl DepositQueueCounts {
             || self.erc20_detected > 0
             || self.erc20_failed > 0
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebhookDeliveryRecord {
+    pub id: String,
+    pub event: String,
+    pub registration_id: String,
+    pub webhook_url: String,
+    pub payload: String,
+    pub status: String,
+    pub attempt_count: u64,
+    pub last_http_status: Option<u16>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -43,7 +57,17 @@ pub fn normalize_db_path(database_url: &str) -> &str {
 }
 
 pub fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(include_str!("../migrations/V1__initial.sql"))])
+    Migrations::new(vec![
+        M::up(include_str!("../migrations/V1__initial.sql")),
+        M::up(include_str!("../migrations/V2__webhook_deliveries.sql")),
+    ])
+}
+
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
@@ -562,6 +586,176 @@ impl Db {
             .optional()?;
         Ok(count.unwrap_or(0) as u64)
     }
+
+    /// Insert or refresh a pending delivery. Returns true when the worker should be notified.
+    pub fn upsert_webhook_delivery(
+        &self,
+        id: &str,
+        event: &str,
+        registration_id: &str,
+        webhook_url: &str,
+        payload: &str,
+    ) -> Result<bool> {
+        self.with_write(|conn| {
+            let now = now_unix_secs();
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM webhook_deliveries WHERE id = ?1 AND event = ?2",
+                    params![id, event],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if existing.as_deref() == Some("delivered") {
+                return Ok(false);
+            }
+
+            if existing.is_none() {
+                conn.execute(
+                    "INSERT INTO webhook_deliveries
+                     (id, event, registration_id, webhook_url, payload, status, attempt_count,
+                      last_http_status, last_error, leased_until, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, NULL, NULL, NULL, ?6)",
+                    params![id, event, registration_id, webhook_url, payload, now],
+                )?;
+                return Ok(true);
+            }
+
+            if existing.as_deref() == Some("failed") {
+                return Ok(false);
+            }
+
+            conn.execute(
+                "UPDATE webhook_deliveries
+                 SET webhook_url = ?3, payload = ?4, updated_at = ?5
+                 WHERE id = ?1 AND event = ?2 AND status = 'pending'",
+                params![id, event, webhook_url, payload, now],
+            )?;
+            Ok(true)
+        })
+    }
+
+    pub fn claim_webhook_delivery(
+        &self,
+        id: &str,
+        event: &str,
+        lease_until: i64,
+        max_retries: u32,
+    ) -> Result<bool> {
+        let now = now_unix_secs();
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE webhook_deliveries
+                 SET leased_until = ?3, updated_at = ?4
+                 WHERE id = ?1 AND event = ?2
+                   AND status = 'pending'
+                   AND attempt_count < ?5
+                   AND (leased_until IS NULL OR leased_until < ?4)",
+                params![id, event, lease_until, now, max_retries as i64],
+            )?;
+            Ok(conn.changes() == 1)
+        })
+    }
+
+    pub fn record_webhook_attempt(
+        &self,
+        id: &str,
+        event: &str,
+        http_status: Option<u16>,
+        error: Option<&str>,
+        status: &str,
+    ) -> Result<u64> {
+        self.with_write(|conn| {
+            let now = now_unix_secs();
+            conn.execute(
+                "UPDATE webhook_deliveries
+                 SET attempt_count = attempt_count + 1,
+                     last_http_status = ?3,
+                     last_error = ?4,
+                     status = ?5,
+                     leased_until = NULL,
+                     updated_at = ?6
+                 WHERE id = ?1 AND event = ?2",
+                params![
+                    id,
+                    event,
+                    http_status.map(i64::from),
+                    error,
+                    status,
+                    now
+                ],
+            )?;
+            let count: i64 = conn.query_row(
+                "SELECT attempt_count FROM webhook_deliveries WHERE id = ?1 AND event = ?2",
+                params![id, event],
+                |row| row.get(0),
+            )?;
+            Ok(count as u64)
+        })
+    }
+
+    pub fn get_pending_webhook_delivery_keys(
+        &self,
+        max_retries: u32,
+        batch_size: u32,
+    ) -> Result<Vec<(String, String)>> {
+        let now = now_unix_secs();
+        let conn = self.read.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, event FROM webhook_deliveries
+             WHERE status = 'pending'
+               AND attempt_count < ?1
+               AND (leased_until IS NULL OR leased_until < ?2)
+             ORDER BY updated_at ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![max_retries as i64, now, batch_size as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn get_webhook_delivery(&self, id: &str, event: &str) -> Result<Option<WebhookDeliveryRecord>> {
+        let conn = self.read.get()?;
+        conn.query_row(
+            "SELECT id, event, registration_id, webhook_url, payload, status, attempt_count,
+                    last_http_status, last_error
+             FROM webhook_deliveries WHERE id = ?1 AND event = ?2",
+            params![id, event],
+            |row| {
+                let http_status: Option<i64> = row.get(7)?;
+                Ok(WebhookDeliveryRecord {
+                    id: row.get(0)?,
+                    event: row.get(1)?,
+                    registration_id: row.get(2)?,
+                    webhook_url: row.get(3)?,
+                    payload: row.get(4)?,
+                    status: row.get(5)?,
+                    attempt_count: row.get::<_, i64>(6)? as u64,
+                    last_http_status: http_status.map(|s| s as u16),
+                    last_error: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn retry_webhook_delivery(&self, id: &str, event: &str) -> Result<bool> {
+        let now = now_unix_secs();
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE webhook_deliveries
+                 SET status = 'pending', attempt_count = 0, leased_until = NULL,
+                     last_http_status = NULL, last_error = NULL, updated_at = ?3
+                 WHERE id = ?1 AND event = ?2 AND status = 'failed'",
+                params![id, event, now],
+            )?;
+            Ok(conn.changes() == 1)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -754,5 +948,106 @@ mod tests {
         let prefixed = format!("sqlite:{bare_str}");
         let db_prefixed = Db::new(&prefixed).unwrap();
         assert!(db_prefixed.get_account_by_id("u1").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_upsert_webhook_delivery_skips_delivered() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+        assert!(db
+            .upsert_webhook_delivery(
+                "polygon:0xabc",
+                "deposit_detected",
+                "user1",
+                "https://example.com/hook",
+                r#"{"id":"polygon:0xabc","event":"deposit_detected"}"#,
+            )
+            .unwrap());
+
+        db.record_webhook_attempt(
+            "polygon:0xabc",
+            "deposit_detected",
+            Some(200),
+            None,
+            "delivered",
+        )
+        .unwrap();
+
+        assert!(!db
+            .upsert_webhook_delivery(
+                "polygon:0xabc",
+                "deposit_detected",
+                "user1",
+                "https://example.com/hook",
+                r#"{"id":"polygon:0xabc","event":"deposit_detected"}"#,
+            )
+            .unwrap());
+
+        let row = db
+            .get_webhook_delivery("polygon:0xabc", "deposit_detected")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "delivered");
+    }
+
+    #[test]
+    fn test_claim_webhook_delivery_respects_lease() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+        db.upsert_webhook_delivery(
+            "base:0x1",
+            "deposit_swept",
+            "user1",
+            "https://example.com/hook",
+            r#"{"id":"base:0x1","event":"deposit_swept"}"#,
+        )
+        .unwrap();
+
+        let now = now_unix_secs();
+        assert!(db
+            .claim_webhook_delivery("base:0x1", "deposit_swept", now + 60, 5)
+            .unwrap());
+        assert!(!db
+            .claim_webhook_delivery("base:0x1", "deposit_swept", now + 120, 5)
+            .unwrap());
+    }
+
+    #[test]
+    fn test_retry_webhook_delivery_resets_failed_row() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+        db.upsert_webhook_delivery(
+            "polygon:0xdead",
+            "deposit_detected",
+            "user1",
+            "https://example.com/hook",
+            r#"{"id":"polygon:0xdead","event":"deposit_detected"}"#,
+        )
+        .unwrap();
+        db.record_webhook_attempt(
+            "polygon:0xdead",
+            "deposit_detected",
+            Some(503),
+            Some("HTTP status 503"),
+            "failed",
+        )
+        .unwrap();
+
+        assert!(db
+            .retry_webhook_delivery("polygon:0xdead", "deposit_detected")
+            .unwrap());
+
+        let row = db
+            .get_webhook_delivery("polygon:0xdead", "deposit_detected")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.attempt_count, 0);
+        assert!(!db
+            .retry_webhook_delivery("polygon:0xdead", "deposit_detected")
+            .unwrap());
     }
 }

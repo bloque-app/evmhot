@@ -24,6 +24,14 @@ async fn main() -> anyhow::Result<()> {
             "Disabled"
         }
     );
+    tracing::info!(
+        "Webhook retries: max={}, delay_ms={}, poll_interval_s={}, batch_size={}, lease_s={}",
+        config.webhook_max_retries,
+        config.webhook_retry_delay_ms,
+        config.webhook_retry_poll_interval_secs,
+        config.webhook_retry_batch_size,
+        config.webhook_lease_seconds
+    );
 
     let faucet_address = config.derived_faucet_address()?;
     tracing::info!("Faucet address: {}", faucet_address);

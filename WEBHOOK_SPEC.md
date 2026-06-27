@@ -47,3 +47,27 @@ Same fields as detection, plus for ERC20:
 ## Lazy faucet
 
 Registration does **not** fund addresses. Gas is funded just-in-time by the sweeper when a deposit needs sweeping. No `faucet_funding` webhook is emitted at registration time.
+
+## Delivery and retries
+
+Monitor and sweeper **enqueue** webhooks only; a background worker performs HTTP delivery with configurable retries.
+
+| Status | Meaning |
+|--------|---------|
+| `pending` | Awaiting delivery or scheduled for retry |
+| `delivered` | Receiver returned HTTP 2xx |
+| `failed` | `WEBHOOK_MAX_RETRIES` attempts exhausted |
+
+- Idempotency is unchanged: `(id, event)` is the primary key; already-`delivered` rows are not re-enqueued.
+- Non-2xx HTTP responses (including 503) count as failures and are retried.
+- The worker wakes immediately on enqueue and on `POST /admin/retry_webhooks`.
+- Duplicate POSTs are prevented via a lease (`WEBHOOK_LEASE_SECONDS`) claimed before each attempt.
+
+Admin retry (requires `WEBHOOK_JWT_TOKEN`):
+
+```bash
+curl -X POST http://localhost:3000/admin/retry_webhooks \
+  -H "Authorization: Bearer $WEBHOOK_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"base:0xabc:120","event":"deposit_swept"}'
+```

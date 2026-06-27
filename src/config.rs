@@ -117,6 +117,11 @@ pub struct Config {
     pub port: u16,
     /// Optional JWT token for webhook authorization
     pub webhook_jwt_token: Option<String>,
+    pub webhook_max_retries: u32,
+    pub webhook_retry_delay_ms: u64,
+    pub webhook_retry_poll_interval_secs: u64,
+    pub webhook_retry_batch_size: u32,
+    pub webhook_lease_seconds: u64,
     /// Default chain name for the redb→SQLite importer only (`LEGACY_CHAIN`, default: `polygon`).
     pub legacy_chain: String,
     pub chains: Vec<ChainConfig>,
@@ -135,6 +140,11 @@ impl Config {
             .unwrap_or_else(|_| "3000".to_string())
             .parse()?;
         let webhook_jwt_token = env::var("WEBHOOK_JWT_TOKEN").ok();
+        let webhook_max_retries = env_u32("WEBHOOK_MAX_RETRIES", 5);
+        let webhook_retry_delay_ms = env_u64("WEBHOOK_RETRY_DELAY_MS", 1000);
+        let webhook_retry_poll_interval_secs = env_u64("WEBHOOK_RETRY_POLL_INTERVAL", 30);
+        let webhook_retry_batch_size = env_u32("WEBHOOK_RETRY_BATCH_SIZE", 50);
+        let webhook_lease_seconds = env_u64("WEBHOOK_LEASE_SECONDS", 60);
         let legacy_chain = env::var("LEGACY_CHAIN").unwrap_or_else(|_| "polygon".to_string());
 
         let chains_config_path =
@@ -147,6 +157,11 @@ impl Config {
             faucet_mnemonic,
             port,
             webhook_jwt_token,
+            webhook_max_retries,
+            webhook_retry_delay_ms,
+            webhook_retry_poll_interval_secs,
+            webhook_retry_batch_size,
+            webhook_lease_seconds,
             legacy_chain,
             chains,
         })
@@ -264,6 +279,20 @@ fn validate_chain_name(name: &str) -> Result<()> {
 
 fn parse_u256_str(value: &str, field: &str) -> Result<U256> {
     U256::from_str(value.trim()).with_context(|| format!("Invalid {field} value: {value}"))
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Parse `MIN_DEPOSITS` as comma-separated `address=rawamount` pairs.

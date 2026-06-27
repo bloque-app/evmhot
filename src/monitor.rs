@@ -1,9 +1,10 @@
-use crate::{config::ChainConfig, db::Db};
+use crate::{config::ChainConfig, db::Db, webhook::WebhookDeliverer};
 use alloy::primitives::Address;
 use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::BlockNumberOrTag;
 use alloy::transports::BoxTransport;
 use anyhow::Result;
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 /// Information about a detected deposit for webhook notification
@@ -23,7 +24,7 @@ struct DepositInfo<'a> {
 
 pub struct Monitor {
     chain: ChainConfig,
-    webhook_jwt_token: Option<String>,
+    deliverer: Arc<WebhookDeliverer>,
     db: Db,
     provider: RootProvider<BoxTransport>,
 }
@@ -31,13 +32,13 @@ pub struct Monitor {
 impl Monitor {
     pub fn new(
         chain: ChainConfig,
-        webhook_jwt_token: Option<String>,
+        deliverer: Arc<WebhookDeliverer>,
         db: Db,
         provider: RootProvider<BoxTransport>,
     ) -> Self {
         Self {
             chain,
-            webhook_jwt_token,
+            deliverer,
             db,
             provider,
         }
@@ -388,8 +389,6 @@ impl Monitor {
             return Ok(());
         };
 
-        let client = reqwest::Client::new();
-
         let mut payload = serde_json::json!({
             "id": info.id,
             "chain": info.chain,
@@ -412,27 +411,14 @@ impl Monitor {
             payload["token_decimals"] = serde_json::json!(decimals);
         }
 
-        let mut request = client.post(&webhook_url).json(&payload);
+        self.deliverer
+            .enqueue(&webhook_url, info.registration_id, payload)
+            .await?;
 
-        if let Some(ref token) = self.webhook_jwt_token {
-            request = request.header("Authorization", format!("Bearer {}", token));
-        }
-
-        let res = request.send().await;
-
-        match res {
-            Ok(r) => info!(
-                "[{}] Deposit detected webhook sent to {}: status={}, registration_id={}",
-                info.chain,
-                webhook_url,
-                r.status(),
-                info.registration_id
-            ),
-            Err(e) => error!(
-                "[{}] Failed to send deposit detected webhook to {}: {:?}",
-                info.chain, webhook_url, e
-            ),
-        }
+        info!(
+            "[{}] Deposit detected webhook enqueued for {} (registration_id={})",
+            info.chain, webhook_url, info.registration_id
+        );
 
         Ok(())
     }

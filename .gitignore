@@ -19,3 +19,7 @@ backups/
 *.log
 .envrc
 chains.toml
+*.bak
+
+# One-off operational scripts containing real PII / account data
+scripts/retry_deposit_webhooks.sh

@@ -7,7 +7,7 @@ use axum::{
 };
 use evm_hot_wallet::{
     HotWalletService, RegisterRequest, RegisterResponse, RetrySweepRequest, RetrySweepResponse,
-    VerifyTransferRequest, VerifyTransferResponse,
+    RetryWebhookRequest, RetryWebhookResponse, VerifyTransferRequest, VerifyTransferResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -47,6 +47,7 @@ pub async fn start_server(service: HotWalletService, port: u16) {
         .route("/block_number", get(get_block_number))
         .route("/block_number", post(set_block_number))
         .route("/admin/retry_sweeps", post(retry_sweeps))
+        .route("/admin/retry_webhooks", post(retry_webhooks))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
@@ -142,10 +143,27 @@ async fn retry_sweeps(
         .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
+async fn retry_webhooks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<RetryWebhookRequest>,
+) -> Result<Json<RetryWebhookResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    state.service.retry_webhook(payload).map(Json).map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("No failed webhook delivery found") {
+            ApiError::NotFound(msg)
+        } else {
+            ApiError::Internal(msg)
+        }
+    })
+}
+
 #[derive(Debug)]
 enum ApiError {
     Internal(String),
     Unauthorized(String),
+    NotFound(String),
 }
 
 impl IntoResponse for ApiError {
@@ -153,6 +171,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
         };
 
         (status, message).into_response()

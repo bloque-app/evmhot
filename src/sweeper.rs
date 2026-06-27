@@ -3,6 +3,7 @@ use crate::{
     db::{Db, Erc20Deposit},
     faucet::Faucet,
     wallet::Wallet,
+    webhook::WebhookDeliverer,
 };
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, U256};
@@ -34,7 +35,7 @@ struct Erc20WebhookInfo<'a> {
 
 pub struct Sweeper {
     chain: ChainConfig,
-    webhook_jwt_token: Option<String>,
+    deliverer: Arc<WebhookDeliverer>,
     db: Db,
     wallet: Wallet,
     provider: RootProvider<BoxTransport>,
@@ -81,7 +82,7 @@ fn is_transient_funding_error(err_debug: &str) -> bool {
 impl Sweeper {
     pub fn new(
         chain: ChainConfig,
-        webhook_jwt_token: Option<String>,
+        deliverer: Arc<WebhookDeliverer>,
         db: Db,
         wallet: Wallet,
         provider: RootProvider<BoxTransport>,
@@ -89,7 +90,7 @@ impl Sweeper {
     ) -> Self {
         Self {
             chain,
-            webhook_jwt_token,
+            deliverer,
             db,
             wallet,
             provider,
@@ -324,14 +325,22 @@ impl Sweeper {
         self.db.mark_deposit_swept(&self.chain.name, tx_hash)?;
 
         let webhook_id = format!("{}:{}", self.chain.name, tx_hash);
-        self.send_webhook(
-            &webhook_id,
-            from_address_str,
-            registration_id,
-            tx_hash,
-            amount_str,
-        )
-        .await?;
+        if let Err(e) = self
+            .enqueue_deposit_swept_webhook(
+                &webhook_id,
+                from_address_str,
+                registration_id,
+                tx_hash,
+                amount_str,
+                None,
+            )
+            .await
+        {
+            error!(
+                "[{}] Failed to enqueue deposit_swept webhook for {webhook_id}: {e:?}",
+                self.chain.name
+            );
+        }
 
         info!(
             "[{}] Swept funds! Tx hash: {:?}",
@@ -450,9 +459,9 @@ impl Sweeper {
                 token_decimals,
                 sweep_tx_hash: &sweep_tx_hash,
             };
-            if let Err(e) = self.send_erc20_webhook(&webhook_info).await {
+            if let Err(e) = self.enqueue_erc20_webhook(&webhook_info).await {
                 error!(
-                    "[{}] swept webhook failed for {key}: {e:?}",
+                    "[{}] swept webhook enqueue failed for {key}: {e:?}",
                     self.chain.name
                 );
             }
@@ -461,70 +470,67 @@ impl Sweeper {
         Ok(())
     }
 
-    async fn send_webhook(
+    async fn enqueue_deposit_swept_webhook(
         &self,
         id: &str,
         account_id: &str,
         registration_id: &str,
         tx_hash: &str,
         amount: &str,
+        erc20_info: Option<&Erc20WebhookInfo<'_>>,
     ) -> Result<()> {
         let Some(webhook_url) = self.db.get_webhook_url(registration_id)? else {
             return Ok(());
         };
 
-        let client = reqwest::Client::new();
-        let payload = serde_json::json!({
-            "id": id,
-            "chain": self.chain.name,
-            "chain_id": self.chain.chain_id,
-            "event": "deposit_swept",
-            "account_id": account_id,
-            "registration_id": registration_id,
-            "original_tx_hash": tx_hash,
-            "amount": amount,
-            "token_type": "native"
-        });
-
-        let mut request = client.post(&webhook_url).json(&payload);
-        if let Some(ref token) = self.webhook_jwt_token {
-            request = request.header("Authorization", format!("Bearer {}", token));
-        }
-        let _ = request.send().await;
-        Ok(())
-    }
-
-    async fn send_erc20_webhook(&self, info: &Erc20WebhookInfo<'_>) -> Result<()> {
-        let Some(webhook_url) = self.db.get_webhook_url(info.registration_id)? else {
-            return Ok(());
+        let payload = if let Some(info) = erc20_info {
+            let mut payload = serde_json::json!({
+                "id": info.id,
+                "chain": info.chain,
+                "chain_id": info.chain_id,
+                "event": "deposit_swept",
+                "account_id": info.account_id,
+                "registration_id": info.registration_id,
+                "original_tx_hash": info.deposit_key.split(':').next().unwrap_or(info.deposit_key),
+                "amount": info.amount,
+                "token_type": "erc20",
+                "token_symbol": info.token_symbol,
+                "token_address": info.token_address,
+                "sweep_tx_hash": info.sweep_tx_hash
+            });
+            if let Some(decimals) = info.token_decimals {
+                payload["token_decimals"] = serde_json::json!(decimals);
+            }
+            payload
+        } else {
+            serde_json::json!({
+                "id": id,
+                "chain": self.chain.name,
+                "chain_id": self.chain.chain_id,
+                "event": "deposit_swept",
+                "account_id": account_id,
+                "registration_id": registration_id,
+                "original_tx_hash": tx_hash,
+                "amount": amount,
+                "token_type": "native"
+            })
         };
 
-        let client = reqwest::Client::new();
-        let mut payload = serde_json::json!({
-            "id": info.id,
-            "chain": info.chain,
-            "chain_id": info.chain_id,
-            "event": "deposit_swept",
-            "account_id": info.account_id,
-            "registration_id": info.registration_id,
-            "original_tx_hash": info.deposit_key.split(':').next().unwrap_or(info.deposit_key),
-            "amount": info.amount,
-            "token_type": "erc20",
-            "token_symbol": info.token_symbol,
-            "token_address": info.token_address,
-            "sweep_tx_hash": info.sweep_tx_hash
-        });
+        self.deliverer
+            .enqueue(&webhook_url, registration_id, payload)
+            .await
+    }
 
-        if let Some(decimals) = info.token_decimals {
-            payload["token_decimals"] = serde_json::json!(decimals);
-        }
-
-        let mut request = client.post(&webhook_url).json(&payload);
-        if let Some(ref token) = self.webhook_jwt_token {
-            request = request.header("Authorization", format!("Bearer {}", token));
-        }
-        let _ = request.send().await;
-        Ok(())
+    async fn enqueue_erc20_webhook(&self, info: &Erc20WebhookInfo<'_>) -> Result<()> {
+        self.enqueue_deposit_swept_webhook(
+            info.id,
+            info.account_id,
+            info.registration_id,
+            info.deposit_key,
+            info.amount,
+            Some(info),
+        )
+        .await
     }
 }
 

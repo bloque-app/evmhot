@@ -4,10 +4,11 @@ use crate::monitor::Monitor;
 use crate::sweeper::Sweeper;
 use crate::test_support::{
     chain_treasury, http_provider_boxed, test_chain_config_named, test_config,
-    test_config_multichain, TEST_CHAIN,
+    test_config_multichain, test_webhook_deliverer, TEST_CHAIN,
 };
 use crate::traits::Service;
 use crate::wallet::Wallet;
+use crate::webhook::WebhookRetryService;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,9 +71,11 @@ async fn test_e2e_deposit_sweep_flow() {
         .mount(&webhook_server)
         .await;
 
+    let deliverer = test_webhook_deliverer(db.clone());
+    spawn_webhook_worker(Arc::clone(&deliverer));
     spawn_chain_workers(
         chain_cfg,
-        config.webhook_jwt_token.clone(),
+        deliverer,
         config.faucet_mnemonic.clone(),
         db.clone(),
         wallet.clone(),
@@ -133,9 +136,11 @@ async fn test_e2e_multichain_same_address_both_swept() {
         .mount(&webhook_server)
         .await;
 
+    let deliverer = test_webhook_deliverer(db.clone());
+    spawn_webhook_worker(Arc::clone(&deliverer));
     spawn_chain_workers(
         base_cfg.clone(),
-        config.webhook_jwt_token.clone(),
+        Arc::clone(&deliverer),
         config.faucet_mnemonic.clone(),
         db.clone(),
         wallet.clone(),
@@ -143,7 +148,7 @@ async fn test_e2e_multichain_same_address_both_swept() {
     );
     spawn_chain_workers(
         polygon_cfg,
-        config.webhook_jwt_token,
+        deliverer,
         config.faucet_mnemonic,
         db.clone(),
         wallet,
@@ -200,9 +205,11 @@ async fn test_e2e_one_chain_down_other_sweeps() {
         .mount(&webhook_server)
         .await;
 
+    let deliverer = test_webhook_deliverer(db.clone());
+    spawn_webhook_worker(Arc::clone(&deliverer));
     spawn_chain_workers(
         base_cfg.clone(),
-        config.webhook_jwt_token.clone(),
+        Arc::clone(&deliverer),
         config.faucet_mnemonic.clone(),
         db.clone(),
         wallet.clone(),
@@ -210,7 +217,7 @@ async fn test_e2e_one_chain_down_other_sweeps() {
     );
     spawn_chain_workers(
         dead_cfg,
-        config.webhook_jwt_token,
+        deliverer,
         config.faucet_mnemonic,
         db.clone(),
         wallet,
@@ -230,9 +237,16 @@ async fn test_e2e_one_chain_down_other_sweeps() {
     }
 }
 
+fn spawn_webhook_worker(deliverer: Arc<crate::webhook::WebhookDeliverer>) {
+    let worker = WebhookRetryService::new(deliverer);
+    tokio::spawn(async move {
+        worker.run().await;
+    });
+}
+
 fn spawn_chain_workers(
     chain_cfg: crate::config::ChainConfig,
-    webhook_jwt_token: Option<String>,
+    deliverer: Arc<crate::webhook::WebhookDeliverer>,
     faucet_mnemonic: String,
     db: Db,
     wallet: Wallet,
@@ -240,7 +254,7 @@ fn spawn_chain_workers(
 ) {
     let monitor = Monitor::new(
         chain_cfg.clone(),
-        webhook_jwt_token.clone(),
+        Arc::clone(&deliverer),
         db.clone(),
         provider.clone(),
     );
@@ -252,7 +266,7 @@ fn spawn_chain_workers(
         )
         .unwrap(),
     );
-    let sweeper = Sweeper::new(chain_cfg, webhook_jwt_token, db, wallet, provider, faucet);
+    let sweeper = Sweeper::new(chain_cfg, deliverer, db, wallet, provider, faucet);
 
     tokio::spawn(async move {
         monitor.run().await;

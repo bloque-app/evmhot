@@ -8,6 +8,7 @@ mod monitor;
 mod sweeper;
 pub mod traits;
 mod wallet;
+mod webhook;
 
 #[cfg(test)]
 mod e2e_tests;
@@ -27,6 +28,7 @@ use std::sync::Arc;
 use sweeper::Sweeper;
 use traits::Service;
 use wallet::Wallet;
+use webhook::{WebhookDeliverer, WebhookRetryService};
 
 /// Request structure for registering a new account
 #[derive(Deserialize, Clone)]
@@ -108,6 +110,20 @@ pub struct RetrySweepResponse {
     pub token_type: String,
 }
 
+/// Request to re-queue a failed webhook delivery.
+#[derive(Deserialize, Clone, Debug)]
+pub struct RetryWebhookRequest {
+    pub id: String,
+    pub event: String,
+}
+
+/// Response for a webhook retry request.
+#[derive(Serialize, Clone, Debug)]
+pub struct RetryWebhookResponse {
+    pub retried: bool,
+    pub status: String,
+}
+
 /// Per-chain runtime context (provider + faucet).
 pub struct ChainContext {
     pub cfg: ChainConfig,
@@ -121,6 +137,7 @@ pub struct HotWalletService {
     db: Db,
     wallet: Wallet,
     chains: Vec<ChainContext>,
+    webhook_deliverer: Arc<WebhookDeliverer>,
 }
 
 impl HotWalletService {
@@ -179,6 +196,24 @@ impl HotWalletService {
         }
     }
 
+    pub fn retry_webhook(&self, request: RetryWebhookRequest) -> anyhow::Result<RetryWebhookResponse> {
+        let retried = self
+            .db
+            .retry_webhook_delivery(&request.id, &request.event)?;
+        if !retried {
+            return Err(anyhow::anyhow!(
+                "No failed webhook delivery found for id={} event={}",
+                request.id,
+                request.event
+            ));
+        }
+        self.webhook_deliverer.notify_worker();
+        Ok(RetryWebhookResponse {
+            retried: true,
+            status: "pending".to_string(),
+        })
+    }
+
     pub async fn new(config: Config) -> anyhow::Result<Self> {
         let db = Db::new(&config.database_url)?;
         let wallet = Wallet::new(config.mnemonic.clone());
@@ -209,20 +244,29 @@ impl HotWalletService {
             });
         }
 
+        let webhook_deliverer = Arc::new(WebhookDeliverer::new(db.clone(), &config)?);
+
         Ok(Self {
             config,
             db,
             wallet,
             chains,
+            webhook_deliverer,
         })
     }
 
     pub async fn start_background_services(&self) -> anyhow::Result<()> {
+        let webhook_worker = WebhookRetryService::new(Arc::clone(&self.webhook_deliverer));
+        tokio::spawn(async move {
+            tracing::info!("Starting Webhook retry worker");
+            webhook_worker.run().await;
+        });
+
         for ctx in &self.chains {
             let chain_name = ctx.cfg.name.clone();
             let monitor = Monitor::new(
                 ctx.cfg.clone(),
-                self.config.webhook_jwt_token.clone(),
+                Arc::clone(&self.webhook_deliverer),
                 self.db.clone(),
                 ctx.provider.clone(),
             );
@@ -233,7 +277,7 @@ impl HotWalletService {
 
             let sweeper = Sweeper::new(
                 ctx.cfg.clone(),
-                self.config.webhook_jwt_token.clone(),
+                Arc::clone(&self.webhook_deliverer),
                 self.db.clone(),
                 self.wallet.clone(),
                 ctx.provider.clone(),

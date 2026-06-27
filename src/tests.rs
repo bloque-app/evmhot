@@ -3,10 +3,11 @@ use crate::db::Db;
 use crate::faucet::Faucet;
 use crate::monitor::Monitor;
 use crate::sweeper::Sweeper;
-use crate::test_support::{self, http_provider_boxed, test_chain_config, test_config, TEST_CHAIN};
+use crate::test_support::{self, http_provider_boxed, test_chain_config, test_config, test_webhook_deliverer, TEST_CHAIN};
 use crate::traits::Service;
 use crate::wallet::Wallet;
-use crate::{HotWalletService, RegisterRequest, RetrySweepRequest, VerifyTransferRequest, VerifyTransferResponse};
+use crate::webhook::{WebhookDeliverer, WebhookRetryService};
+use crate::{HotWalletService, RegisterRequest, RetrySweepRequest, RetryWebhookRequest, VerifyTransferRequest, VerifyTransferResponse};
 use serde_json::json;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
@@ -77,13 +78,14 @@ async fn test_monitor_creation_with_http_provider() {
     let db_file = NamedTempFile::new().unwrap();
     let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
 
-    let config = test_config(db_file.path().to_str().unwrap(), "http://localhost:8545");
+    let _config = test_config(db_file.path().to_str().unwrap(), "http://localhost:8545");
 
     // Create provider and monitor (no actual connection needed for this test)
     let provider = http_provider_boxed("http://localhost:8545");
+    let deliverer = test_webhook_deliverer(db.clone());
     let _monitor = Monitor::new(
         test_chain_config("http://localhost:8545"),
-        config.webhook_jwt_token.clone(),
+        deliverer,
         db.clone(),
         provider,
     );
@@ -168,9 +170,10 @@ async fn test_sweeper_creation() {
         .unwrap(),
     );
 
+    let deliverer = test_webhook_deliverer(db.clone());
     Sweeper::new(
         config.chains[0].clone(),
-        config.webhook_jwt_token.clone(),
+        deliverer,
         db,
         wallet,
         provider.clone(),
@@ -1054,9 +1057,10 @@ async fn test_monitor_skips_erc20_below_min_deposit() {
         .await;
 
     let provider = http_provider_boxed(&rpc_server.uri());
+    let deliverer = test_webhook_deliverer(db.clone());
     let monitor = Monitor::new(
         config.chains[0].clone(),
-        config.webhook_jwt_token.clone(),
+        deliverer,
         db.clone(),
         provider.clone(),
     );
@@ -1113,6 +1117,11 @@ async fn test_erc20_sweep_emits_per_deposit_webhooks() {
         "USDT",
     )
     .unwrap();
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&webhook_server)
+        .await;
 
     // balanceOf -> 3000000030 (aggregate on-chain balance)
     Mock::given(method("POST"))
@@ -1212,9 +1221,14 @@ async fn test_erc20_sweep_emits_per_deposit_webhooks() {
         )
         .unwrap(),
     );
+    let deliverer = test_webhook_deliverer(db.clone());
+    let webhook_worker = WebhookRetryService::new(Arc::clone(&deliverer));
+    tokio::spawn(async move {
+        webhook_worker.run().await;
+    });
     let sweeper = Sweeper::new(
         config.chains[0].clone(),
-        config.webhook_jwt_token.clone(),
+        deliverer,
         db.clone(),
         wallet,
         provider.clone(),
@@ -1240,6 +1254,17 @@ async fn test_erc20_sweep_emits_per_deposit_webhooks() {
     assert!(swept, "ERC20 deposits should be marked swept");
 
     sleep(Duration::from_millis(300)).await;
+
+    for id in [
+        format!("{TEST_CHAIN}:0xaaa:1"),
+        format!("{TEST_CHAIN}:0xbbb:2"),
+    ] {
+        let row = db
+            .get_webhook_delivery(&id, "deposit_swept")
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing webhook delivery row for {id}"));
+        assert_eq!(row.status, "delivered", "webhook for {id} should be delivered");
+    }
 
     let requests = webhook_server.received_requests().await.unwrap();
     let swept_events: Vec<_> = requests
@@ -1429,9 +1454,14 @@ async fn test_erc20_sweep_webhook_best_effort_on_failure() {
         )
         .unwrap(),
     );
+    let deliverer = test_webhook_deliverer(db.clone());
+    let webhook_worker = WebhookRetryService::new(Arc::clone(&deliverer));
+    tokio::spawn(async move {
+        webhook_worker.run().await;
+    });
     let sweeper = Sweeper::new(
         config.chains[0].clone(),
-        config.webhook_jwt_token.clone(),
+        deliverer,
         db.clone(),
         wallet,
         provider.clone(),
@@ -1453,11 +1483,317 @@ async fn test_erc20_sweep_webhook_best_effort_on_failure() {
     }
     handle.abort();
 
-    sleep(Duration::from_millis(300)).await;
+    let row_a = db
+        .get_webhook_delivery(&format!("{TEST_CHAIN}:0xaaa:1"), "deposit_swept")
+        .unwrap();
+    let row_b = db
+        .get_webhook_delivery(&format!("{TEST_CHAIN}:0xbbb:2"), "deposit_swept")
+        .unwrap();
+    assert!(row_a.is_some(), "first deposit should enqueue webhook delivery");
+    assert!(row_b.is_some(), "second deposit should enqueue webhook delivery");
+
+    let mut both_delivered = false;
+    for _ in 0..40 {
+        let a = db
+            .get_webhook_delivery(&format!("{TEST_CHAIN}:0xaaa:1"), "deposit_swept")
+            .unwrap();
+        let b = db
+            .get_webhook_delivery(&format!("{TEST_CHAIN}:0xbbb:2"), "deposit_swept")
+            .unwrap();
+        if a.as_ref().map(|r| r.status.as_str()) == Some("delivered")
+            && b.as_ref().map(|r| r.status.as_str()) == Some("delivered")
+        {
+            both_delivered = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(both_delivered, "worker should eventually deliver both webhooks");
     assert!(
-        webhook_attempts.load(Ordering::SeqCst) >= 2,
-        "best-effort loop should attempt webhook for each deposit even after first failure"
+        webhook_attempts.load(Ordering::SeqCst) >= 3,
+        "first delivery may retry after 503 before both succeed"
     );
+}
+
+// ========== Webhook Delivery Tests ==========
+
+#[tokio::test]
+async fn test_webhook_attempt_stored_retries_until_success() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+
+    let webhook_server = MockServer::start().await;
+    let attempts = StdArc::new(AtomicUsize::new(0));
+    let attempts_for_mock = attempts.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |_: &wiremock::Request| {
+            let n = attempts_for_mock.fetch_add(1, Ordering::SeqCst) + 1;
+            if n <= 2 {
+                ResponseTemplate::new(503)
+            } else {
+                ResponseTemplate::new(200)
+            }
+        })
+        .mount(&webhook_server)
+        .await;
+
+    let db_file = NamedTempFile::new().unwrap();
+    let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
+    let deliverer = test_webhook_deliverer(db.clone());
+
+    let payload = json!({
+        "id": "polygon:0xabc",
+        "event": "deposit_detected"
+    });
+    deliverer
+        .enqueue(
+            &webhook_server.uri(),
+            "user1",
+            payload,
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..5 {
+        deliverer
+            .attempt_stored("polygon:0xabc", "deposit_detected")
+            .await
+            .unwrap();
+        let row = db
+            .get_webhook_delivery("polygon:0xabc", "deposit_detected")
+            .unwrap()
+            .unwrap();
+        if row.status == "delivered" {
+            assert_eq!(row.attempt_count, 3);
+            return;
+        }
+    }
+    panic!("webhook was not delivered after retries");
+}
+
+#[tokio::test]
+async fn test_webhook_attempt_stored_marks_failed_after_max_retries() {
+    let webhook_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&webhook_server)
+        .await;
+
+    let db_file = NamedTempFile::new().unwrap();
+    let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
+    let deliverer = test_webhook_deliverer(db.clone());
+
+    deliverer
+        .enqueue(
+            &webhook_server.uri(),
+            "user1",
+            json!({"id": "base:0x1", "event": "deposit_swept"}),
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..5 {
+        deliverer
+            .attempt_stored("base:0x1", "deposit_swept")
+            .await
+            .unwrap();
+    }
+
+    let row = db
+        .get_webhook_delivery("base:0x1", "deposit_swept")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "failed");
+    assert_eq!(row.attempt_count, 3);
+}
+
+#[tokio::test]
+async fn test_webhook_enqueue_skips_already_delivered() {
+    let webhook_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&webhook_server)
+        .await;
+
+    let db_file = NamedTempFile::new().unwrap();
+    let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
+    let deliverer = test_webhook_deliverer(db.clone());
+
+    db.upsert_webhook_delivery(
+        "polygon:0xabc",
+        "deposit_detected",
+        "user1",
+        &webhook_server.uri(),
+        r#"{"id":"polygon:0xabc","event":"deposit_detected"}"#,
+    )
+    .unwrap();
+    db.record_webhook_attempt(
+        "polygon:0xabc",
+        "deposit_detected",
+        Some(200),
+        None,
+        "delivered",
+    )
+    .unwrap();
+
+    deliverer
+        .enqueue(
+            &webhook_server.uri(),
+            "user1",
+            json!({"id": "polygon:0xabc", "event": "deposit_detected"}),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_webhook_lease_prevents_duplicate_post() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+    use std::time::Duration;
+
+    let webhook_server = MockServer::start().await;
+    let posts = StdArc::new(AtomicUsize::new(0));
+    let posts_for_mock = posts.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |_: &wiremock::Request| {
+            posts_for_mock.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_delay(Duration::from_millis(200))
+        })
+        .mount(&webhook_server)
+        .await;
+
+    let db_file = NamedTempFile::new().unwrap();
+    let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
+    let deliverer = Arc::new(
+        WebhookDeliverer::new_for_test(db.clone(), None, 3, 10, 60, 50, 60).unwrap(),
+    );
+
+    deliverer
+        .enqueue(
+            &webhook_server.uri(),
+            "user1",
+            json!({"id": "polygon:0xabc", "event": "deposit_detected"}),
+        )
+        .await
+        .unwrap();
+
+    let d1 = Arc::clone(&deliverer);
+    let d2 = Arc::clone(&deliverer);
+    let t1 = tokio::spawn(async move {
+        d1.attempt_stored("polygon:0xabc", "deposit_detected")
+            .await
+    });
+    let t2 = tokio::spawn(async move {
+        d2.attempt_stored("polygon:0xabc", "deposit_detected")
+            .await
+    });
+    let _ = tokio::join!(t1, t2);
+
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_webhook_worker_wake_on_enqueue() {
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let webhook_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&webhook_server)
+        .await;
+
+    let db_file = NamedTempFile::new().unwrap();
+    let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
+    let deliverer = Arc::new(
+        WebhookDeliverer::new_for_test(db.clone(), None, 3, 10, 60, 50, 60).unwrap(),
+    );
+    let worker = WebhookRetryService::new(Arc::clone(&deliverer));
+    tokio::spawn(async move {
+        worker.run().await;
+    });
+
+    deliverer
+        .enqueue(
+            &webhook_server.uri(),
+            "user1",
+            json!({"id": "polygon:0xabc", "event": "deposit_detected"}),
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..40 {
+        if db
+            .get_webhook_delivery("polygon:0xabc", "deposit_detected")
+            .unwrap()
+            .is_some_and(|r| r.status == "delivered")
+        {
+            return;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("worker did not deliver webhook promptly after enqueue notify");
+}
+
+#[tokio::test]
+async fn test_admin_retry_webhooks_resets_and_notifies() {
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let rpc_server = MockServer::start().await;
+    let webhook_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
+
+    let db = Db::new(&config.database_url).unwrap();
+    db.upsert_webhook_delivery(
+        "base:0xabc:120",
+        "deposit_swept",
+        "user1",
+        &webhook_server.uri(),
+        r#"{"id":"base:0xabc:120","event":"deposit_swept"}"#,
+    )
+    .unwrap();
+    db.record_webhook_attempt(
+        "base:0xabc:120",
+        "deposit_swept",
+        Some(503),
+        Some("HTTP status 503"),
+        "failed",
+    )
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&webhook_server)
+        .await;
+
+    let service = HotWalletService::new(config).await.unwrap();
+    service.start_background_services().await.unwrap();
+
+    let response = service
+        .retry_webhook(RetryWebhookRequest {
+            id: "base:0xabc:120".to_string(),
+            event: "deposit_swept".to_string(),
+        })
+        .unwrap();
+    assert!(response.retried);
+    assert_eq!(response.status, "pending");
+
+    for _ in 0..40 {
+        if db
+            .get_webhook_delivery("base:0xabc:120", "deposit_swept")
+            .unwrap()
+            .is_some_and(|r| r.status == "delivered")
+        {
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    panic!("admin retry did not lead to webhook delivery");
 }
 
 // ========== Token Allowlist Tests ==========
@@ -1581,9 +1917,10 @@ async fn test_monitor_skips_non_allowlisted_erc20_token() {
         .await;
 
     let provider = http_provider_boxed(&rpc_server.uri());
+    let deliverer = test_webhook_deliverer(db.clone());
     let monitor = Monitor::new(
         config.chains[0].clone(),
-        config.webhook_jwt_token.clone(),
+        deliverer,
         db.clone(),
         provider.clone(),
     );
@@ -1668,9 +2005,10 @@ async fn test_monitor_records_allowlisted_erc20_token() {
         .await;
 
     let provider = http_provider_boxed(&rpc_server.uri());
+    let deliverer = test_webhook_deliverer(db.clone());
     let monitor = Monitor::new(
         config.chains[0].clone(),
-        config.webhook_jwt_token.clone(),
+        deliverer,
         db.clone(),
         provider.clone(),
     );
@@ -1734,9 +2072,14 @@ async fn test_sweeper_marks_non_allowlisted_deposit_failed_without_rpc() {
         )
         .unwrap(),
     );
+    let deliverer = test_webhook_deliverer(db.clone());
+    let webhook_worker = WebhookRetryService::new(Arc::clone(&deliverer));
+    tokio::spawn(async move {
+        webhook_worker.run().await;
+    });
     let sweeper = Sweeper::new(
         config.chains[0].clone(),
-        config.webhook_jwt_token.clone(),
+        deliverer,
         db.clone(),
         wallet,
         provider.clone(),
@@ -1835,9 +2178,10 @@ async fn test_erc20_faucet_failure_keeps_deposit_detected() {
         )
         .unwrap(),
     );
+    let deliverer = test_webhook_deliverer(db.clone());
     let sweeper = Sweeper::new(
         config.chains[0].clone(),
-        config.webhook_jwt_token.clone(),
+        deliverer,
         db.clone(),
         wallet,
         provider,

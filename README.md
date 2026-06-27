@@ -82,7 +82,12 @@ Secrets stay in environment variables. Per-chain settings (RPC, treasury, tokens
 | `CHAINS_CONFIG` | no | Path to chains TOML file | `chains.toml` |
 | `DATABASE_URL` | no | SQLite database file path (`sqlite:` prefix optional) | `sqlite:wallet.db` |
 | `PORT` | no | API server port | `3000` |
-| `WEBHOOK_JWT_TOKEN` | no | Optional JWT sent as `Authorization: Bearer` on webhooks | — |
+| `WEBHOOK_JWT_TOKEN` | no | Optional JWT sent as `Authorization: Bearer` on webhooks and admin endpoints | — |
+| `WEBHOOK_MAX_RETRIES` | no | Max delivery attempts before marking a webhook `failed` | `5` |
+| `WEBHOOK_RETRY_DELAY_MS` | no | Delay between delivery attempts in the worker batch | `1000` |
+| `WEBHOOK_RETRY_POLL_INTERVAL` | no | Worker poll interval (seconds) when no enqueue/admin notify | `30` |
+| `WEBHOOK_RETRY_BATCH_SIZE` | no | Max pending deliveries processed per worker batch | `50` |
+| `WEBHOOK_LEASE_SECONDS` | no | Claim lease duration to prevent duplicate POSTs | `60` |
 | `LEGACY_CHAIN` | no | Chain name for redb→SQLite importer only | `polygon` |
 
 ### Chains file (`chains.toml`)
@@ -369,6 +374,26 @@ curl -X POST http://localhost:8080/admin/retry_sweeps \
 ```
 
 Omit `log_index` for native deposits. The sweeper picks up re-queued rows on the next poll cycle (~10s by default).
+
+**"Webhook delivery failed"**
+- Webhooks are persisted in SQLite and retried by a background worker. Non-2xx responses are treated as failures (including 503).
+- Re-queue a permanently failed webhook with:
+
+```bash
+curl -X POST http://localhost:8080/admin/retry_webhooks \
+  -H "Authorization: Bearer $WEBHOOK_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"base:0xabc:120","event":"deposit_swept"}'
+```
+
+Inspect failed deliveries:
+
+```sql
+SELECT id, event, status, attempt_count, last_http_status, last_error
+FROM webhook_deliveries WHERE status = 'failed';
+```
+
+The legacy [`scripts/retry_deposit_webhooks.sh`](scripts/retry_deposit_webhooks.sh) script can still be used for manual replays; prefer the admin API for operational retries.
 
 **Manual SQL recovery** (if the API is unavailable):
 
