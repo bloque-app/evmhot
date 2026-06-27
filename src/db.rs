@@ -231,9 +231,7 @@ impl Db {
             "SELECT tx_hash, account_id, amount FROM deposits
              WHERE chain = ?1 AND status = 'detected'",
         )?;
-        let rows = stmt.query_map([chain], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
+        let rows = stmt.query_map([chain], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -242,7 +240,9 @@ impl Db {
         let conn = self.read.get()?;
         let key = last_block_key(chain);
         let val: Option<String> = conn
-            .query_row("SELECT value FROM state WHERE key = ?1", [key], |row| row.get(0))
+            .query_row("SELECT value FROM state WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
             .optional()?;
         Ok(val.map(|v| v.parse().unwrap_or(0)).unwrap_or(0))
     }
@@ -676,14 +676,7 @@ impl Db {
                      leased_until = NULL,
                      updated_at = ?6
                  WHERE id = ?1 AND event = ?2",
-                params![
-                    id,
-                    event,
-                    http_status.map(i64::from),
-                    error,
-                    status,
-                    now
-                ],
+                params![id, event, http_status.map(i64::from), error, status, now],
             )?;
             let count: i64 = conn.query_row(
                 "SELECT attempt_count FROM webhook_deliveries WHERE id = ?1 AND event = ?2",
@@ -709,15 +702,18 @@ impl Db {
              ORDER BY updated_at ASC
              LIMIT ?3",
         )?;
-        let rows = stmt.query_map(
-            params![max_retries as i64, now, batch_size as i64],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        let rows = stmt.query_map(params![max_retries as i64, now, batch_size as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    pub fn get_webhook_delivery(&self, id: &str, event: &str) -> Result<Option<WebhookDeliveryRecord>> {
+    pub fn get_webhook_delivery(
+        &self,
+        id: &str,
+        event: &str,
+    ) -> Result<Option<WebhookDeliveryRecord>> {
         let conn = self.read.get()?;
         conn.query_row(
             "SELECT id, event, registration_id, webhook_url, payload, status, attempt_count,
@@ -799,12 +795,8 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
 
-        assert!(db
-            .record_deposit("base", "0xabc", "user1", "100")
-            .unwrap());
-        assert!(!db
-            .record_deposit("base", "0xabc", "user1", "100")
-            .unwrap());
+        assert!(db.record_deposit("base", "0xabc", "user1", "100").unwrap());
+        assert!(!db.record_deposit("base", "0xabc", "user1", "100").unwrap());
     }
 
     #[test]
@@ -813,26 +805,10 @@ mod tests {
         let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
 
         assert!(db
-            .record_erc20_deposit(
-                "polygon",
-                "0xabc",
-                1,
-                "user1",
-                "100",
-                "0xtoken",
-                "USDC"
-            )
+            .record_erc20_deposit("polygon", "0xabc", 1, "user1", "100", "0xtoken", "USDC")
             .unwrap());
         assert!(!db
-            .record_erc20_deposit(
-                "polygon",
-                "0xabc",
-                1,
-                "user1",
-                "100",
-                "0xtoken",
-                "USDC"
-            )
+            .record_erc20_deposit("polygon", "0xabc", 1, "user1", "100", "0xtoken", "USDC")
             .unwrap());
     }
 
@@ -877,16 +853,8 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
 
-        db.record_erc20_deposit(
-            "base",
-            "0xabc",
-            120,
-            "user1",
-            "100",
-            "0xtoken",
-            "USDC",
-        )
-        .unwrap();
+        db.record_erc20_deposit("base", "0xabc", 120, "user1", "100", "0xtoken", "USDC")
+            .unwrap();
         db.mark_erc20_deposit_failed("base", "0xabc:120").unwrap();
         db.increment_sweep_failure_count("base", "0xabc:120")
             .unwrap();
@@ -905,7 +873,8 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
 
-        db.record_deposit("polygon", "0xabc", "user1", "100").unwrap();
+        db.record_deposit("polygon", "0xabc", "user1", "100")
+            .unwrap();
         db.mark_deposit_failed("polygon", "0xabc").unwrap();
 
         assert!(db.retry_native_deposit("polygon", "0xabc").unwrap());

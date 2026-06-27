@@ -3,11 +3,16 @@ use crate::db::Db;
 use crate::faucet::Faucet;
 use crate::monitor::Monitor;
 use crate::sweeper::Sweeper;
-use crate::test_support::{self, http_provider_boxed, test_chain_config, test_config, test_webhook_deliverer, TEST_CHAIN};
+use crate::test_support::{
+    self, http_provider_boxed, test_chain_config, test_config, test_webhook_deliverer, TEST_CHAIN,
+};
 use crate::traits::Service;
 use crate::wallet::Wallet;
 use crate::webhook::{WebhookDeliverer, WebhookRetryService};
-use crate::{HotWalletService, RegisterRequest, RetrySweepRequest, RetryWebhookRequest, VerifyTransferRequest, VerifyTransferResponse};
+use crate::{
+    HotWalletService, RegisterRequest, RetrySweepRequest, RetryWebhookRequest,
+    VerifyTransferRequest, VerifyTransferResponse,
+};
 use serde_json::json;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
@@ -1263,7 +1268,10 @@ async fn test_erc20_sweep_emits_per_deposit_webhooks() {
             .get_webhook_delivery(&id, "deposit_swept")
             .unwrap()
             .unwrap_or_else(|| panic!("missing webhook delivery row for {id}"));
-        assert_eq!(row.status, "delivered", "webhook for {id} should be delivered");
+        assert_eq!(
+            row.status, "delivered",
+            "webhook for {id} should be delivered"
+        );
     }
 
     let requests = webhook_server.received_requests().await.unwrap();
@@ -1489,8 +1497,14 @@ async fn test_erc20_sweep_webhook_best_effort_on_failure() {
     let row_b = db
         .get_webhook_delivery(&format!("{TEST_CHAIN}:0xbbb:2"), "deposit_swept")
         .unwrap();
-    assert!(row_a.is_some(), "first deposit should enqueue webhook delivery");
-    assert!(row_b.is_some(), "second deposit should enqueue webhook delivery");
+    assert!(
+        row_a.is_some(),
+        "first deposit should enqueue webhook delivery"
+    );
+    assert!(
+        row_b.is_some(),
+        "second deposit should enqueue webhook delivery"
+    );
 
     let mut both_delivered = false;
     for _ in 0..40 {
@@ -1509,7 +1523,10 @@ async fn test_erc20_sweep_webhook_best_effort_on_failure() {
         sleep(Duration::from_millis(100)).await;
     }
 
-    assert!(both_delivered, "worker should eventually deliver both webhooks");
+    assert!(
+        both_delivered,
+        "worker should eventually deliver both webhooks"
+    );
     assert!(
         webhook_attempts.load(Ordering::SeqCst) >= 3,
         "first delivery may retry after 503 before both succeed"
@@ -1547,11 +1564,7 @@ async fn test_webhook_attempt_stored_retries_until_success() {
         "event": "deposit_detected"
     });
     deliverer
-        .enqueue(
-            &webhook_server.uri(),
-            "user1",
-            payload,
-        )
+        .enqueue(&webhook_server.uri(), "user1", payload)
         .await
         .unwrap();
 
@@ -1667,9 +1680,8 @@ async fn test_webhook_lease_prevents_duplicate_post() {
 
     let db_file = NamedTempFile::new().unwrap();
     let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
-    let deliverer = Arc::new(
-        WebhookDeliverer::new_for_test(db.clone(), None, 3, 10, 60, 50, 60).unwrap(),
-    );
+    let deliverer =
+        Arc::new(WebhookDeliverer::new_for_test(db.clone(), None, 3, 10, 60, 50, 60).unwrap());
 
     deliverer
         .enqueue(
@@ -1682,14 +1694,10 @@ async fn test_webhook_lease_prevents_duplicate_post() {
 
     let d1 = Arc::clone(&deliverer);
     let d2 = Arc::clone(&deliverer);
-    let t1 = tokio::spawn(async move {
-        d1.attempt_stored("polygon:0xabc", "deposit_detected")
-            .await
-    });
-    let t2 = tokio::spawn(async move {
-        d2.attempt_stored("polygon:0xabc", "deposit_detected")
-            .await
-    });
+    let t1 =
+        tokio::spawn(async move { d1.attempt_stored("polygon:0xabc", "deposit_detected").await });
+    let t2 =
+        tokio::spawn(async move { d2.attempt_stored("polygon:0xabc", "deposit_detected").await });
     let _ = tokio::join!(t1, t2);
 
     assert_eq!(posts.load(Ordering::SeqCst), 1);
@@ -1708,9 +1716,8 @@ async fn test_webhook_worker_wake_on_enqueue() {
 
     let db_file = NamedTempFile::new().unwrap();
     let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
-    let deliverer = Arc::new(
-        WebhookDeliverer::new_for_test(db.clone(), None, 3, 10, 60, 50, 60).unwrap(),
-    );
+    let deliverer =
+        Arc::new(WebhookDeliverer::new_for_test(db.clone(), None, 3, 10, 60, 50, 60).unwrap());
     let worker = WebhookRetryService::new(Arc::clone(&deliverer));
     tokio::spawn(async move {
         worker.run().await;
@@ -2193,24 +2200,20 @@ async fn test_erc20_faucet_failure_keeps_deposit_detected() {
     }
 
     assert_eq!(db.get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(), 1);
-    assert_eq!(db.get_sweep_failure_count(TEST_CHAIN, "0xabc:1").unwrap(), 0);
+    assert_eq!(
+        db.get_sweep_failure_count(TEST_CHAIN, "0xabc:1").unwrap(),
+        0
+    );
 }
 
 #[test]
 fn test_retry_sweep_service_requeues_failed_erc20_deposit() {
     let tmp = NamedTempFile::new().unwrap();
     let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
-    db.record_erc20_deposit(
-        TEST_CHAIN,
-        "0xabc",
-        120,
-        "user_1",
-        "100",
-        "0xtoken",
-        "USDC",
-    )
-    .unwrap();
-    db.mark_erc20_deposit_failed(TEST_CHAIN, "0xabc:120").unwrap();
+    db.record_erc20_deposit(TEST_CHAIN, "0xabc", 120, "user_1", "100", "0xtoken", "USDC")
+        .unwrap();
+    db.mark_erc20_deposit_failed(TEST_CHAIN, "0xabc:120")
+        .unwrap();
 
     let config = test_config(tmp.path().to_str().unwrap(), "http://localhost:0");
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -2227,7 +2230,11 @@ fn test_retry_sweep_service_requeues_failed_erc20_deposit() {
     assert!(response.retried);
     assert_eq!(response.token_type, "erc20");
     assert_eq!(
-        service.db().get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(),
+        service
+            .db()
+            .get_detected_erc20_deposits(TEST_CHAIN)
+            .unwrap()
+            .len(),
         1
     );
 }

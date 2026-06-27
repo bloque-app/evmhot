@@ -206,7 +206,11 @@ impl WebhookDeliverer {
         Ok(processed)
     }
 
-    async fn try_post(&self, url: &str, payload: &Value) -> std::result::Result<u16, DeliveryError> {
+    async fn try_post(
+        &self,
+        url: &str,
+        payload: &Value,
+    ) -> std::result::Result<u16, DeliveryError> {
         let mut request = self.client.post(url).json(payload);
         if let Some(ref token) = self.jwt_token {
             request = request.header("Authorization", format!("Bearer {token}"));

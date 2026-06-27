@@ -19,16 +19,12 @@ pub fn default_webhook_config_fields() -> (u32, u64, u64, u32, u64) {
 }
 
 pub fn test_webhook_deliverer(db: Db) -> Arc<WebhookDeliverer> {
-    Arc::new(
-        WebhookDeliverer::new_for_test(db, None, 3, 10, 60, 50, 60).unwrap(),
-    )
+    Arc::new(WebhookDeliverer::new_for_test(db, None, 3, 10, 60, 50, 60).unwrap())
 }
 
 #[allow(dead_code)]
 pub fn test_webhook_deliverer_fast(db: Db) -> Arc<WebhookDeliverer> {
-    Arc::new(
-        WebhookDeliverer::new_for_test(db, None, 3, 10, 5, 50, 60).unwrap(),
-    )
+    Arc::new(WebhookDeliverer::new_for_test(db, None, 3, 10, 5, 50, 60).unwrap())
 }
 
 pub fn test_chain_config(rpc_url: impl Into<String>) -> ChainConfig {
@@ -64,8 +60,13 @@ pub fn test_config_multichain(
     base_rpc: impl Into<String>,
     polygon_rpc: impl Into<String>,
 ) -> Config {
-    let (webhook_max_retries, webhook_retry_delay_ms, webhook_retry_poll_interval_secs, webhook_retry_batch_size, webhook_lease_seconds) =
-        default_webhook_config_fields();
+    let (
+        webhook_max_retries,
+        webhook_retry_delay_ms,
+        webhook_retry_poll_interval_secs,
+        webhook_retry_batch_size,
+        webhook_lease_seconds,
+    ) = default_webhook_config_fields();
     Config {
         database_url: db_path.into(),
         mnemonic: TEST_MNEMONIC.to_string(),
@@ -86,8 +87,13 @@ pub fn test_config_multichain(
 }
 
 pub fn test_config(db_path: impl Into<String>, rpc_url: impl Into<String>) -> Config {
-    let (webhook_max_retries, webhook_retry_delay_ms, webhook_retry_poll_interval_secs, webhook_retry_batch_size, webhook_lease_seconds) =
-        default_webhook_config_fields();
+    let (
+        webhook_max_retries,
+        webhook_retry_delay_ms,
+        webhook_retry_poll_interval_secs,
+        webhook_retry_batch_size,
+        webhook_lease_seconds,
+    ) = default_webhook_config_fields();
     Config {
         database_url: db_path.into(),
         mnemonic: TEST_MNEMONIC.to_string(),

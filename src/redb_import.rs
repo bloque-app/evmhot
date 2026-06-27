@@ -98,16 +98,8 @@ pub fn migrate_redb_file_to_sqlite(
     }
 
     summary.erc20_deposits.0 = snapshot.erc20_deposits.len();
-    for (
-        chain,
-        tx_hash,
-        log_index,
-        account_id,
-        amount,
-        token_address,
-        token_symbol,
-        status,
-    ) in &snapshot.erc20_deposits
+    for (chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status) in
+        &snapshot.erc20_deposits
     {
         tx.execute(
             "INSERT OR IGNORE INTO erc20_deposits
@@ -205,14 +197,7 @@ mod tests {
                 .unwrap();
             store
                 .insert_v2_erc20_deposit_for_test(
-                    "polygon",
-                    "0xswept",
-                    1,
-                    "user1",
-                    "100",
-                    "0xtoken",
-                    "USDC",
-                    "swept",
+                    "polygon", "0xswept", 1, "user1", "100", "0xtoken", "USDC", "swept",
                 )
                 .unwrap();
             store
@@ -227,12 +212,18 @@ mod tests {
             migrate_redb_file_to_sqlite(redb_tmp.path(), sqlite_path, "polygon", true).unwrap();
 
         assert_eq!(summary.deposits.0, 1);
-        assert!(summary.block_cursors.iter().any(|(c, b)| c == "polygon" && *b == 42));
+        assert!(summary
+            .block_cursors
+            .iter()
+            .any(|(c, b)| c == "polygon" && *b == 42));
 
         let db = Db::new(sqlite_path.to_str().unwrap()).unwrap();
         assert_eq!(db.get_last_processed_block("polygon").unwrap(), 42);
         assert!(db.get_detected_deposits("polygon").unwrap().is_empty());
-        assert!(db.get_detected_erc20_deposits("polygon").unwrap().is_empty());
+        assert!(db
+            .get_detected_erc20_deposits("polygon")
+            .unwrap()
+            .is_empty());
 
         let meta = db.get_sweep_meta("polygon", "0xswept:1").unwrap();
         assert_eq!(meta, Some(("0xsweep_tx".to_string(), 3)));

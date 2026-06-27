@@ -588,6 +588,8 @@ mod tests {
             "Still insufficient balance after faucet funding"
         ));
         assert!(!is_transient_funding_error("execution reverted"));
-        assert!(!is_transient_funding_error("buffer overrun while deserializing"));
+        assert!(!is_transient_funding_error(
+            "buffer overrun while deserializing"
+        ));
     }
 }

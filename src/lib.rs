@@ -1,10 +1,10 @@
 // Library modules
 pub mod config;
 pub mod db;
-pub mod redb_store;
-pub mod redb_import;
 pub(crate) mod faucet;
 mod monitor;
+pub mod redb_import;
+pub mod redb_store;
 mod sweeper;
 pub mod traits;
 mod wallet;
@@ -178,9 +178,9 @@ impl HotWalletService {
         }
 
         if let Some(log_index) = request.log_index {
-            let retried = self
-                .db
-                .retry_erc20_deposit(&request.chain, &request.tx_hash, log_index)?;
+            let retried =
+                self.db
+                    .retry_erc20_deposit(&request.chain, &request.tx_hash, log_index)?;
             Ok(RetrySweepResponse {
                 retried,
                 token_type: "erc20".to_string(),
@@ -196,7 +196,10 @@ impl HotWalletService {
         }
     }
 
-    pub fn retry_webhook(&self, request: RetryWebhookRequest) -> anyhow::Result<RetryWebhookResponse> {
+    pub fn retry_webhook(
+        &self,
+        request: RetryWebhookRequest,
+    ) -> anyhow::Result<RetryWebhookResponse> {
         let retried = self
             .db
             .retry_webhook_delivery(&request.id, &request.event)?;

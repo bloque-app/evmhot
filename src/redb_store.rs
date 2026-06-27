@@ -136,13 +136,7 @@ impl RedbStore {
             let mut deposits = write_txn.open_table(ERC20_DEPOSITS)?;
             deposits.insert(
                 key.as_str(),
-                (
-                    account_id,
-                    amount,
-                    token_address,
-                    token_symbol,
-                    status,
-                ),
+                (account_id, amount, token_address, token_symbol, status),
             )?;
         }
         write_txn.commit()?;

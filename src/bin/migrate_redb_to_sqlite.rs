@@ -12,7 +12,11 @@ struct Args {
     from: PathBuf,
     #[arg(long, help = "Path for new SQLite database file")]
     to: PathBuf,
-    #[arg(long, default_value = "polygon", help = "Legacy chain name for v1 key namespacing")]
+    #[arg(
+        long,
+        default_value = "polygon",
+        help = "Legacy chain name for v1 key namespacing"
+    )]
     legacy_chain: String,
     #[arg(long, default_value_t = false, help = "Overwrite existing SQLite file")]
     force: bool,
@@ -22,9 +26,14 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    let summary = migrate_redb_file_to_sqlite(&args.from, &args.to, &args.legacy_chain, args.force)?;
+    let summary =
+        migrate_redb_file_to_sqlite(&args.from, &args.to, &args.legacy_chain, args.force)?;
 
-    println!("Migration complete: {} -> {}", args.from.display(), args.to.display());
+    println!(
+        "Migration complete: {} -> {}",
+        args.from.display(),
+        args.to.display()
+    );
     println!(
         "accounts: {} redb -> {} inserted",
         summary.accounts.0, summary.accounts.1
