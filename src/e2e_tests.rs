@@ -43,7 +43,7 @@ async fn test_e2e_deposit_sweep_flow() {
     };
 
     let wallet = Wallet::new(config.mnemonic.clone());
-    let db = Db::new(&config.database_url).unwrap();
+    let db = Db::new(&config.database_url).await.unwrap();
 
     // 3. Register Users
     // User 1 -> Index 0
@@ -51,12 +51,14 @@ async fn test_e2e_deposit_sweep_flow() {
     let addr1_str = addr1.to_string();
     let webhook_url = webhook_server.uri();
     db.register_account("user_1", 0, &addr1_str, &webhook_url)
+        .await
         .unwrap();
 
     // User 2 -> Index 1
     let addr2 = wallet.derive_address(1).unwrap();
     let addr2_str = addr2.to_string();
     db.register_account("user_2", 1, &addr2_str, &webhook_url)
+        .await
         .unwrap();
 
     // 4. Initialize Provider
@@ -294,7 +296,7 @@ async fn test_e2e_deposit_sweep_flow() {
     // Wait for deposit detection
     let mut detected = false;
     for _ in 0..10 {
-        let deposits = db.get_detected_deposits().unwrap();
+        let deposits = db.get_detected_deposits().await.unwrap();
         if !deposits.is_empty() {
             detected = true;
             break;
@@ -309,7 +311,7 @@ async fn test_e2e_deposit_sweep_flow() {
         // We don't have a direct "get_swept_deposits" but we can check if detected list is empty
         // assuming we only had one. Or check DB directly if we exposed a method.
         // Let's check if detected becomes empty.
-        let deposits = db.get_detected_deposits().unwrap();
+        let deposits = db.get_detected_deposits().await.unwrap();
         if deposits.is_empty() {
             swept = true;
             break;

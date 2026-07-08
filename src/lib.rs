@@ -128,13 +128,13 @@ where
     }
 
     /// Set the last processed block number manually
-    pub fn set_block_number(&self, block_number: u64) -> anyhow::Result<()> {
-        self.db.set_last_processed_block(block_number)
+    pub async fn set_block_number(&self, block_number: u64) -> anyhow::Result<()> {
+        self.db.set_last_processed_block(block_number).await
     }
 
     /// Get the current last processed block number
-    pub fn get_block_number(&self) -> anyhow::Result<u64> {
-        self.db.get_last_processed_block()
+    pub async fn get_block_number(&self) -> anyhow::Result<u64> {
+        self.db.get_last_processed_block().await
     }
 
     /// Verify if a transaction contains a transfer matching the expected criteria
@@ -389,7 +389,7 @@ where
 
         // Check if account already exists
         if let Ok(Some((_index, existing_address, _webhook))) =
-            self.db.get_account_by_id(&request.id)
+            self.db.get_account_by_id(&request.id).await
         {
             info!(
                 "Account {} already exists with address {}",
@@ -413,7 +413,8 @@ where
 
         // Save to DB with webhook URL
         self.db
-            .register_account(&request.id, index, &address_str, &request.webhook_url)?;
+            .register_account(&request.id, index, &address_str, &request.webhook_url)
+            .await?;
 
         info!(
             "Registered account {} with address {} (index: {})",
@@ -493,7 +494,7 @@ where
 impl HotWalletService<alloy::transports::http::Http<reqwest::Client>> {
     /// Create a new HotWalletService with HTTP provider from configuration
     pub async fn new_http(config: Config) -> anyhow::Result<Self> {
-        let db = Db::new(&config.database_url)?;
+        let db = Db::new(&config.database_url).await?;
         let wallet = Wallet::new(config.mnemonic.clone());
 
         let url = match &config.provider_url {
@@ -569,7 +570,7 @@ impl HotWalletService<alloy::transports::http::Http<reqwest::Client>> {
 impl HotWalletService<alloy::pubsub::PubSubFrontend> {
     /// Create a new HotWalletService with WebSocket provider from configuration
     pub async fn new_ws(config: Config) -> anyhow::Result<Self> {
-        let db = Db::new(&config.database_url)?;
+        let db = Db::new(&config.database_url).await?;
         let wallet = Wallet::new(config.mnemonic.clone());
 
         let url = match &config.provider_url {
@@ -656,7 +657,7 @@ async fn send_faucet_funding_webhook(
     use tracing::{error, info};
 
     // Get the webhook URL using registration_id (the key in ACCOUNTS table)
-    let Some(webhook_url) = db.get_webhook_url(registration_id)? else {
+    let Some(webhook_url) = db.get_webhook_url(registration_id).await? else {
         error!(
             "No webhook URL found for registration_id: {}",
             registration_id

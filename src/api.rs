@@ -102,6 +102,7 @@ where
     let block_number = state
         .service
         .get_block_number()
+        .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(BlockNumberResponse { block_number }))
 }
@@ -116,6 +117,7 @@ where
     state
         .service
         .set_block_number(payload.block_number)
+        .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(BlockNumberResponse {
         block_number: payload.block_number,

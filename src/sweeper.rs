@@ -86,7 +86,7 @@ where
 
     async fn process_deposits(&self) -> Result<()> {
         // Process native ETH deposits
-        let deposits = self.db.get_detected_deposits()?;
+        let deposits = self.db.get_detected_deposits().await?;
 
         for (tx_hash, registration_id, amount_str) in deposits {
             info!(
@@ -97,7 +97,8 @@ where
             // Get account details to derive key (registration_id is the key in ACCOUNTS table)
             let (derivation_index, address_str, _webhook_url) = self
                 .db
-                .get_account_by_id(&registration_id)?
+                .get_account_by_id(&registration_id)
+                .await?
                 .ok_or_else(|| anyhow::anyhow!("Account not found"))?;
 
             let signer = self.wallet.get_signer(derivation_index)?;
@@ -126,7 +127,7 @@ where
         }
 
         // Process ERC20 deposits
-        let erc20_deposits = self.db.get_detected_erc20_deposits()?;
+        let erc20_deposits = self.db.get_detected_erc20_deposits().await?;
 
         // Track (address, token) pairs already swept in this cycle to avoid redundant attempts.
         // After sweeping the full token_balance for one deposit, all other deposits for the same
@@ -152,14 +153,15 @@ where
                     "Skipping ERC20 deposit token symbol for deposit: {}",
                     deposit.key
                 );
-                self.db.mark_erc20_deposit_swept(&deposit.key)?;
+                self.db.mark_erc20_deposit_swept(&deposit.key).await?;
                 continue;
             }
 
             // Get account details to derive key (registration_id is the key in ACCOUNTS table)
             let (derivation_index, address_str, _webhook_url) = self
                 .db
-                .get_account_by_id(registration_id)?
+                .get_account_by_id(registration_id)
+                .await?
                 .ok_or_else(|| anyhow::anyhow!("Account not found"))?;
 
             // Skip if we already swept this (address, token) pair in this cycle
@@ -194,13 +196,18 @@ where
                 }
                 Err(e) => {
                     error!("Failed to sweep ERC20 deposit {}: {:?}", deposit.key, e);
-                    if let Ok(failures) = self.db.increment_sweep_failure_count(&deposit.key) {
+                    if let Ok(failures) = self.db.increment_sweep_failure_count(&deposit.key).await
+                    {
                         if failures >= MAX_SWEEP_RETRIES {
                             let registration_id = &deposit.account_id;
-                            match self.db.mark_erc20_deposits_failed_for_account_token(
-                                registration_id,
-                                &deposit.token_address,
-                            ) {
+                            match self
+                                .db
+                                .mark_erc20_deposits_failed_for_account_token(
+                                    registration_id,
+                                    &deposit.token_address,
+                                )
+                                .await
+                            {
                                 Ok(failed_keys) => {
                                     error!(
                                         "Permanently marked {} deposit(s) as failed for account={}, token={} after {} attempts: {:?}",
@@ -310,7 +317,7 @@ where
         info!("Swept funds! Tx hash: {:?}", receipt.transaction_hash);
 
         // Update DB
-        self.db.mark_deposit_swept(tx_hash)?;
+        self.db.mark_deposit_swept(tx_hash).await?;
 
         // Send Webhook (for native deposits, id = tx_hash)
         // account_id = Polygon address, registration_id = original id from registration
@@ -347,14 +354,14 @@ where
                 "Skipping ERC20 deposit token symbol '{}' exceeds 5 characters for deposit: {}",
                 deposit.token_symbol, deposit.key
             );
-            self.db.mark_erc20_deposit_swept(&deposit.key)?;
+            self.db.mark_erc20_deposit_swept(&deposit.key).await?;
             return Ok(());
         }
 
         if token_balance.is_zero() {
-            let retry_count = self.db.increment_zero_balance_count(&deposit.key)?;
+            let retry_count = self.db.increment_zero_balance_count(&deposit.key).await?;
             if retry_count >= MAX_ZERO_BALANCE_RETRIES {
-                self.db.mark_erc20_deposit_swept(&deposit.key)?;
+                self.db.mark_erc20_deposit_swept(&deposit.key).await?;
                 info!(
                     "Marking deposit {} as swept after {} zero-balance retries (funds likely consolidated in a prior sweep)",
                     deposit.key, retry_count
@@ -507,11 +514,13 @@ where
         let registration_id = &deposit.account_id;
         let marked_keys = self
             .db
-            .mark_erc20_deposits_swept_for_account_token(registration_id, &deposit.token_address)?;
+            .mark_erc20_deposits_swept_for_account_token(registration_id, &deposit.token_address)
+            .await?;
 
         // Store sweep tx hash for all marked deposits (audit trail + webhook idempotency key)
         self.db
-            .set_sweep_tx_hash_for_keys(&marked_keys, &sweep_tx_hash)?;
+            .set_sweep_tx_hash_for_keys(&marked_keys, &sweep_tx_hash)
+            .await?;
 
         info!(
             "Marked {} ERC20 deposit(s) as swept for account={}, token={}, sweep_tx={}: {:?}",
@@ -525,7 +534,8 @@ where
         // Fetch token decimals from DB
         let token_decimals = self
             .db
-            .get_token_metadata(&deposit.token_address)?
+            .get_token_metadata(&deposit.token_address)
+            .await?
             .map(|(_, decimals, _)| decimals);
 
         // Send Webhook with the actual swept amount and the sweep tx hash for consumer deduplication
@@ -555,7 +565,7 @@ where
         amount: &str,
     ) -> Result<()> {
         // Get the webhook URL using registration_id (the key in ACCOUNTS table)
-        let Some(webhook_url) = self.db.get_webhook_url(registration_id)? else {
+        let Some(webhook_url) = self.db.get_webhook_url(registration_id).await? else {
             error!(
                 "No webhook URL found for registration_id: {}",
                 registration_id
@@ -603,7 +613,7 @@ where
 
     async fn send_erc20_webhook(&self, info: &Erc20WebhookInfo<'_>) -> Result<()> {
         // Get the webhook URL using registration_id (the key in ACCOUNTS table)
-        let Some(webhook_url) = self.db.get_webhook_url(info.registration_id)? else {
+        let Some(webhook_url) = self.db.get_webhook_url(info.registration_id).await? else {
             error!(
                 "No webhook URL found for registration_id: {}",
                 info.registration_id

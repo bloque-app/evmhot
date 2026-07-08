@@ -41,7 +41,7 @@ where
 
         // Use saturating_sub to prevent underflow if block_offset_from_head > latest_block
         let current_block = latest_block.saturating_sub(self.config.block_offset_from_head);
-        let last_processed = self.db.get_last_processed_block()?;
+        let last_processed = self.db.get_last_processed_block().await?;
 
         let start_block = if last_processed == 0 {
             current_block // Start from now if fresh
@@ -99,8 +99,10 @@ where
                             continue;
                         }
 
-                        if let Some(registration_id) =
-                            self.db.get_registration_id_by_address(&to_address_str)?
+                        if let Some(registration_id) = self
+                            .db
+                            .get_registration_id_by_address(&to_address_str)
+                            .await?
                         {
                             info!(
                                 "Native ETH deposit detected! Tx: {:?}, Address: {}, Registration ID: {}",
@@ -109,11 +111,14 @@ where
 
                             // Only send webhook if this is a new deposit (not a duplicate)
                             let tx_hash_str = tx.hash.to_string();
-                            let is_new_deposit = self.db.record_deposit(
-                                &tx_hash_str,
-                                &registration_id,
-                                &tx.value.to_string(),
-                            )?;
+                            let is_new_deposit = self
+                                .db
+                                .record_deposit(
+                                    &tx_hash_str,
+                                    &registration_id,
+                                    &tx.value.to_string(),
+                                )
+                                .await?;
 
                             // Send webhook notification for deposit detection only if it's new
                             if is_new_deposit {
@@ -145,7 +150,7 @@ where
         }
 
         // info!("Processing D {}", block_num);
-        self.db.set_last_processed_block(block_num)?;
+        self.db.set_last_processed_block(block_num).await?;
         Ok(())
     }
 
@@ -190,8 +195,10 @@ where
                 }
 
                 // Check if this is one of our monitored addresses
-                if let Some(registration_id) =
-                    self.db.get_registration_id_by_address(&to_address_str)?
+                if let Some(registration_id) = self
+                    .db
+                    .get_registration_id_by_address(&to_address_str)
+                    .await?
                 {
                     // Decode the amount from data field (ABI-encoded uint256 is 32 bytes)
                     let amount = if log.data().data.len() >= 32 {
@@ -236,14 +243,17 @@ where
                         let deposit_id = format!("{}:{}", tx_hash_str, log_index);
 
                         // Only send webhook if this is a new deposit (not a duplicate)
-                        let is_new_deposit = self.db.record_erc20_deposit(
-                            &tx_hash_str,
-                            log_index,
-                            &registration_id,
-                            &amount.to_string(),
-                            &token_address.to_string(),
-                            &token_info.symbol,
-                        )?;
+                        let is_new_deposit = self
+                            .db
+                            .record_erc20_deposit(
+                                &tx_hash_str,
+                                log_index,
+                                &registration_id,
+                                &amount.to_string(),
+                                &token_address.to_string(),
+                                &token_info.symbol,
+                            )
+                            .await?;
 
                         // Send webhook notification for ERC20 deposit detection only if it's new
                         if is_new_deposit {
@@ -320,7 +330,9 @@ where
         let token_address_str = token_address.to_string();
 
         // Check cache first
-        if let Some((symbol, decimals, name)) = self.db.get_token_metadata(&token_address_str)? {
+        if let Some((symbol, decimals, name)) =
+            self.db.get_token_metadata(&token_address_str).await?
+        {
             return Ok(TokenInfo {
                 address: token_address_str,
                 symbol,
@@ -333,12 +345,14 @@ where
         match get_token_info(&self.provider, token_address).await {
             Ok(token_info) => {
                 // Cache it
-                self.db.store_token_metadata(
-                    &token_address_str,
-                    &token_info.symbol,
-                    token_info.decimals,
-                    &token_info.name,
-                )?;
+                self.db
+                    .store_token_metadata(
+                        &token_address_str,
+                        &token_info.symbol,
+                        token_info.decimals,
+                        &token_info.name,
+                    )
+                    .await?;
                 Ok(token_info)
             }
             Err(e) => {
@@ -359,7 +373,7 @@ where
 
     async fn send_deposit_detected_webhook(&self, info: &DepositInfo<'_>) -> Result<()> {
         // Get the webhook URL for this account using registration_id
-        let Some(webhook_url) = self.db.get_webhook_url(info.registration_id)? else {
+        let Some(webhook_url) = self.db.get_webhook_url(info.registration_id).await? else {
             error!(
                 "No webhook URL found for registration_id: {}",
                 info.registration_id

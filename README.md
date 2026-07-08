@@ -91,7 +91,7 @@ The service is configured via environment variables. Create a `.env` file or set
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DATABASE_URL` | Path to the database file | `sqlite:wallet.db` |
+| `DATABASE_URL` | Storage backend: a `postgres://` / `postgresql://` URL uses the PostgreSQL driver; any other value is treated as a local database file path (redb driver). Tables are created automatically on startup with either driver. | `sqlite:wallet.db` |
 | `PORT` | API server port | `3000` |
 | `POLL_INTERVAL` | Block polling interval in seconds (HTTP mode only) | `10` |
 | `BLOCK_OFFSET_FROM_HEAD` | Number of blocks to stay behind chain head for confirmation safety | `20` |

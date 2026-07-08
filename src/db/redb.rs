@@ -1,6 +1,9 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use redb::{Database, ReadableTable, TableDefinition};
 use std::sync::Arc;
+
+use super::{Erc20Deposit, Storage};
 
 const ACCOUNTS: TableDefinition<&str, (u32, &str, &str)> = TableDefinition::new("accounts"); // account_id -> (index, address, webhook_url)
 const ADDRESS_TO_ID: TableDefinition<&str, &str> = TableDefinition::new("address_to_id");
@@ -13,21 +16,13 @@ const ERC20_DEPOSITS: TableDefinition<&str, (&str, &str, &str, &str, &str)> =
 const SWEEP_META: TableDefinition<&str, (&str, u64)> = TableDefinition::new("sweep_meta"); // deposit_key -> (sweep_tx_hash, zero_balance_retry_count)
 const SWEEP_FAILURES: TableDefinition<&str, u64> = TableDefinition::new("sweep_failures"); // deposit_key -> consecutive_failure_count
 
-#[derive(Clone, Debug)]
-pub struct Erc20Deposit {
-    pub key: String,
-    pub account_id: String,
-    pub amount: String,
-    pub token_address: String,
-    pub token_symbol: String,
-}
-
+/// Embedded file-based storage driver backed by redb.
 #[derive(Clone)]
-pub struct Db {
+pub struct RedbStorage {
     db: Arc<Database>,
 }
 
-impl Db {
+impl RedbStorage {
     pub fn new(path: &str) -> Result<Self> {
         let db = Database::create(path)?;
 
@@ -47,9 +42,11 @@ impl Db {
 
         Ok(Self { db: Arc::new(db) })
     }
+}
 
-    #[allow(dead_code)]
-    pub fn get_next_derivation_index(&self) -> Result<u32> {
+#[async_trait]
+impl Storage for RedbStorage {
+    async fn get_next_derivation_index(&self) -> Result<u32> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ACCOUNTS)?;
         // This is inefficient O(N) but fine for MVP.
@@ -62,7 +59,7 @@ impl Db {
         }
     }
 
-    pub fn register_account(
+    async fn register_account(
         &self,
         id: &str,
         index: u32,
@@ -81,21 +78,21 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_registration_id_by_address(&self, address: &str) -> Result<Option<String>> {
+    async fn get_registration_id_by_address(&self, address: &str) -> Result<Option<String>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ADDRESS_TO_ID)?;
         let result = table.get(address)?;
         Ok(result.map(|v| v.value().to_string()))
     }
 
-    pub fn get_account_by_address(&self, address: &str) -> Result<Option<String>> {
+    async fn get_account_by_address(&self, address: &str) -> Result<Option<String>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ADDRESS_TO_ID)?;
         let result = table.get(address)?;
         Ok(result.map(|v| v.value().to_string()))
     }
 
-    pub fn get_account_by_id(&self, id: &str) -> Result<Option<(u32, String, String)>> {
+    async fn get_account_by_id(&self, id: &str) -> Result<Option<(u32, String, String)>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ACCOUNTS)?;
         let result = table.get(id)?;
@@ -105,15 +102,14 @@ impl Db {
         }))
     }
 
-    pub fn get_webhook_url(&self, account_id: &str) -> Result<Option<String>> {
+    async fn get_webhook_url(&self, account_id: &str) -> Result<Option<String>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ACCOUNTS)?;
         let result = table.get(account_id)?;
         Ok(result.map(|v| v.value().2.to_string()))
     }
 
-    /// Record a deposit and return true if it was newly recorded, false if it was a duplicate
-    pub fn record_deposit(&self, tx_hash: &str, account_id: &str, amount: &str) -> Result<bool> {
+    async fn record_deposit(&self, tx_hash: &str, account_id: &str, amount: &str) -> Result<bool> {
         let write_txn = self.db.begin_write()?;
         let is_new = {
             let mut deposits = write_txn.open_table(DEPOSITS)?;
@@ -129,7 +125,7 @@ impl Db {
         Ok(is_new)
     }
 
-    pub fn mark_deposit_swept(&self, tx_hash: &str) -> Result<()> {
+    async fn mark_deposit_swept(&self, tx_hash: &str) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut deposits = write_txn.open_table(DEPOSITS)?;
@@ -149,7 +145,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_detected_deposits(&self) -> Result<Vec<(String, String, String)>> {
+    async fn get_detected_deposits(&self) -> Result<Vec<(String, String, String)>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(DEPOSITS)?;
         let mut results = Vec::new();
@@ -167,14 +163,14 @@ impl Db {
         Ok(results)
     }
 
-    pub fn get_last_processed_block(&self) -> Result<u64> {
+    async fn get_last_processed_block(&self) -> Result<u64> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(STATE)?;
         let result = table.get("last_block")?;
         Ok(result.map(|v| v.value().parse().unwrap_or(0)).unwrap_or(0))
     }
 
-    pub fn set_last_processed_block(&self, block: u64) -> Result<()> {
+    async fn set_last_processed_block(&self, block: u64) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut state = write_txn.open_table(STATE)?;
@@ -186,7 +182,7 @@ impl Db {
 
     // ========== ERC20 Token Metadata ==========
 
-    pub fn store_token_metadata(
+    async fn store_token_metadata(
         &self,
         address: &str,
         symbol: &str,
@@ -202,7 +198,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_token_metadata(&self, address: &str) -> Result<Option<(String, u8, String)>> {
+    async fn get_token_metadata(&self, address: &str) -> Result<Option<(String, u8, String)>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(TOKEN_METADATA)?;
         let result = table.get(address)?;
@@ -214,8 +210,7 @@ impl Db {
 
     // ========== ERC20 Deposits ==========
 
-    /// Record an ERC20 deposit and return true if it was newly recorded, false if it was a duplicate
-    pub fn record_erc20_deposit(
+    async fn record_erc20_deposit(
         &self,
         tx_hash: &str,
         log_index: u64,
@@ -242,7 +237,7 @@ impl Db {
         Ok(is_new)
     }
 
-    pub fn get_detected_erc20_deposits(&self) -> Result<Vec<Erc20Deposit>> {
+    async fn get_detected_erc20_deposits(&self) -> Result<Vec<Erc20Deposit>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ERC20_DEPOSITS)?;
         let mut results = Vec::new();
@@ -262,7 +257,7 @@ impl Db {
         Ok(results)
     }
 
-    pub fn mark_erc20_deposit_swept(&self, key: &str) -> Result<()> {
+    async fn mark_erc20_deposit_swept(&self, key: &str) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut deposits = write_txn.open_table(ERC20_DEPOSITS)?;
@@ -296,9 +291,7 @@ impl Db {
         Ok(())
     }
 
-    /// Mark all detected ERC20 deposits for a given (account_id, token_address) as swept.
-    /// Returns the list of deposit keys that were marked.
-    pub fn mark_erc20_deposits_swept_for_account_token(
+    async fn mark_erc20_deposits_swept_for_account_token(
         &self,
         account_id: &str,
         token_address: &str,
@@ -347,8 +340,7 @@ impl Db {
 
     // ========== Sweep Metadata (new table, existing schemas unchanged) ==========
 
-    /// Increment zero-balance retry count for a deposit. Returns the new count.
-    pub fn increment_zero_balance_count(&self, key: &str) -> Result<u64> {
+    async fn increment_zero_balance_count(&self, key: &str) -> Result<u64> {
         let write_txn = self.db.begin_write()?;
         let new_count = {
             let mut meta = write_txn.open_table(SWEEP_META)?;
@@ -367,9 +359,7 @@ impl Db {
         Ok(new_count)
     }
 
-    /// Store the on-chain sweep tx hash for a single deposit key.
-    #[allow(dead_code)]
-    pub fn set_sweep_tx_hash(&self, key: &str, tx_hash: &str) -> Result<()> {
+    async fn set_sweep_tx_hash(&self, key: &str, tx_hash: &str) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut meta = write_txn.open_table(SWEEP_META)?;
@@ -383,8 +373,7 @@ impl Db {
         Ok(())
     }
 
-    /// Store the on-chain sweep tx hash for multiple deposit keys in one transaction.
-    pub fn set_sweep_tx_hash_for_keys(&self, keys: &[String], tx_hash: &str) -> Result<()> {
+    async fn set_sweep_tx_hash_for_keys(&self, keys: &[String], tx_hash: &str) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut meta = write_txn.open_table(SWEEP_META)?;
@@ -400,9 +389,7 @@ impl Db {
         Ok(())
     }
 
-    /// Read sweep metadata for a deposit key.
-    #[allow(dead_code)]
-    pub fn get_sweep_meta(&self, key: &str) -> Result<Option<(String, u64)>> {
+    async fn get_sweep_meta(&self, key: &str) -> Result<Option<(String, u64)>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(SWEEP_META)?;
         let result = table.get(key)?;
@@ -414,8 +401,7 @@ impl Db {
 
     // ========== Sweep Failure Tracking ==========
 
-    /// Increment the sweep failure count for a deposit. Returns the new count.
-    pub fn increment_sweep_failure_count(&self, key: &str) -> Result<u64> {
+    async fn increment_sweep_failure_count(&self, key: &str) -> Result<u64> {
         let write_txn = self.db.begin_write()?;
         let new_count = {
             let mut failures = write_txn.open_table(SWEEP_FAILURES)?;
@@ -431,8 +417,7 @@ impl Db {
         Ok(new_count)
     }
 
-    /// Mark a single ERC20 deposit as permanently failed.
-    pub fn mark_erc20_deposit_failed(&self, key: &str) -> Result<()> {
+    async fn mark_erc20_deposit_failed(&self, key: &str) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut deposits = write_txn.open_table(ERC20_DEPOSITS)?;
@@ -466,9 +451,7 @@ impl Db {
         Ok(())
     }
 
-    /// Mark all detected ERC20 deposits for a given (account_id, token_address) as permanently failed.
-    /// Returns the list of deposit keys that were marked.
-    pub fn mark_erc20_deposits_failed_for_account_token(
+    async fn mark_erc20_deposits_failed_for_account_token(
         &self,
         account_id: &str,
         token_address: &str,
