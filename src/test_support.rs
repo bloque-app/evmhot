@@ -37,6 +37,8 @@ pub fn test_chain_config(rpc_url: impl Into<String>) -> ChainConfig {
         poll_interval: 1,
         get_logs_max_retries: 30,
         get_logs_delay_ms: 50,
+        catch_up_chunk_size: 500,
+        block_fetch_concurrency: 10,
         min_deposits: MinDepositSettings::default(),
         allowed_token_addresses: HashSet::new(),
     }

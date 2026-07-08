@@ -305,6 +305,28 @@ impl wiremock::Match for BodyContains {
     }
 }
 
+/// Case-insensitive body substring matcher. Used to check for a token address in an
+/// `eth_getLogs` request without depending on whether alloy serializes `Address` in
+/// checksummed or lowercase hex form.
+fn body_json_contains_ci(substring: &str) -> impl wiremock::Match {
+    BodyContainsCi(substring.to_lowercase())
+}
+
+struct BodyContainsCi(String);
+impl wiremock::Match for BodyContainsCi {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        let body_str = String::from_utf8_lossy(&request.body).to_lowercase();
+        body_str.contains(&self.0)
+    }
+}
+
+/// Matches a JSON field with an exact hex-encoded numeric value, e.g.
+/// `field_hex("fromBlock", 1)` matches `"fromBlock":"0x1"` but not `"fromBlock":"0x15"`.
+/// Plain substring matching on the hex digits alone would conflate those two.
+fn field_hex(field: &str, value: u64) -> String {
+    format!("\"{field}\":\"0x{value:x}\"")
+}
+
 fn empty_block_rpc_response() -> serde_json::Value {
     let block_hash = "0x000000000000000000000000000000000000000000000000000000000000000a";
     let parent_hash = "0x0000000000000000000000000000000000000000000000000000000000000009";
@@ -2656,4 +2678,784 @@ async fn test_block_number_unknown_chain() {
 
     let err = service.get_block_number("unknown").unwrap_err();
     assert!(err.to_string().contains("Unknown chain"));
+}
+
+// ========== Monitor Catch-Up Acceleration Tests ==========
+//
+// Builds a native-transfer block RPC response by cloning the shared empty-block
+// skeleton (so the many fixed-size hex fields like logsBloom stay valid) and
+// overriding only the block number and transaction list.
+fn native_tx_block_response(block_num: u64, to_addr: &str, tx_hash: &str) -> serde_json::Value {
+    let mut resp = empty_block_rpc_response();
+    let block_hex = format!("0x{block_num:x}");
+    resp["result"]["number"] = json!(block_hex);
+    resp["result"]["transactions"] = json!([{
+        "hash": tx_hash,
+        "nonce": "0x0",
+        "blockHash": "0x000000000000000000000000000000000000000000000000000000000000000a",
+        "blockNumber": block_hex,
+        "transactionIndex": "0x0",
+        "from": "0x0000000000000000000000000000000000000001",
+        "to": to_addr,
+        "value": "0xDE0B6B3A7640000",
+        "gas": "0x5208",
+        "gasPrice": "0x3B9ACA00",
+        "input": "0x",
+        "v": "0x1b",
+        "r": "0x1",
+        "s": "0x1",
+        "type": "0x0",
+        "chainId": "0x1"
+    }]);
+    resp
+}
+
+/// [REGRESSION] `get_logs_with_retry` used to treat an empty result as a failure and
+/// retry up to `get_logs_max_retries` times with `get_logs_delay_ms` sleeps between
+/// attempts — on a fast-moving chain with sparse matching transfers, this alone could
+/// burn seconds per block. An empty result is valid; it must return immediately.
+#[tokio::test]
+async fn test_get_logs_empty_result_returns_without_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let mut config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
+    config.chains[0].get_logs_max_retries = 30;
+    config.chains[0].get_logs_delay_ms = 50;
+    // Large enough that only one catch_up cycle runs during the test window, so the
+    // get_logs call count reflects a single scan attempt, not multiple poll loops.
+    config.chains[0].poll_interval = 3600;
+
+    let db = Db::new(&config.database_url).unwrap();
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_blockNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0xA"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBlockByNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_block_rpc_response()))
+        .mount(&rpc_server)
+        .await;
+
+    let get_logs_calls = StdArc::new(AtomicUsize::new(0));
+    let calls_for_mock = get_logs_calls.clone();
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .respond_with(move |_: &wiremock::Request| {
+            calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "result": []
+            }))
+        })
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let deliverer = test_webhook_deliverer(db.clone());
+    let monitor = Monitor::new(
+        config.chains[0].clone(),
+        deliverer,
+        db.clone(),
+        provider.clone(),
+    );
+    let handle = tokio::spawn(async move {
+        monitor.run().await;
+    });
+
+    // If the regression reappeared, a buggy retry loop (30 attempts x 50ms delay)
+    // would still be mid-retry at 800ms, producing well over 1 call.
+    sleep(Duration::from_millis(800)).await;
+    handle.abort();
+
+    assert_eq!(
+        get_logs_calls.load(Ordering::SeqCst),
+        1,
+        "an empty get_logs result must not be retried"
+    );
+}
+
+/// The `eth_getLogs` filter must be narrowed to the allowlisted token contracts,
+/// instead of matching every ERC20 Transfer event on the chain.
+#[tokio::test]
+async fn test_erc20_filter_includes_allowlisted_token_address() {
+    use std::collections::HashSet;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let addr = wallet.derive_address(0).unwrap().to_string();
+
+    let allowed_token = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+    let mut allowlist = HashSet::new();
+    allowlist.insert(allowed_token.to_lowercase());
+
+    let mut config = test_config_with_allowlist(allowlist);
+    config.database_url = db_file.path().to_str().unwrap().to_string();
+    config.chains[0].rpc_url = rpc_server.uri();
+    config.chains[0].get_logs_max_retries = 1;
+    config.chains[0].get_logs_delay_ms = 1;
+    config.chains[0].poll_interval = 3600;
+
+    let db = Db::new(&config.database_url).unwrap();
+    db.register_account("user_1", 0, &addr, "http://localhost/webhook")
+        .unwrap();
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_blockNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0xA"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBlockByNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_block_rpc_response()))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .and(body_json_contains_ci(&allowed_token.to_lowercase()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": []
+        })))
+        .expect(1)
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let deliverer = test_webhook_deliverer(db.clone());
+    let monitor = Monitor::new(
+        config.chains[0].clone(),
+        deliverer,
+        db.clone(),
+        provider.clone(),
+    );
+    let handle = tokio::spawn(async move {
+        monitor.run().await;
+    });
+
+    sleep(Duration::from_millis(300)).await;
+    handle.abort();
+
+    // Verification of the `.expect(1)` mock above happens when `rpc_server` drops:
+    // if the allowlisted token address never appeared in the eth_getLogs request,
+    // this mock never matched and the drop panics.
+}
+
+/// When the monitor is far enough behind head, `catch_up` must switch to the
+/// batched path: one ranged `eth_getLogs` call covering the whole gap (in one
+/// chunk, since it's under `catch_up_chunk_size`) instead of one call per block.
+#[tokio::test]
+async fn test_batch_catchup_ranged_get_logs_records_erc20_deposit() {
+    use std::collections::HashSet;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let addr = wallet.derive_address(0).unwrap().to_string();
+
+    let allowed_token = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+    let mut allowlist = HashSet::new();
+    allowlist.insert(allowed_token.to_lowercase());
+
+    let mut config = test_config_with_allowlist(allowlist);
+    config.database_url = db_file.path().to_str().unwrap().to_string();
+    config.chains[0].rpc_url = rpc_server.uri();
+    config.chains[0].get_logs_max_retries = 1;
+    config.chains[0].get_logs_delay_ms = 1;
+    config.chains[0].poll_interval = 3600;
+
+    let db = Db::new(&config.database_url).unwrap();
+    db.register_account("user_1", 0, &addr, "http://localhost/webhook")
+        .unwrap();
+    db.store_token_metadata(TEST_CHAIN, allowed_token, "USDT", 6, "Tether USD")
+        .unwrap();
+    // last_processed = 1, head = 21 -> gap of 20 blocks, above the batch threshold.
+    db.set_last_processed_block(TEST_CHAIN, 1).unwrap();
+
+    let transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    let from_topic = "0x0000000000000000000000000000000000000000000000000000000000000001";
+    let to_topic = format!("0x000000000000000000000000{}", &addr[2..].to_lowercase());
+    let amount_data = "0x00000000000000000000000000000000000000000000000000000000000f4240";
+    let tx_hash = format!("0x{}", "a".repeat(64));
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_blockNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x15"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBlockByNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_block_rpc_response()))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [{
+                "address": allowed_token,
+                "topics": [transfer_topic, from_topic, to_topic],
+                "data": amount_data,
+                "blockNumber": "0x5",
+                "transactionHash": tx_hash,
+                "transactionIndex": "0x0",
+                "blockHash": "0x000000000000000000000000000000000000000000000000000000000000000a",
+                "logIndex": "0x0",
+                "removed": false
+            }]
+        })))
+        .expect(1)
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let deliverer = test_webhook_deliverer(db.clone());
+    let monitor = Monitor::new(
+        config.chains[0].clone(),
+        deliverer,
+        db.clone(),
+        provider.clone(),
+    );
+    let handle = tokio::spawn(async move {
+        monitor.run().await;
+    });
+
+    sleep(Duration::from_millis(500)).await;
+    handle.abort();
+
+    let deposits = db.get_detected_erc20_deposits(TEST_CHAIN).unwrap();
+    assert_eq!(
+        deposits.len(),
+        1,
+        "expected one ERC20 deposit from the ranged batch scan"
+    );
+    assert_eq!(db.get_last_processed_block(TEST_CHAIN).unwrap(), 21);
+
+    let deposit_id = format!("{TEST_CHAIN}:{tx_hash}:0");
+    assert!(
+        db.get_webhook_delivery(&deposit_id, "deposit_detected")
+            .unwrap()
+            .is_some(),
+        "expected deposit_detected webhook enqueued exactly once"
+    );
+}
+
+/// Providers cap `eth_getLogs` responses (Alchemy: "Log response size exceeded" for
+/// an oversized range/response, with no partial result). The batch path must bisect
+/// the range on error and retry with the two halves rather than failing outright.
+#[tokio::test]
+async fn test_batch_catchup_bisects_on_provider_error() {
+    use std::collections::HashSet;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let addr = wallet.derive_address(0).unwrap().to_string();
+
+    let allowed_token = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+    let mut allowlist = HashSet::new();
+    allowlist.insert(allowed_token.to_lowercase());
+
+    let mut config = test_config_with_allowlist(allowlist);
+    config.database_url = db_file.path().to_str().unwrap().to_string();
+    config.chains[0].rpc_url = rpc_server.uri();
+    config.chains[0].get_logs_max_retries = 1;
+    config.chains[0].get_logs_delay_ms = 1;
+    config.chains[0].poll_interval = 3600;
+
+    let db = Db::new(&config.database_url).unwrap();
+    db.register_account("user_1", 0, &addr, "http://localhost/webhook")
+        .unwrap();
+    db.store_token_metadata(TEST_CHAIN, allowed_token, "USDT", 6, "Tether USD")
+        .unwrap();
+    // last_processed = 1, head = 21 -> whole chunk is (1, 21); mid-bisect is (1,11) + (12,21).
+    db.set_last_processed_block(TEST_CHAIN, 1).unwrap();
+
+    let transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    let from_topic = "0x0000000000000000000000000000000000000000000000000000000000000001";
+    let to_topic = format!("0x000000000000000000000000{}", &addr[2..].to_lowercase());
+    let amount_data = "0x00000000000000000000000000000000000000000000000000000000000f4240";
+    let tx_hash_left = format!("0x{}", "1".repeat(64));
+    let tx_hash_right = format!("0x{}", "2".repeat(64));
+
+    fn transfer_log(
+        token: &str,
+        topics: [&str; 3],
+        data: &str,
+        block_hex: &str,
+        tx_hash: &str,
+    ) -> serde_json::Value {
+        json!({
+            "address": token,
+            "topics": topics,
+            "data": data,
+            "blockNumber": block_hex,
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x0",
+            "blockHash": "0x000000000000000000000000000000000000000000000000000000000000000a",
+            "logIndex": "0x0",
+            "removed": false
+        })
+    }
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_blockNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x15"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBlockByNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_block_rpc_response()))
+        .mount(&rpc_server)
+        .await;
+
+    // Whole-range call (1..=21): simulates a provider rejecting an oversized range.
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .and(body_json_contains(&field_hex("fromBlock", 1)))
+        .and(body_json_contains(&field_hex("toBlock", 21)))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&rpc_server)
+        .await;
+
+    // Left half (1..=11): succeeds.
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .and(body_json_contains(&field_hex("fromBlock", 1)))
+        .and(body_json_contains(&field_hex("toBlock", 11)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [transfer_log(
+                allowed_token,
+                [transfer_topic, from_topic, &to_topic],
+                amount_data,
+                "0x5",
+                &tx_hash_left,
+            )]
+        })))
+        .expect(1)
+        .mount(&rpc_server)
+        .await;
+
+    // Right half (12..=21): succeeds.
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .and(body_json_contains(&field_hex("fromBlock", 12)))
+        .and(body_json_contains(&field_hex("toBlock", 21)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [transfer_log(
+                allowed_token,
+                [transfer_topic, from_topic, &to_topic],
+                amount_data,
+                "0x10",
+                &tx_hash_right,
+            )]
+        })))
+        .expect(1)
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let deliverer = test_webhook_deliverer(db.clone());
+    let monitor = Monitor::new(
+        config.chains[0].clone(),
+        deliverer,
+        db.clone(),
+        provider.clone(),
+    );
+    let handle = tokio::spawn(async move {
+        monitor.run().await;
+    });
+
+    sleep(Duration::from_millis(500)).await;
+    handle.abort();
+
+    let deposits = db.get_detected_erc20_deposits(TEST_CHAIN).unwrap();
+    assert_eq!(
+        deposits.len(),
+        2,
+        "expected deposits from both bisected halves"
+    );
+    assert_eq!(db.get_last_processed_block(TEST_CHAIN).unwrap(), 21);
+}
+
+/// If a range has been bisected all the way down to a single block and that block
+/// still errors, the error must surface (no infinite recursion) and the chunk must
+/// not be checkpointed as processed.
+#[tokio::test]
+async fn test_batch_catchup_bisect_floor_surfaces_error() {
+    use std::collections::HashSet;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+
+    let allowed_token = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+    let mut allowlist = HashSet::new();
+    allowlist.insert(allowed_token.to_lowercase());
+
+    let mut config = test_config_with_allowlist(allowlist);
+    config.database_url = db_file.path().to_str().unwrap().to_string();
+    config.chains[0].rpc_url = rpc_server.uri();
+    config.chains[0].get_logs_max_retries = 1;
+    config.chains[0].get_logs_delay_ms = 1;
+    config.chains[0].poll_interval = 3600;
+    // Small chunk so the first (and only, for this test) chunk is just (1, 2),
+    // keeping the bisection tree to 3 nodes: (1,2) -> (1,1) + (2,2).
+    config.chains[0].catch_up_chunk_size = 2;
+
+    let db = Db::new(&config.database_url).unwrap();
+    // last_processed = 1, head = 21 -> gap of 20, above the batch threshold, even
+    // though the first chunk itself only spans 2 blocks.
+    db.set_last_processed_block(TEST_CHAIN, 1).unwrap();
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_blockNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x15"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBlockByNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_block_rpc_response()))
+        .mount(&rpc_server)
+        .await;
+
+    // The (1,2) range errors, bisects into (1,1) and (2,2). Bisection short-circuits
+    // on the first failing half (fail-fast: once part of the chunk is unrecoverable,
+    // there's no point burning a call on the sibling), so only (1,2) and (1,1) are
+    // ever queried; (2,2) must not be.
+    for (from, to) in [(1, 2), (1, 1)] {
+        Mock::given(method("POST"))
+            .and(body_json_contains("eth_getLogs"))
+            .and(body_json_contains(&field_hex("fromBlock", from)))
+            .and(body_json_contains(&field_hex("toBlock", to)))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&rpc_server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .and(body_json_contains(&field_hex("fromBlock", 2)))
+        .and(body_json_contains(&field_hex("toBlock", 2)))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let deliverer = test_webhook_deliverer(db.clone());
+    let monitor = Monitor::new(
+        config.chains[0].clone(),
+        deliverer,
+        db.clone(),
+        provider.clone(),
+    );
+    let handle = tokio::spawn(async move {
+        monitor.run().await;
+    });
+
+    sleep(Duration::from_millis(500)).await;
+    handle.abort();
+
+    assert_eq!(
+        db.get_last_processed_block(TEST_CHAIN).unwrap(),
+        1,
+        "a chunk that errors all the way to the bisection floor must not be checkpointed"
+    );
+    assert_eq!(db.get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(), 0);
+}
+
+/// The batch path fetches native blocks concurrently; deposits from multiple blocks
+/// within one chunk must all be recorded, not just the first or last.
+#[tokio::test]
+async fn test_batch_catchup_concurrent_native_fetch_records_multiple_blocks() {
+    use std::collections::HashSet;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let addr = wallet.derive_address(0).unwrap().to_string();
+
+    let allowed_token = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+    let mut allowlist = HashSet::new();
+    allowlist.insert(allowed_token.to_lowercase());
+
+    let mut config = test_config_with_allowlist(allowlist);
+    config.database_url = db_file.path().to_str().unwrap().to_string();
+    config.chains[0].rpc_url = rpc_server.uri();
+    config.chains[0].get_logs_max_retries = 1;
+    config.chains[0].get_logs_delay_ms = 1;
+    config.chains[0].poll_interval = 3600;
+
+    let db = Db::new(&config.database_url).unwrap();
+    db.register_account("user_1", 0, &addr, "http://localhost/webhook")
+        .unwrap();
+    // last_processed = 1, head = 21 -> gap of 20, above the batch threshold.
+    db.set_last_processed_block(TEST_CHAIN, 1).unwrap();
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_blockNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x15"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    // No ERC20 activity in this test; keep the batch path focused on native.
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": []
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    let addr_for_mock = addr.clone();
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBlockByNumber"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body_str = String::from_utf8_lossy(&req.body);
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body_str).unwrap_or(json!({"params": []}));
+            let block_hex = parsed["params"][0].as_str().unwrap_or("0x0");
+            let block_num =
+                u64::from_str_radix(block_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+
+            if block_num == 3 || block_num == 7 {
+                let tx_hash = format!("0x{block_num:064x}");
+                ResponseTemplate::new(200).set_body_json(native_tx_block_response(
+                    block_num,
+                    &addr_for_mock,
+                    &tx_hash,
+                ))
+            } else {
+                ResponseTemplate::new(200).set_body_json(empty_block_rpc_response())
+            }
+        })
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let deliverer = test_webhook_deliverer(db.clone());
+    let monitor = Monitor::new(
+        config.chains[0].clone(),
+        deliverer,
+        db.clone(),
+        provider.clone(),
+    );
+    let handle = tokio::spawn(async move {
+        monitor.run().await;
+    });
+
+    sleep(Duration::from_millis(800)).await;
+    handle.abort();
+
+    let deposits = db.get_detected_deposits(TEST_CHAIN).unwrap();
+    assert_eq!(
+        deposits.len(),
+        2,
+        "expected native deposits from both blocks fetched concurrently within the chunk"
+    );
+    assert_eq!(db.get_last_processed_block(TEST_CHAIN).unwrap(), 21);
+}
+
+/// Re-running a chunk (e.g. after a restart that re-reads a stale checkpoint) must
+/// not record a duplicate deposit or re-trigger the webhook for one already detected.
+#[tokio::test]
+async fn test_batch_catchup_replay_is_idempotent() {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let addr = wallet.derive_address(0).unwrap().to_string();
+
+    let allowed_token = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+    let mut allowlist = HashSet::new();
+    allowlist.insert(allowed_token.to_lowercase());
+
+    let mut config = test_config_with_allowlist(allowlist);
+    config.database_url = db_file.path().to_str().unwrap().to_string();
+    config.chains[0].rpc_url = rpc_server.uri();
+    config.chains[0].get_logs_max_retries = 1;
+    config.chains[0].get_logs_delay_ms = 1;
+    config.chains[0].poll_interval = 3600;
+
+    let db = Db::new(&config.database_url).unwrap();
+    db.register_account("user_1", 0, &addr, "http://localhost/webhook")
+        .unwrap();
+    db.store_token_metadata(TEST_CHAIN, allowed_token, "USDT", 6, "Tether USD")
+        .unwrap();
+    db.set_last_processed_block(TEST_CHAIN, 1).unwrap();
+
+    let transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    let from_topic = "0x0000000000000000000000000000000000000000000000000000000000000001";
+    let to_topic = format!("0x000000000000000000000000{}", &addr[2..].to_lowercase());
+    let amount_data = "0x00000000000000000000000000000000000000000000000000000000000f4240";
+    let tx_hash = format!("0x{}", "c".repeat(64));
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_blockNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x15"
+        })))
+        .mount(&rpc_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBlockByNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_block_rpc_response()))
+        .mount(&rpc_server)
+        .await;
+
+    let get_logs_calls = StdArc::new(AtomicUsize::new(0));
+    let calls_for_mock = get_logs_calls.clone();
+    let log_entry = json!({
+        "address": allowed_token,
+        "topics": [transfer_topic, from_topic, to_topic],
+        "data": amount_data,
+        "blockNumber": "0x5",
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+        "blockHash": "0x000000000000000000000000000000000000000000000000000000000000000a",
+        "logIndex": "0x0",
+        "removed": false
+    });
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .respond_with(move |_: &wiremock::Request| {
+            calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": [log_entry.clone()]
+            }))
+        })
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+
+    // First run: drains the backlog, records the deposit, checkpoints to 21.
+    {
+        let deliverer = test_webhook_deliverer(db.clone());
+        let monitor = Monitor::new(
+            config.chains[0].clone(),
+            deliverer,
+            db.clone(),
+            provider.clone(),
+        );
+        let handle = tokio::spawn(async move {
+            monitor.run().await;
+        });
+        sleep(Duration::from_millis(500)).await;
+        handle.abort();
+    }
+
+    assert_eq!(db.get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(), 1);
+    assert_eq!(db.get_last_processed_block(TEST_CHAIN).unwrap(), 21);
+
+    // Simulate replaying the same chunk (e.g. a restart reading a stale checkpoint)
+    // by resetting last_processed back to the chunk start.
+    db.set_last_processed_block(TEST_CHAIN, 1).unwrap();
+
+    {
+        let deliverer = test_webhook_deliverer(db.clone());
+        let monitor = Monitor::new(
+            config.chains[0].clone(),
+            deliverer,
+            db.clone(),
+            provider.clone(),
+        );
+        let handle = tokio::spawn(async move {
+            monitor.run().await;
+        });
+        sleep(Duration::from_millis(500)).await;
+        handle.abort();
+    }
+
+    assert_eq!(
+        get_logs_calls.load(Ordering::SeqCst),
+        2,
+        "expected the ranged get_logs call to run again on replay"
+    );
+    assert_eq!(
+        db.get_detected_erc20_deposits(TEST_CHAIN).unwrap().len(),
+        1,
+        "replaying the chunk must not record a duplicate deposit"
+    );
+
+    let deposit_id = format!("{TEST_CHAIN}:{tx_hash}:0");
+    let delivery = db
+        .get_webhook_delivery(&deposit_id, "deposit_detected")
+        .unwrap();
+    assert!(
+        delivery.is_some(),
+        "webhook delivery row should still exist after replay"
+    );
+    assert_eq!(
+        delivery.unwrap().attempt_count,
+        0,
+        "replay must not re-enqueue/re-attempt the webhook for an already-detected deposit"
+    );
 }
