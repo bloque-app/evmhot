@@ -66,7 +66,11 @@ impl Monitor {
     async fn catch_up(&self) -> Result<()> {
         let latest_block = self.provider.get_block_number().await?;
         let current_block = latest_block.saturating_sub(self.chain.block_offset_from_head);
-        let last_processed = self.db.get_last_processed_block(&self.chain.name)?;
+        let chain_name = self.chain.name.clone();
+        let last_processed = self
+            .db
+            .blocking(move |db| db.get_last_processed_block(&chain_name))
+            .await?;
 
         let start_block = if last_processed == 0 {
             current_block
@@ -136,8 +140,10 @@ impl Monitor {
             self.process_native_range_concurrent(chunk_start, chunk_end)
                 .await?;
 
+            let chain_name = self.chain.name.clone();
             self.db
-                .set_last_processed_block(&self.chain.name, chunk_end)?;
+                .blocking(move |db| db.set_last_processed_block(&chain_name, chunk_end))
+                .await?;
             chunk_start = chunk_end + 1;
         }
 
@@ -160,6 +166,12 @@ impl Monitor {
                 {
                     self.handle_native_txs(&block).await?;
                 }
+                // Deserializing a hydrated block is a synchronous, non-yielding
+                // CPU burst once the HTTP response body lands; yielding here
+                // gives the runtime a chance to schedule other tasks (other
+                // chains' monitors, the webhook retry worker) between blocks
+                // instead of one chunk's fetches monopolizing a worker thread.
+                tokio::task::yield_now().await;
                 Ok(())
             })
             .buffered(concurrency)
@@ -184,8 +196,10 @@ impl Monitor {
             self.process_erc20_transfers(block_num).await?;
         }
 
+        let chain_name = self.chain.name.clone();
         self.db
-            .set_last_processed_block(&self.chain.name, block_num)?;
+            .blocking(move |db| db.set_last_processed_block(&chain_name, block_num))
+            .await?;
         Ok(())
     }
 
@@ -212,8 +226,13 @@ impl Monitor {
                 continue;
             }
 
-            let Some(registration_id) = self.db.get_registration_id_by_address(&to_address_str)?
-            else {
+            let registration_id = {
+                let addr = to_address_str.clone();
+                self.db
+                    .blocking(move |db| db.get_registration_id_by_address(&addr))
+                    .await?
+            };
+            let Some(registration_id) = registration_id else {
                 continue;
             };
 
@@ -231,12 +250,17 @@ impl Monitor {
             );
 
             let tx_hash_str = tx.hash.to_string();
-            let is_new_deposit = self.db.record_deposit(
-                &self.chain.name,
-                &tx_hash_str,
-                &registration_id,
-                &tx.value.to_string(),
-            )?;
+            let is_new_deposit = {
+                let chain_name = self.chain.name.clone();
+                let tx_hash_str = tx_hash_str.clone();
+                let registration_id = registration_id.clone();
+                let value_str = tx.value.to_string();
+                self.db
+                    .blocking(move |db| {
+                        db.record_deposit(&chain_name, &tx_hash_str, &registration_id, &value_str)
+                    })
+                    .await?
+            };
 
             if is_new_deposit {
                 let amount_str = tx.value.to_string();
@@ -311,6 +335,10 @@ impl Monitor {
         let logs = self.get_logs_ranged_bisect(from_block, to_block).await?;
         for log in &logs {
             self.handle_erc20_log(log).await?;
+            // A busy chunk can carry many logs; yield between them so this
+            // task doesn't hog a worker thread through the whole batch (see
+            // the equivalent comment in `process_native_range_concurrent`).
+            tokio::task::yield_now().await;
         }
         Ok(())
     }
@@ -379,7 +407,13 @@ impl Monitor {
             return Ok(());
         }
 
-        let Some(registration_id) = self.db.get_registration_id_by_address(&to_address_str)? else {
+        let registration_id = {
+            let addr = to_address_str.clone();
+            self.db
+                .blocking(move |db| db.get_registration_id_by_address(&addr))
+                .await?
+        };
+        let Some(registration_id) = registration_id else {
             return Ok(());
         };
 
@@ -429,15 +463,27 @@ impl Monitor {
         let tx_hash_str = tx_hash.to_string();
         let deposit_id = format!("{}:{}:{}", self.chain.name, tx_hash_str, log_index);
 
-        let is_new_deposit = self.db.record_erc20_deposit(
-            &self.chain.name,
-            &tx_hash_str,
-            log_index,
-            &registration_id,
-            &amount.to_string(),
-            &token_address.to_string(),
-            &token_info.symbol,
-        )?;
+        let is_new_deposit = {
+            let chain_name = self.chain.name.clone();
+            let tx_hash_str = tx_hash_str.clone();
+            let registration_id = registration_id.clone();
+            let amount_str = amount.to_string();
+            let token_address_str = token_address.to_string();
+            let symbol = token_info.symbol.clone();
+            self.db
+                .blocking(move |db| {
+                    db.record_erc20_deposit(
+                        &chain_name,
+                        &tx_hash_str,
+                        log_index,
+                        &registration_id,
+                        &amount_str,
+                        &token_address_str,
+                        &symbol,
+                    )
+                })
+                .await?
+        };
 
         if is_new_deposit {
             let token_addr_str = token_address.to_string();
@@ -511,10 +557,14 @@ impl Monitor {
     async fn get_or_fetch_token_metadata(&self, token_address: Address) -> Result<TokenInfo> {
         let token_address_str = token_address.to_string();
 
-        if let Some((symbol, decimals, name)) = self
-            .db
-            .get_token_metadata(&self.chain.name, &token_address_str)?
-        {
+        let cached = {
+            let chain_name = self.chain.name.clone();
+            let addr = token_address_str.clone();
+            self.db
+                .blocking(move |db| db.get_token_metadata(&chain_name, &addr))
+                .await?
+        };
+        if let Some((symbol, decimals, name)) = cached {
             return Ok(TokenInfo {
                 address: token_address_str,
                 symbol,
@@ -525,13 +575,14 @@ impl Monitor {
 
         match get_token_info(&self.provider, token_address).await {
             Ok(token_info) => {
-                self.db.store_token_metadata(
-                    &self.chain.name,
-                    &token_address_str,
-                    &token_info.symbol,
-                    token_info.decimals,
-                    &token_info.name,
-                )?;
+                let chain_name = self.chain.name.clone();
+                let addr = token_address_str.clone();
+                let symbol = token_info.symbol.clone();
+                let name = token_info.name.clone();
+                let decimals = token_info.decimals;
+                self.db
+                    .blocking(move |db| db.store_token_metadata(&chain_name, &addr, &symbol, decimals, &name))
+                    .await?;
                 Ok(token_info)
             }
             Err(e) => {
@@ -550,7 +601,13 @@ impl Monitor {
     }
 
     async fn send_deposit_detected_webhook(&self, info: &DepositInfo<'_>) -> Result<()> {
-        let Some(webhook_url) = self.db.get_webhook_url(info.registration_id)? else {
+        let webhook_url = {
+            let registration_id = info.registration_id.to_string();
+            self.db
+                .blocking(move |db| db.get_webhook_url(&registration_id))
+                .await?
+        };
+        let Some(webhook_url) = webhook_url else {
             error!(
                 "No webhook URL found for registration_id: {}",
                 info.registration_id

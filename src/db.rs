@@ -4,7 +4,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection, OptionalExtension};
 use rusqlite_migration::{Migrations, M};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DepositQueueCounts {
@@ -104,12 +104,43 @@ impl Db {
         migrations().to_latest(&mut write_conn)?;
 
         let manager = SqliteConnectionManager::file(path).with_init(|c| apply_pragmas(&*c));
-        let read_pool = Pool::builder().build(manager)?;
+        // Explicit, short connection_timeout: r2d2's default is 30s, which
+        // means a read-pool contention spike (e.g. every connection busy
+        // during a catch-up backlog) would block whichever thread called
+        // `read.get()` for up to 30s. Callers on the async paths route
+        // through `Db::blocking`, so that block lands on the blocking pool
+        // rather than a Tokio worker thread, but failing fast is still
+        // preferable to a long silent stall either way.
+        let read_pool = Pool::builder()
+            .connection_timeout(Duration::from_secs(5))
+            .build(manager)?;
 
         Ok(Self {
             write: Arc::new(Mutex::new(write_conn)),
             read: read_pool,
         })
+    }
+
+    /// Runs a `Db` operation on Tokio's blocking thread pool.
+    ///
+    /// Every `Db` method is a synchronous rusqlite call: the write side takes
+    /// a `std::sync::Mutex`, and the read side blocks on `r2d2::Pool::get()`.
+    /// Calling them directly from an async fn risks stalling whichever Tokio
+    /// worker thread happens to run the call for the duration of the lock/
+    /// pool wait, which can starve everything else on that runtime (see the
+    /// monitor/sweeper/webhook callers). `Db` is a cheap `Clone` (the write
+    /// side is `Arc<Mutex<_>>`, the read side an r2d2 pool that's itself
+    /// internally `Arc`-backed), so this just moves a clone onto
+    /// `spawn_blocking`.
+    pub async fn blocking<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Db) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || f(&db))
+            .await
+            .map_err(|e| anyhow!("Db blocking task panicked or was cancelled: {e}"))?
     }
 
     fn with_write<F, T>(&self, f: F) -> Result<T>
