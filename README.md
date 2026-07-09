@@ -4,53 +4,49 @@ A Rust-based hot wallet service for EVM-compatible blockchains that monitors dep
 
 ## Features
 
-- 🔍 **Real-time Monitoring**: Dual-mode blockchain monitoring with WebSocket subscriptions and HTTP polling fallback
-- 💸 **Automatic Sweeping**: Automatically sweeps detected deposits to a configured treasury address
-- 🚰 **Faucet Integration**: Built-in faucet for funding new addresses with existential deposits
-- 🔐 **HD Wallet Support**: BIP-39 mnemonic-based hierarchical deterministic wallet for generating unique addresses
+- 🔍 **Multi-Chain Monitoring**: One process monitors multiple EVM chains (Base, Polygon, others) via HTTP polling
+- 💸 **Automatic Sweeping**: Per-chain sweepers transfer detected deposits to each chain's treasury address
+- 🚰 **Lazy Faucet**: Funds deposit addresses with gas just-in-time at sweep time (not at registration)
+- 🔐 **HD Wallet Support**: BIP-39 mnemonic-based hierarchical deterministic wallet — same addresses on every EVM chain
 - 📡 **REST API**: Simple API for registering users and generating deposit addresses
 - 🪝 **Per-Account Webhooks**: Custom webhook URLs per user for deposit detection and sweep notifications
-- 🗄️ **Embedded Database**: Uses `redb` for efficient, embedded storage
+- 🗄️ **Embedded Database**: SQLite (rusqlite, WAL mode)
 - 🪙 **ERC-20 Support**: Monitors and sweeps both native ETH and ERC-20 token deposits
 - 🧪 **Well-Tested**: Comprehensive unit and E2E tests with mocked providers
 - 🚀 **CI/CD Ready**: GitHub Actions workflow for formatting, linting, and testing
 
 ## Architecture
 
-The service consists of four main components:
+The service runs one **Monitor** and one **Sweeper** per configured chain, sharing a single database and HD wallet.
 
-### 1. Monitor
-Monitors the blockchain for incoming transactions to registered addresses:
-- **WebSocket Mode**: Real-time block subscriptions for instant deposit detection
-- **HTTP Polling Mode**: Fallback polling mechanism with configurable intervals
+### 1. Monitor (per chain)
+Polls the chain's RPC endpoint for incoming transactions to registered addresses:
+- **HTTP polling only** with configurable interval and block confirmation offset
 - **Native ETH & ERC-20**: Detects both native token and ERC-20 token transfers
-- **Smart Filtering**: Automatically ignores deposits from the faucet address to prevent sweeping existential deposits
-- Tracks last processed block to handle restarts gracefully
-- Records detected deposits in the database with token metadata
+- **Smart Filtering**: Ignores deposits from that chain's faucet address
+- Per-chain last processed block cursor for graceful restarts
+- Records detected deposits with chain-prefixed keys and sends webhooks including `chain` / `chain_id`
 
-### 2. Sweeper
-Processes detected deposits and transfers funds to the treasury:
-- Retrieves pending deposits from the database
-- Derives private keys for each deposit address
-- **Native ETH**: Calculates gas costs and transfers maximum available balance
-- **ERC-20 Tokens**: Sweeps ERC-20 tokens (requires native balance for gas)
-- Sends webhook notifications on successful sweeps
-- Marks deposits as swept in the database
+### 2. Sweeper (per chain)
+Processes detected deposits for its chain only:
+- Retrieves pending deposits scoped to the chain
+- Derives private keys for each deposit address (same mnemonic, all chains)
+- **Native ETH**: Calculates gas costs and transfers maximum available balance to the chain treasury
+- **ERC-20 Tokens**: Sweeps ERC-20 tokens (lazy-funds native gas if needed)
+- Sends chain-aware webhook notifications on successful sweeps
 
-### 3. Faucet
-Automatically funds newly registered addresses with an existential deposit:
+### 3. Faucet (per chain)
+Lazy-funds deposit addresses when a sweep needs gas:
 - Uses a separate mnemonic for security isolation
-- Sends configurable amount to new addresses upon registration
-- Ensures addresses have sufficient balance for future transactions
-- Faucet deposits are automatically excluded from sweeping
+- Sends the chain's configured existential deposit only when sweeping
+- Faucet deposits are excluded from sweeping on that chain
 
 ### 4. API Server
-HTTP API for user management and address generation:
-- `POST /register` - Register a new user with a webhook URL and receive a unique deposit address
-- Deterministic address derivation using hash-based indexing
-- Automatic funding via faucet upon registration
-- Per-account webhook configuration for custom notification endpoints
-- Thread-safe database access
+HTTP API for user management and operations:
+- `POST /register` — Register a user with a webhook URL; returns a chain-agnostic deposit address
+- `POST /verify_transfer` — Verify a transfer on a specific chain (requires `chain` field)
+- `GET/POST /block_number` — Read or set the per-chain block cursor (requires `chain`)
+- `GET /health` — Health check listing configured chains
 
 ## Installation
 
@@ -75,83 +71,81 @@ cargo test
 
 ## Configuration
 
-The service is configured via environment variables. Create a `.env` file or set these variables:
+Secrets stay in environment variables. Per-chain settings (RPC, treasury, tokens, gas) live in a TOML file.
 
-### Required Variables
+### Environment variables
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `MNEMONIC` | BIP-39 mnemonic phrase for HD wallet (used to derive user deposit addresses) | `test test test test test test test test test test test junk` |
-| `FAUCET_MNEMONIC` | BIP-39 mnemonic phrase for faucet wallet (used to fund new addresses) | `another twelve word phrase for faucet` |
-| `FAUCET_ADDRESS` | Ethereum address of the faucet (derived from `FAUCET_MNEMONIC` at index 0) | `0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266` |
-| `TREASURY_ADDRESS` | Ethereum address where funds will be swept | `0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb` |
-| `RPC_URL` or `WS_URL` | Blockchain node endpoint (use WS for real-time, RPC for polling) | `https://eth-mainnet.g.alchemy.com/v2/...` or `wss://eth-mainnet.g.alchemy.com/v2/...` |
+| Variable | Required | Description | Default |
+|----------|----------|-------------|---------|
+| `MNEMONIC` | yes | BIP-39 mnemonic for user deposit address derivation (same addresses on all EVM chains) | — |
+| `FAUCET_MNEMONIC` | yes | BIP-39 mnemonic for the faucet wallet (lazy-funds addresses for gas at sweep time) | — |
+| `CHAINS_CONFIG` | no | Path to chains TOML file | `chains.toml` |
+| `DATABASE_URL` | no | SQLite database file path (`sqlite:` prefix optional) | `sqlite:wallet.db` |
+| `PORT` | no | API server port | `3000` |
+| `WEBHOOK_JWT_TOKEN` | no | Optional JWT sent as `Authorization: Bearer` on webhooks and admin endpoints | — |
+| `WEBHOOK_MAX_RETRIES` | no | Max delivery attempts before marking a webhook `failed` | `5` |
+| `WEBHOOK_RETRY_DELAY_MS` | no | Delay between delivery attempts in the worker batch | `1000` |
+| `WEBHOOK_RETRY_POLL_INTERVAL` | no | Worker poll interval (seconds) when no enqueue/admin notify | `30` |
+| `WEBHOOK_RETRY_BATCH_SIZE` | no | Max pending deliveries processed per worker batch | `50` |
+| `WEBHOOK_LEASE_SECONDS` | no | Claim lease duration to prevent duplicate POSTs | `60` |
+| `LEGACY_CHAIN` | no | Chain name for redb→SQLite importer only | `polygon` |
 
-### Optional Variables
+### Chains file (`chains.toml`)
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | Path to the database file | `sqlite:wallet.db` |
-| `PORT` | API server port | `3000` |
-| `POLL_INTERVAL` | Block polling interval in seconds (HTTP mode only) | `10` |
-| `BLOCK_OFFSET_FROM_HEAD` | Number of blocks to stay behind chain head for confirmation safety | `20` |
-| `EXISTENTIAL_DEPOSIT` | Amount in wei to fund new addresses with | `10000000000000000` (0.01 ETH) |
+Copy [`chains.toml.example`](chains.toml.example) to `chains.toml`. Each `[[chains]]` block configures one network:
 
-### Example `.env` File
+- `name` — short id used in API/webhooks (`base`, `polygon`, …)
+- `chain_id` — EVM chain ID (included in webhooks)
+- `rpc_url` — HTTP(S) RPC endpoint (polling only)
+- `treasury_address`, `faucet_address`, `existential_deposit`
+- `allowed_token_addresses` — required per chain (non-empty)
+- Optional: `min_deposits`, `min_deposit_default`, `min_deposit_native`, `poll_interval`, `block_offset_from_head`
+
+### Example `.env`
 
 ```env
-# Database
-DATABASE_URL=sqlite:wallet.db
-
-# Blockchain Connection (choose one)
-RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
-# For WebSocket (comment out RPC_URL if using WS):
-# WS_URL=wss://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
-
-# Hot Wallet Configuration
-# This mnemonic is used to derive deposit addresses for users
-MNEMONIC=your twelve word mnemonic phrase goes here for hot wallet
-
-# Faucet Configuration
-# This mnemonic is for the faucet that funds new addresses with existential deposit
-FAUCET_MNEMONIC=another twelve word mnemonic phrase for faucet wallet funding
-
-# Faucet Address (derived from FAUCET_MNEMONIC at index 0)
-# This address is used to identify and skip faucet deposits from being swept
-# To get this address: derive it from your FAUCET_MNEMONIC using BIP39/BIP44 at path m/44'/60'/0'/0/0
-FAUCET_ADDRESS=0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
-
-# Existential Deposit (in wei)
-# Default: 10000000000000000 (0.01 ETH on Ethereum)
-# Adjust based on network: lower for testnets, consider gas costs
-EXISTENTIAL_DEPOSIT=10000000000000000
-
-# Treasury address where funds are swept to
-TREASURY_ADDRESS=0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
-
-# API Server Port
+DATABASE_URL=wallet.db
+MNEMONIC=your twelve word mnemonic phrase goes here
+FAUCET_MNEMONIC=another twelve word mnemonic phrase for faucet
 PORT=3000
-
-# Polling interval in seconds (for monitoring new blocks)
-POLL_INTERVAL=10
-
-# Block Offset from Head (number of blocks behind current head for confirmation safety)
-BLOCK_OFFSET_FROM_HEAD=20
+CHAINS_CONFIG=chains.toml
 ```
+
+See [WEBHOOK_SPEC.md](./WEBHOOK_SPEC.md) for chain-aware webhook payloads and id format (`{chain}:{tx_hash}`).
+
+## Migration (redb → SQLite)
+
+One-shot offline cutover from the legacy redb file:
+
+```bash
+cp evm_wallet.db evm_wallet.db.bak
+cargo run --release --bin migrate_redb_to_sqlite -- \
+  --from evm_wallet.db \
+  --to wallet.db \
+  --legacy-chain polygon
+```
+
+Verify block cursors and row counts:
+
+```bash
+sqlite3 wallet.db "SELECT key, value FROM state WHERE key LIKE 'last_block:%';"
+sqlite3 wallet.db "SELECT chain, status, COUNT(*) FROM deposits GROUP BY 1, 2;"
+```
+
+Point `DATABASE_URL` at the new SQLite file (bare path or `sqlite:` prefix), then start the service. Keep the redb backup for at least 7 days.
 
 ## Usage
 
 ### Running the Service
 
 ```bash
-# With .env file
+# With .env + chains.toml
 cargo run --release
 
 # Or with environment variables
 MNEMONIC="..." \
-TREASURY_ADDRESS="0x..." \
-WEBHOOK_URL="https://..." \
-RPC_URL="https://..." \
+FAUCET_MNEMONIC="..." \
+CHAINS_CONFIG=chains.toml \
 cargo run --release
 ```
 
@@ -171,32 +165,59 @@ curl -X POST http://localhost:3000/register \
 Response:
 ```json
 {
-  "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
-  "funding_tx": "0xabc123..." // Optional: transaction hash of faucet funding
+  "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
 }
 ```
 
-**Note**: Upon registration, the address is automatically funded with the configured existential deposit from the faucet. This ensures the address has enough balance for gas fees when sweeping deposits.
+**Note**: Registration does **not** fund the address. The sweeper lazy-funds gas on each chain when a deposit is swept. The optional `funding_tx` field is omitted (legacy clients may still see `"funding_tx": null`).
 
-**Important**: Each user registers with their own `webhook_url`. This allows per-user notification endpoints for deposit detection and sweep events.
+**Important**: Each user registers with their own `webhook_url`. Webhooks include `chain`, `chain_id`, and chain-scoped `id` values — see [WEBHOOK_SPEC.md](./WEBHOOK_SPEC.md).
+
+### Verifying Transfers
+
+```bash
+curl -X POST http://localhost:3000/verify_transfer \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chain": "polygon",
+    "tx_hash": "0xabc...",
+    "to_address": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+    "amount": "1000000000000000000",
+    "token_type": "native"
+  }'
+```
+
+### Per-Chain Block Cursor
+
+```bash
+# Get last processed block for polygon
+curl "http://localhost:3000/block_number?chain=polygon"
+
+# Reset cursor (admin)
+curl -X POST http://localhost:3000/block_number \
+  -H "Content-Type: application/json" \
+  -d '{"chain": "polygon", "block_number": 12345678}'
+```
 
 ### Webhook Notifications
 
-The service sends webhook notifications to the per-account `webhook_url` for deposit events. Each webhook includes a unique `id` field for idempotency and deduplication.
+The service sends webhook notifications to the per-account `webhook_url` for deposit events. Each webhook includes `chain`, `chain_id`, and a chain-scoped `id` field for idempotency.
 
 #### Unique Identifier (`id` field)
-- **Native ETH deposits**: `id` = transaction hash (e.g., `"0xabc123..."`)
-- **ERC20 deposits**: `id` = transaction hash + log index (e.g., `"0xabc123...:0"`)
+- **Native ETH deposits**: `{chain}:{tx_hash}` (e.g. `polygon:0xabc...`)
+- **ERC20 deposits**: `{chain}:{tx_hash}:{log_index}` (e.g. `base:0xabc...:0`)
 
-This ensures unique identification even when multiple ERC20 transfers occur in the same transaction.
+See [WEBHOOK_SPEC.md](./WEBHOOK_SPEC.md) for full payload examples.
 
 #### 1. Deposit Detection
-When a deposit is first detected on the blockchain, a POST request is sent to the account's webhook URL:
+When a deposit is first detected on a chain, a POST request is sent to the account's webhook URL:
 
 **Native ETH Deposit Detected:**
 ```json
 {
-  "id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+  "id": "polygon:0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+  "chain": "polygon",
+  "chain_id": 137,
   "event": "deposit_detected",
   "account_id": "user_123",
   "tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
@@ -208,7 +229,9 @@ When a deposit is first detected on the blockchain, a POST request is sent to th
 **ERC-20 Token Deposit Detected:**
 ```json
 {
-  "id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef:0",
+  "id": "polygon:0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef:0",
+  "chain": "polygon",
+  "chain_id": 137,
   "event": "deposit_detected",
   "account_id": "user_123",
   "tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
@@ -233,7 +256,9 @@ When a deposit is successfully swept to the treasury, a POST request is sent to 
 **Native ETH Deposit Swept:**
 ```json
 {
-  "id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+  "id": "polygon:0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+  "chain": "polygon",
+  "chain_id": 137,
   "event": "deposit_swept",
   "account_id": "user_123",
   "original_tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
@@ -245,10 +270,12 @@ When a deposit is successfully swept to the treasury, a POST request is sent to 
 **ERC-20 Token Deposit Swept:**
 ```json
 {
-  "id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef:0",
+  "id": "polygon:0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef:0",
+  "chain": "polygon",
+  "chain_id": 137,
   "event": "deposit_swept",
   "account_id": "user_123",
-  "original_tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef:0",
+  "original_tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
   "amount": "1000000",
   "token_type": "erc20",
   "token_symbol": "USDC",
@@ -257,30 +284,7 @@ When a deposit is successfully swept to the treasury, a POST request is sent to 
 }
 ```
 
-#### 3. Faucet Funding
-When a newly registered address is funded with an existential deposit:
-
-**Faucet Funding Success:**
-```json
-{
-  "event": "faucet_funding",
-  "account_id": "user_123",
-  "address": "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb",
-  "success": true,
-  "tx_hash": "0xabc..."
-}
-```
-
-**Faucet Funding Failure:**
-```json
-{
-  "event": "faucet_funding",
-  "account_id": "user_123",
-  "address": "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb",
-  "success": false,
-  "error": "Insufficient faucet balance"
-}
-```
+Registration does **not** emit a `faucet_funding` webhook. Gas is funded silently at sweep time when needed.
 
 #### Webhook Best Practices
 
@@ -311,9 +315,6 @@ app.post('/webhook', async (req, res) => {
       break;
     case 'deposit_swept':
       await handleDepositSwept(req.body);
-      break;
-    case 'faucet_funding':
-      await handleFaucetFunding(req.body);
       break;
   }
   
@@ -354,12 +355,54 @@ console.log(wallet.address);
 - Addresses are case-insensitive but should be in checksummed format
 
 **"Faucet has insufficient balance"**
-- Ensure the faucet address has enough native currency to fund new addresses
-- Each registration requires at least `EXISTENTIAL_DEPOSIT` amount
+- Ensure the faucet address has enough native currency on each chain to fund sweeps
+- Each lazy fund requires at least that chain's `existential_deposit` amount
 
 **"ERC-20 sweep fails with insufficient gas"**
 - Addresses need native balance (ETH/MATIC/etc.) to pay for ERC-20 transfer gas
 - Consider increasing `EXISTENTIAL_DEPOSIT` if you expect ERC-20 deposits
+
+**"Deposit detected but never swept after faucet was refilled"**
+- ERC20 sweeps retry automatically while `status = 'detected'`. Transient faucet/gas errors no longer count toward the permanent-failure limit.
+- If a deposit was marked `failed` before this fix (or after 5 non-funding errors), re-queue it with:
+
+```bash
+curl -X POST http://localhost:8080/admin/retry_sweeps \
+  -H "Authorization: Bearer $WEBHOOK_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"chain":"base","tx_hash":"0x...","log_index":120}'
+```
+
+Omit `log_index` for native deposits. The sweeper picks up re-queued rows on the next poll cycle (~10s by default).
+
+**"Webhook delivery failed"**
+- Webhooks are persisted in SQLite and retried by a background worker. Non-2xx responses are treated as failures (including 503).
+- Re-queue a permanently failed webhook with:
+
+```bash
+curl -X POST http://localhost:8080/admin/retry_webhooks \
+  -H "Authorization: Bearer $WEBHOOK_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"base:0xabc:120","event":"deposit_swept"}'
+```
+
+Inspect failed deliveries:
+
+```sql
+SELECT id, event, status, attempt_count, last_http_status, last_error
+FROM webhook_deliveries WHERE status = 'failed';
+```
+
+The legacy [`scripts/retry_deposit_webhooks.sh`](scripts/retry_deposit_webhooks.sh) script can still be used for manual replays; prefer the admin API for operational retries.
+
+**Manual SQL recovery** (if the API is unavailable):
+
+```sql
+UPDATE erc20_deposits SET status = 'detected'
+  WHERE chain = 'base' AND tx_hash = '0x...' AND log_index = 120 AND status = 'failed';
+DELETE FROM sweep_failures
+  WHERE chain = 'base' AND tx_hash = '0x...' AND log_index = 120;
+```
 
 ## Debugging
 
@@ -486,7 +529,9 @@ emvhot/
 │   ├── main.rs          # Entry point, service orchestration
 │   ├── api.rs           # REST API server
 │   ├── config.rs        # Configuration management
-│   ├── db.rs            # Database layer (redb)
+│   ├── db.rs            # Database layer (SQLite)
+│   ├── redb_store.rs    # Legacy redb read/migrate (importer only)
+│   ├── redb_import.rs   # redb → SQLite import library
 │   ├── monitor.rs       # Blockchain monitoring service
 │   ├── sweeper.rs       # Fund sweeping service
 │   ├── wallet.rs        # HD wallet implementation
@@ -505,7 +550,7 @@ emvhot/
 Key dependencies:
 - **alloy**: Ethereum library for transaction handling and providers
 - **axum**: Web framework for the REST API
-- **redb**: Embedded key-value database
+- **rusqlite**: Embedded SQLite database (WAL mode)
 - **tokio**: Async runtime
 - **tracing**: Logging and diagnostics
 
@@ -522,31 +567,33 @@ See [`Cargo.toml`](./Cargo.toml) for the complete list.
 5. **Monitor gas prices** - The sweeper uses on-chain gas prices which may be high during congestion
 6. **Database backups** - Regularly backup your database to prevent data loss
 7. **Hot wallet risks** - This is a hot wallet service; funds are only as secure as the server
-8. **Faucet funding** - Ensure the faucet address is properly funded to support new user registrations
-9. **Correct FAUCET_ADDRESS** - Double-check that `FAUCET_ADDRESS` matches the address derived from `FAUCET_MNEMONIC` at index 0
+8. **Faucet funding** - Keep the faucet wallet funded on every configured chain for lazy gas funding at sweep time
+9. **Per-chain faucet_address** - In `chains.toml`, each chain's `faucet_address` must match the address derived from `FAUCET_MNEMONIC` at index 0
 
 ## How It Works
 
 ### Registration Flow
 1. User calls `POST /register` with their account ID and webhook URL
-2. System derives a deterministic address using hash-based indexing
-3. Faucet automatically sends existential deposit to the new address
-4. Address and webhook URL are registered in the database
-5. Address is ready to receive deposits with custom webhook notifications
+2. System derives a deterministic address (same address on Base, Polygon, and all EVM chains)
+3. Address and webhook URL are stored in the database — **no on-chain funding yet**
+4. Address is ready to receive deposits on any configured chain
 
 ### Deposit Detection & Sweeping Flow
-1. **Monitor** watches the blockchain for transactions to registered addresses
-2. When a deposit is detected, **Monitor checks if it's from the faucet**:
+1. Each chain's **Monitor** polls its RPC for transactions to registered addresses
+2. When a deposit is detected, **Monitor checks if it's from that chain's faucet**:
    - If yes: Skip recording (prevents sweeping existential deposits)
-   - If no: 
-     - Record the deposit in the database
-     - Send "deposit_detected" webhook to the account's webhook URL
-3. **Sweeper** processes recorded deposits:
-   - Derives the private key for the deposit address
-   - Calculates gas costs
-   - Transfers funds to the treasury address
-   - Sends "deposit_swept" webhook to the account's webhook URL
-4. Deposit is marked as "swept" in the database
+   - If no: Record with chain-prefixed key and send `deposit_detected` webhook
+3. That chain's **Sweeper** processes its pending deposits:
+   - Lazy-funds gas from the chain faucet if needed
+   - Transfers funds to the chain's treasury address
+   - Sends `deposit_swept` webhook with chain-scoped `id`
+4. Deposit is marked as swept in the database
+
+**Sweep failure behavior:**
+- **Native deposits** stay `detected` and retry every poll cycle until the sweep succeeds.
+- **ERC20 deposits** stay `detected` on transient faucet/gas errors and retry indefinitely.
+- Other ERC20 errors increment a failure counter; after 5 attempts the deposit is marked `failed` and stops retrying until re-queued via `POST /admin/retry_sweeps`.
+- On startup (and periodically when the queue is non-empty), the sweeper logs counts of detected/failed deposits per chain.
 
 ### ERC-20 Token Support
 - Monitor detects ERC-20 `Transfer` events to registered addresses
@@ -565,10 +612,13 @@ cp env.docker.example .env
 # Or use: make setup
 ```
 
-2. **Edit `.env` with your configuration:**
+2. **Edit configuration:**
 ```bash
-# Set your RPC endpoint, mnemonics, addresses, etc.
+# Set mnemonics in .env
 nano .env
+# Copy and edit per-chain settings
+cp chains.toml.example chains.toml
+nano chains.toml
 ```
 
 3. **Build and start the service:**
@@ -635,15 +685,17 @@ docker ps
 docker logs evm-hot-wallet
 ```
 
-**Backup the database:**
+**Backup the database (WAL-safe):**
 ```bash
+docker exec evm-hot-wallet sqlite3 /app/data/wallet.db "PRAGMA wal_checkpoint(TRUNCATE);"
 docker cp evm-hot-wallet:/app/data/wallet.db ./backup-wallet.db
+# Or use: make backup
 ```
 
 ### Production Deployment Notes
 
 1. **Persistent Storage**: Database is stored in a Docker volume (`wallet-data`) to persist across container restarts
-2. **Environment Variables**: All configuration is loaded from `.env` file
+2. **Environment Variables**: Secrets in `.env`; per-chain settings in mounted `chains.toml`
 3. **Network**: Service runs on port 3000 by default (configurable)
 4. **Security**: 
    - Never commit `.env` file with real secrets
@@ -660,7 +712,7 @@ The docker-compose.yml includes a health check. You can also manually check:
 curl http://localhost:3000/health
 ```
 
-Note: You may need to implement a `/health` endpoint in the API if it doesn't exist.
+Note: `/health` returns OK and lists configured chain names.
 
 ## Roadmap
 
@@ -674,10 +726,10 @@ Note: You may need to implement a `/health` endpoint in the API if it doesn't ex
 - [x] Automatic token metadata caching
 - [ ] Webhook signature verification (HMAC)
 - [ ] Configurable gas price strategies
-- [ ] Multi-chain support
+- [x] Multi-chain support (Base, Polygon, others via `chains.toml`)
 - [ ] Admin dashboard
 - [ ] Prometheus metrics
-- [ ] Health check endpoint
+- [ ] Health check endpoint (basic `/health` exists; richer per-chain status planned)
 
 ## Contributing
 

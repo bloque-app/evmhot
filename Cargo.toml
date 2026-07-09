@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "evm_hot_wallet"
 path = "src/main.rs"
 
+[[bin]]
+name = "migrate_redb_to_sqlite"
+path = "src/bin/migrate_redb_to_sqlite.rs"
+
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }
 axum = "0.7"
@@ -29,6 +33,12 @@ hex = "0.4"
 thiserror = "1.0"
 futures = "0.3.31"
 async-trait = "0.1.89"
+toml = "0.8"
+rusqlite = { version = "0.39", features = ["bundled"] }
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.34"
+rusqlite_migration = "2.5.0"
+clap = { version = "4.6.1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3.23.0"

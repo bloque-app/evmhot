@@ -1,17 +1,40 @@
-use anyhow::Result;
-use redb::{Database, ReadableTable, TableDefinition};
-use std::sync::Arc;
+use anyhow::{anyhow, Result};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite_migration::{Migrations, M};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const ACCOUNTS: TableDefinition<&str, (u32, &str, &str)> = TableDefinition::new("accounts"); // account_id -> (index, address, webhook_url)
-const ADDRESS_TO_ID: TableDefinition<&str, &str> = TableDefinition::new("address_to_id");
-const DEPOSITS: TableDefinition<&str, (&str, &str, &str)> = TableDefinition::new("deposits"); // tx_hash -> (account_id, amount, status)
-const STATE: TableDefinition<&str, &str> = TableDefinition::new("state");
-const TOKEN_METADATA: TableDefinition<&str, (&str, u64, &str)> =
-    TableDefinition::new("token_metadata"); // token_address -> (symbol, decimals, name)
-const ERC20_DEPOSITS: TableDefinition<&str, (&str, &str, &str, &str, &str)> =
-    TableDefinition::new("erc20_deposits"); // tx_hash:log_index -> (account_id, amount, token_address, token_symbol, status)
-const SWEEP_META: TableDefinition<&str, (&str, u64)> = TableDefinition::new("sweep_meta"); // deposit_key -> (sweep_tx_hash, zero_balance_retry_count)
-const SWEEP_FAILURES: TableDefinition<&str, u64> = TableDefinition::new("sweep_failures"); // deposit_key -> consecutive_failure_count
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DepositQueueCounts {
+    pub native_detected: u64,
+    pub native_failed: u64,
+    pub erc20_detected: u64,
+    pub erc20_failed: u64,
+}
+
+impl DepositQueueCounts {
+    pub fn has_pending(&self) -> bool {
+        self.native_detected > 0
+            || self.native_failed > 0
+            || self.erc20_detected > 0
+            || self.erc20_failed > 0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebhookDeliveryRecord {
+    pub id: String,
+    pub event: String,
+    pub registration_id: String,
+    pub webhook_url: String,
+    pub payload: String,
+    pub status: String,
+    pub attempt_count: u64,
+    pub last_http_status: Option<u16>,
+    pub last_error: Option<String>,
+}
 
 #[derive(Clone, Debug)]
 pub struct Erc20Deposit {
@@ -24,42 +47,122 @@ pub struct Erc20Deposit {
 
 #[derive(Clone)]
 pub struct Db {
-    db: Arc<Database>,
+    write: Arc<Mutex<Connection>>,
+    read: Pool<SqliteConnectionManager>,
+}
+
+/// Strip `sqlite:` scheme; rusqlite expects a filesystem path.
+pub fn normalize_db_path(database_url: &str) -> &str {
+    database_url.strip_prefix("sqlite:").unwrap_or(database_url)
+}
+
+pub fn migrations() -> Migrations<'static> {
+    Migrations::new(vec![
+        M::up(include_str!("../migrations/V1__initial.sql")),
+        M::up(include_str!("../migrations/V2__webhook_deliveries.sql")),
+    ])
+}
+
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA busy_timeout=5000;",
+    )?;
+    Ok(())
+}
+
+pub fn apply_pragmas_for_import(conn: &Connection) -> Result<()> {
+    apply_pragmas(conn).map_err(Into::into)
+}
+
+/// Parse `"0xtx:42"` -> (`0xtx`, 42). Bare `"0xtx"` -> (`0xtx`, 0).
+fn parse_local_key(local_key: &str) -> Result<(String, i64)> {
+    if let Some((tx, idx)) = local_key.rsplit_once(':') {
+        if !idx.is_empty() && idx.chars().all(|c| c.is_ascii_digit()) {
+            return Ok((tx.to_string(), idx.parse()?));
+        }
+    }
+    Ok((local_key.to_string(), 0))
+}
+
+fn last_block_key(chain: &str) -> String {
+    format!("last_block:{chain}")
 }
 
 impl Db {
-    pub fn new(path: &str) -> Result<Self> {
-        let db = Database::create(path)?;
+    pub fn new(database_url: &str) -> Result<Self> {
+        let path = normalize_db_path(database_url);
+        let mut write_conn = Connection::open(path)?;
+        apply_pragmas(&write_conn)?;
+        migrations().to_latest(&mut write_conn)?;
 
-        // Initialize tables
-        let write_txn = db.begin_write()?;
-        {
-            let _ = write_txn.open_table(ACCOUNTS)?;
-            let _ = write_txn.open_table(ADDRESS_TO_ID)?;
-            let _ = write_txn.open_table(DEPOSITS)?;
-            let _ = write_txn.open_table(STATE)?;
-            let _ = write_txn.open_table(TOKEN_METADATA)?;
-            let _ = write_txn.open_table(ERC20_DEPOSITS)?;
-            let _ = write_txn.open_table(SWEEP_META)?;
-            let _ = write_txn.open_table(SWEEP_FAILURES)?;
-        }
-        write_txn.commit()?;
+        let manager = SqliteConnectionManager::file(path).with_init(|c| apply_pragmas(&*c));
+        // Explicit, short connection_timeout: r2d2's default is 30s, which
+        // means a read-pool contention spike (e.g. every connection busy
+        // during a catch-up backlog) would block whichever thread called
+        // `read.get()` for up to 30s. Callers on the async paths route
+        // through `Db::blocking`, so that block lands on the blocking pool
+        // rather than a Tokio worker thread, but failing fast is still
+        // preferable to a long silent stall either way.
+        let read_pool = Pool::builder()
+            .connection_timeout(Duration::from_secs(5))
+            .build(manager)?;
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            write: Arc::new(Mutex::new(write_conn)),
+            read: read_pool,
+        })
+    }
+
+    /// Runs a `Db` operation on Tokio's blocking thread pool.
+    ///
+    /// Every `Db` method is a synchronous rusqlite call: the write side takes
+    /// a `std::sync::Mutex`, and the read side blocks on `r2d2::Pool::get()`.
+    /// Calling them directly from an async fn risks stalling whichever Tokio
+    /// worker thread happens to run the call for the duration of the lock/
+    /// pool wait, which can starve everything else on that runtime (see the
+    /// monitor/sweeper/webhook callers). `Db` is a cheap `Clone` (the write
+    /// side is `Arc<Mutex<_>>`, the read side an r2d2 pool that's itself
+    /// internally `Arc`-backed), so this just moves a clone onto
+    /// `spawn_blocking`.
+    pub async fn blocking<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Db) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || f(&db))
+            .await
+            .map_err(|e| anyhow!("Db blocking task panicked or was cancelled: {e}"))?
+    }
+
+    fn with_write<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| anyhow!("database write lock poisoned"))?;
+        f(&conn)
     }
 
     #[allow(dead_code)]
     pub fn get_next_derivation_index(&self) -> Result<u32> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(ACCOUNTS)?;
-        // This is inefficient O(N) but fine for MVP.
-        // Better: Store a counter in STATE table.
-        let last = table.iter()?.next_back();
-
-        match last {
-            Some(Ok((_, v))) => Ok(v.value().0 + 1),
-            _ => Ok(0),
-        }
+        let conn = self.read.get()?;
+        let idx: u32 = conn.query_row(
+            "SELECT COALESCE(MAX(derivation_index) + 1, 0) FROM accounts",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(idx)
     }
 
     pub fn register_account(
@@ -69,154 +172,164 @@ impl Db {
         address: &str,
         webhook_url: &str,
     ) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut accounts = write_txn.open_table(ACCOUNTS)?;
-            accounts.insert(id, (index, address, webhook_url))?;
-
-            let mut addr_map = write_txn.open_table(ADDRESS_TO_ID)?;
-            addr_map.insert(address, id)?;
-        }
-        write_txn.commit()?;
-        Ok(())
+        self.with_write(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO accounts (id, derivation_index, address, webhook_url)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id, index, address, webhook_url],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn get_registration_id_by_address(&self, address: &str) -> Result<Option<String>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(ADDRESS_TO_ID)?;
-        let result = table.get(address)?;
-        Ok(result.map(|v| v.value().to_string()))
+        let conn = self.read.get()?;
+        conn.query_row(
+            "SELECT id FROM accounts WHERE address = ?1",
+            [address],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn get_account_by_address(&self, address: &str) -> Result<Option<String>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(ADDRESS_TO_ID)?;
-        let result = table.get(address)?;
-        Ok(result.map(|v| v.value().to_string()))
+        self.get_registration_id_by_address(address)
     }
 
     pub fn get_account_by_id(&self, id: &str) -> Result<Option<(u32, String, String)>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(ACCOUNTS)?;
-        let result = table.get(id)?;
-        Ok(result.map(|v| {
-            let val = v.value();
-            (val.0, val.1.to_string(), val.2.to_string())
-        }))
+        let conn = self.read.get()?;
+        conn.query_row(
+            "SELECT derivation_index, address, webhook_url FROM accounts WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn get_webhook_url(&self, account_id: &str) -> Result<Option<String>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(ACCOUNTS)?;
-        let result = table.get(account_id)?;
-        Ok(result.map(|v| v.value().2.to_string()))
+        let conn = self.read.get()?;
+        conn.query_row(
+            "SELECT webhook_url FROM accounts WHERE id = ?1",
+            [account_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
-    /// Record a deposit and return true if it was newly recorded, false if it was a duplicate
-    pub fn record_deposit(&self, tx_hash: &str, account_id: &str, amount: &str) -> Result<bool> {
-        let write_txn = self.db.begin_write()?;
-        let is_new = {
-            let mut deposits = write_txn.open_table(DEPOSITS)?;
-            // Check if exists to avoid overwrite and duplicates
-            if deposits.get(tx_hash)?.is_none() {
-                deposits.insert(tx_hash, (account_id, amount, "detected"))?;
-                true
-            } else {
-                false
-            }
-        };
-        write_txn.commit()?;
-        Ok(is_new)
+    pub fn record_deposit(
+        &self,
+        chain: &str,
+        tx_hash: &str,
+        account_id: &str,
+        amount: &str,
+    ) -> Result<bool> {
+        self.with_write(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO deposits (chain, tx_hash, account_id, amount, status)
+                 VALUES (?1, ?2, ?3, ?4, 'detected')",
+                params![chain, tx_hash, account_id, amount],
+            )?;
+            Ok(conn.changes() == 1)
+        })
     }
 
-    pub fn mark_deposit_swept(&self, tx_hash: &str) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut deposits = write_txn.open_table(DEPOSITS)?;
-            let (account_id, amount) = {
-                let current_val = deposits.get(tx_hash)?;
-                if let Some(v) = current_val {
-                    let val = v.value();
-                    (val.0.to_string(), val.1.to_string())
-                } else {
-                    return Ok(());
-                }
-            };
-
-            deposits.insert(tx_hash, (account_id.as_str(), amount.as_str(), "swept"))?;
-        }
-        write_txn.commit()?;
-        Ok(())
+    pub fn mark_deposit_swept(&self, chain: &str, tx_hash: &str) -> Result<()> {
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE deposits SET status = 'swept' WHERE chain = ?1 AND tx_hash = ?2",
+                params![chain, tx_hash],
+            )?;
+            Ok(())
+        })
     }
 
-    pub fn get_detected_deposits(&self) -> Result<Vec<(String, String, String)>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(DEPOSITS)?;
-        let mut results = Vec::new();
-        for item in table.iter()? {
-            let (tx_hash, value) = item?;
-            let (account_id, amount, status) = value.value();
-            if status == "detected" {
-                results.push((
-                    tx_hash.value().to_string(),
-                    account_id.to_string(),
-                    amount.to_string(),
-                ));
-            }
-        }
-        Ok(results)
+    pub fn mark_deposit_failed(&self, chain: &str, tx_hash: &str) -> Result<()> {
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE deposits SET status = 'failed' WHERE chain = ?1 AND tx_hash = ?2",
+                params![chain, tx_hash],
+            )?;
+            Ok(())
+        })
     }
 
-    pub fn get_last_processed_block(&self) -> Result<u64> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(STATE)?;
-        let result = table.get("last_block")?;
-        Ok(result.map(|v| v.value().parse().unwrap_or(0)).unwrap_or(0))
+    pub fn get_detected_deposits(&self, chain: &str) -> Result<Vec<(String, String, String)>> {
+        let conn = self.read.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT tx_hash, account_id, amount FROM deposits
+             WHERE chain = ?1 AND status = 'detected'",
+        )?;
+        let rows = stmt.query_map([chain], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
-    pub fn set_last_processed_block(&self, block: u64) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut state = write_txn.open_table(STATE)?;
-            state.insert("last_block", block.to_string().as_str())?;
-        }
-        write_txn.commit()?;
-        Ok(())
+    pub fn get_last_processed_block(&self, chain: &str) -> Result<u64> {
+        let conn = self.read.get()?;
+        let key = last_block_key(chain);
+        let val: Option<String> = conn
+            .query_row("SELECT value FROM state WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(val.map(|v| v.parse().unwrap_or(0)).unwrap_or(0))
     }
 
-    // ========== ERC20 Token Metadata ==========
+    pub fn set_last_processed_block(&self, chain: &str, block: u64) -> Result<()> {
+        let key = last_block_key(chain);
+        let block_str = block.to_string();
+        self.with_write(|conn| {
+            conn.execute(
+                "INSERT INTO state (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, block_str],
+            )?;
+            Ok(())
+        })
+    }
 
     pub fn store_token_metadata(
         &self,
+        chain: &str,
         address: &str,
         symbol: &str,
         decimals: u8,
         name: &str,
     ) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut metadata = write_txn.open_table(TOKEN_METADATA)?;
-            metadata.insert(address, (symbol, decimals as u64, name))?;
-        }
-        write_txn.commit()?;
-        Ok(())
+        self.with_write(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO token_metadata
+                 (chain, token_address, symbol, decimals, name)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![chain, address, symbol, decimals, name],
+            )?;
+            Ok(())
+        })
     }
 
-    pub fn get_token_metadata(&self, address: &str) -> Result<Option<(String, u8, String)>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(TOKEN_METADATA)?;
-        let result = table.get(address)?;
-        Ok(result.map(|v| {
-            let val = v.value();
-            (val.0.to_string(), val.1 as u8, val.2.to_string())
-        }))
+    pub fn get_token_metadata(
+        &self,
+        chain: &str,
+        address: &str,
+    ) -> Result<Option<(String, u8, String)>> {
+        let conn = self.read.get()?;
+        conn.query_row(
+            "SELECT symbol, decimals, name FROM token_metadata
+             WHERE chain = ?1 AND token_address = ?2",
+            params![chain, address],
+            |row| Ok((row.get(0)?, row.get::<_, u8>(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
-    // ========== ERC20 Deposits ==========
-
-    /// Record an ERC20 deposit and return true if it was newly recorded, false if it was a duplicate
+    #[allow(clippy::too_many_arguments)]
     pub fn record_erc20_deposit(
         &self,
+        chain: &str,
         tx_hash: &str,
         log_index: u64,
         account_id: &str,
@@ -224,292 +337,718 @@ impl Db {
         token_address: &str,
         token_symbol: &str,
     ) -> Result<bool> {
-        let write_txn = self.db.begin_write()?;
-        let is_new = {
-            let mut deposits = write_txn.open_table(ERC20_DEPOSITS)?;
-            let key = format!("{}:{}", tx_hash, log_index);
-            if deposits.get(key.as_str())?.is_none() {
-                deposits.insert(
-                    key.as_str(),
-                    (account_id, amount, token_address, token_symbol, "detected"),
-                )?;
-                true
-            } else {
-                false
-            }
-        };
-        write_txn.commit()?;
-        Ok(is_new)
-    }
-
-    pub fn get_detected_erc20_deposits(&self) -> Result<Vec<Erc20Deposit>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(ERC20_DEPOSITS)?;
-        let mut results = Vec::new();
-        for item in table.iter()? {
-            let (key, value) = item?;
-            let (account_id, amount, token_address, token_symbol, status) = value.value();
-            if status == "detected" {
-                results.push(Erc20Deposit {
-                    key: key.value().to_string(), // tx_hash:log_index
-                    account_id: account_id.to_string(),
-                    amount: amount.to_string(),
-                    token_address: token_address.to_string(),
-                    token_symbol: token_symbol.to_string(),
-                });
-            }
-        }
-        Ok(results)
-    }
-
-    pub fn mark_erc20_deposit_swept(&self, key: &str) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut deposits = write_txn.open_table(ERC20_DEPOSITS)?;
-            let (account_id, amount, token_address, token_symbol) = {
-                let current_val = deposits.get(key)?;
-                if let Some(v) = current_val {
-                    let val = v.value();
-                    (
-                        val.0.to_string(),
-                        val.1.to_string(),
-                        val.2.to_string(),
-                        val.3.to_string(),
-                    )
-                } else {
-                    return Ok(());
-                }
-            };
-
-            deposits.insert(
-                key,
-                (
-                    account_id.as_str(),
-                    amount.as_str(),
-                    token_address.as_str(),
-                    token_symbol.as_str(),
-                    "swept",
-                ),
+        self.with_write(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO erc20_deposits
+                 (chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'detected')",
+                params![
+                    chain,
+                    tx_hash,
+                    log_index as i64,
+                    account_id,
+                    amount,
+                    token_address,
+                    token_symbol
+                ],
             )?;
-        }
-        write_txn.commit()?;
-        Ok(())
+            Ok(conn.changes() == 1)
+        })
     }
 
-    /// Mark all detected ERC20 deposits for a given (account_id, token_address) as swept.
-    /// Returns the list of deposit keys that were marked.
+    pub fn get_detected_erc20_deposits(&self, chain: &str) -> Result<Vec<Erc20Deposit>> {
+        let conn = self.read.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT tx_hash, log_index, account_id, amount, token_address, token_symbol
+             FROM erc20_deposits WHERE chain = ?1 AND status = 'detected'",
+        )?;
+        let rows = stmt.query_map([chain], |row| {
+            let tx_hash: String = row.get(0)?;
+            let log_index: i64 = row.get(1)?;
+            Ok(Erc20Deposit {
+                key: format!("{tx_hash}:{log_index}"),
+                account_id: row.get(2)?,
+                amount: row.get(3)?,
+                token_address: row.get(4)?,
+                token_symbol: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn mark_erc20_deposit_swept(&self, chain: &str, local_key: &str) -> Result<()> {
+        let (tx_hash, log_index) = parse_local_key(local_key)?;
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE erc20_deposits SET status = 'swept'
+                 WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3",
+                params![chain, tx_hash, log_index],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn mark_erc20_deposits_swept_for_account_token(
         &self,
+        chain: &str,
         account_id: &str,
         token_address: &str,
-    ) -> Result<Vec<String>> {
-        let write_txn = self.db.begin_write()?;
-        let mut marked_keys = Vec::new();
-        {
-            let mut deposits = write_txn.open_table(ERC20_DEPOSITS)?;
-
-            // First pass: collect keys that need updating
-            let keys_to_update: Vec<(String, String, String, String)> = {
-                let mut to_update = Vec::new();
-                for item in deposits.iter()? {
-                    let (key, value) = item?;
-                    let (acc_id, amount, tok_addr, tok_symbol, status) = value.value();
-                    if status == "detected" && acc_id == account_id && tok_addr == token_address {
-                        to_update.push((
-                            key.value().to_string(),
-                            amount.to_string(),
-                            tok_symbol.to_string(),
-                            acc_id.to_string(),
-                        ));
-                    }
-                }
-                to_update
-            };
-
-            // Second pass: update the entries
-            for (key, amount, tok_symbol, acc_id) in &keys_to_update {
-                deposits.insert(
-                    key.as_str(),
-                    (
-                        acc_id.as_str(),
-                        amount.as_str(),
-                        token_address,
-                        tok_symbol.as_str(),
-                        "swept",
-                    ),
-                )?;
-                marked_keys.push(key.clone());
-            }
-        }
-        write_txn.commit()?;
-        Ok(marked_keys)
-    }
-
-    // ========== Sweep Metadata (new table, existing schemas unchanged) ==========
-
-    /// Increment zero-balance retry count for a deposit. Returns the new count.
-    pub fn increment_zero_balance_count(&self, key: &str) -> Result<u64> {
-        let write_txn = self.db.begin_write()?;
-        let new_count = {
-            let mut meta = write_txn.open_table(SWEEP_META)?;
-            let (sweep_tx_hash, count) = match meta.get(key)? {
-                Some(v) => {
-                    let val = v.value();
-                    (val.0.to_string(), val.1)
-                }
-                None => (String::new(), 0),
-            };
-            let new_count = count + 1;
-            meta.insert(key, (sweep_tx_hash.as_str(), new_count))?;
-            new_count
-        };
-        write_txn.commit()?;
-        Ok(new_count)
-    }
-
-    /// Store the on-chain sweep tx hash for a single deposit key.
-    #[allow(dead_code)]
-    pub fn set_sweep_tx_hash(&self, key: &str, tx_hash: &str) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut meta = write_txn.open_table(SWEEP_META)?;
-            let count = match meta.get(key)? {
-                Some(v) => v.value().1,
-                None => 0,
-            };
-            meta.insert(key, (tx_hash, count))?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
-    /// Store the on-chain sweep tx hash for multiple deposit keys in one transaction.
-    pub fn set_sweep_tx_hash_for_keys(&self, keys: &[String], tx_hash: &str) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut meta = write_txn.open_table(SWEEP_META)?;
-            for key in keys {
-                let count = match meta.get(key.as_str())? {
-                    Some(v) => v.value().1,
-                    None => 0,
-                };
-                meta.insert(key.as_str(), (tx_hash, count))?;
-            }
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
-    /// Read sweep metadata for a deposit key.
-    #[allow(dead_code)]
-    pub fn get_sweep_meta(&self, key: &str) -> Result<Option<(String, u64)>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(SWEEP_META)?;
-        let result = table.get(key)?;
-        Ok(result.map(|v| {
-            let val = v.value();
-            (val.0.to_string(), val.1)
-        }))
-    }
-
-    // ========== Sweep Failure Tracking ==========
-
-    /// Increment the sweep failure count for a deposit. Returns the new count.
-    pub fn increment_sweep_failure_count(&self, key: &str) -> Result<u64> {
-        let write_txn = self.db.begin_write()?;
-        let new_count = {
-            let mut failures = write_txn.open_table(SWEEP_FAILURES)?;
-            let count = match failures.get(key)? {
-                Some(v) => v.value(),
-                None => 0,
-            };
-            let new_count = count + 1;
-            failures.insert(key, new_count)?;
-            new_count
-        };
-        write_txn.commit()?;
-        Ok(new_count)
-    }
-
-    /// Mark a single ERC20 deposit as permanently failed.
-    pub fn mark_erc20_deposit_failed(&self, key: &str) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut deposits = write_txn.open_table(ERC20_DEPOSITS)?;
-            let (account_id, amount, token_address, token_symbol) = {
-                let current_val = deposits.get(key)?;
-                if let Some(v) = current_val {
-                    let val = v.value();
-                    (
-                        val.0.to_string(),
-                        val.1.to_string(),
-                        val.2.to_string(),
-                        val.3.to_string(),
-                    )
-                } else {
-                    return Ok(());
-                }
-            };
-
-            deposits.insert(
-                key,
-                (
-                    account_id.as_str(),
-                    amount.as_str(),
-                    token_address.as_str(),
-                    token_symbol.as_str(),
-                    "failed",
-                ),
+    ) -> Result<Vec<(String, String)>> {
+        self.with_write(|conn| {
+            let mut stmt = conn.prepare(
+                "UPDATE erc20_deposits SET status = 'swept'
+                 WHERE chain = ?1 AND account_id = ?2 AND token_address = ?3 AND status = 'detected'
+                 RETURNING tx_hash, log_index, amount",
             )?;
-        }
-        write_txn.commit()?;
-        Ok(())
+            let rows = stmt.query_map(params![chain, account_id, token_address], |row| {
+                let tx_hash: String = row.get(0)?;
+                let log_index: i64 = row.get(1)?;
+                let amount: String = row.get(2)?;
+                Ok((format!("{tx_hash}:{log_index}"), amount))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
     }
 
-    /// Mark all detected ERC20 deposits for a given (account_id, token_address) as permanently failed.
-    /// Returns the list of deposit keys that were marked.
+    pub fn increment_zero_balance_count(&self, chain: &str, local_key: &str) -> Result<u64> {
+        let (tx_hash, log_index) = parse_local_key(local_key)?;
+        self.with_write(|conn| {
+            conn.execute(
+                "INSERT INTO sweep_meta (chain, tx_hash, log_index, sweep_tx_hash, zero_balance_retry_count)
+                 VALUES (?1, ?2, ?3, '', 1)
+                 ON CONFLICT(chain, tx_hash, log_index) DO UPDATE SET
+                   zero_balance_retry_count = zero_balance_retry_count + 1",
+                params![chain, tx_hash, log_index],
+            )?;
+            let count: i64 = conn.query_row(
+                "SELECT zero_balance_retry_count FROM sweep_meta
+                 WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3",
+                params![chain, tx_hash, log_index],
+                |row| row.get(0),
+            )?;
+            Ok(count as u64)
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn set_sweep_tx_hash(&self, chain: &str, local_key: &str, tx_hash: &str) -> Result<()> {
+        let (deposit_tx, log_index) = parse_local_key(local_key)?;
+        self.with_write(|conn| {
+            conn.execute(
+                "INSERT INTO sweep_meta (chain, tx_hash, log_index, sweep_tx_hash, zero_balance_retry_count)
+                 VALUES (?1, ?2, ?3, ?4, 0)
+                 ON CONFLICT(chain, tx_hash, log_index) DO UPDATE SET sweep_tx_hash = excluded.sweep_tx_hash",
+                params![chain, deposit_tx, log_index, tx_hash],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn set_sweep_tx_hash_for_keys(
+        &self,
+        chain: &str,
+        local_keys: &[String],
+        tx_hash: &str,
+    ) -> Result<()> {
+        self.with_write(|conn| {
+            for local_key in local_keys {
+                let (deposit_tx, log_index) = parse_local_key(local_key)?;
+                let existing: i64 = conn
+                    .query_row(
+                        "SELECT zero_balance_retry_count FROM sweep_meta
+                         WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3",
+                        params![chain, deposit_tx, log_index],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                conn.execute(
+                    "INSERT INTO sweep_meta (chain, tx_hash, log_index, sweep_tx_hash, zero_balance_retry_count)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(chain, tx_hash, log_index) DO UPDATE SET sweep_tx_hash = excluded.sweep_tx_hash",
+                    params![chain, deposit_tx, log_index, tx_hash, existing],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn get_sweep_meta(&self, chain: &str, local_key: &str) -> Result<Option<(String, u64)>> {
+        let (tx_hash, log_index) = parse_local_key(local_key)?;
+        let conn = self.read.get()?;
+        conn.query_row(
+            "SELECT sweep_tx_hash, zero_balance_retry_count FROM sweep_meta
+             WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3",
+            params![chain, tx_hash, log_index],
+            |row| {
+                let count: i64 = row.get(1)?;
+                Ok((row.get(0)?, count as u64))
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn increment_sweep_failure_count(&self, chain: &str, local_key: &str) -> Result<u64> {
+        let (tx_hash, log_index) = parse_local_key(local_key)?;
+        self.with_write(|conn| {
+            conn.execute(
+                "INSERT INTO sweep_failures (chain, tx_hash, log_index, consecutive_failure_count)
+                 VALUES (?1, ?2, ?3, 1)
+                 ON CONFLICT(chain, tx_hash, log_index) DO UPDATE SET
+                   consecutive_failure_count = consecutive_failure_count + 1",
+                params![chain, tx_hash, log_index],
+            )?;
+            let count: i64 = conn.query_row(
+                "SELECT consecutive_failure_count FROM sweep_failures
+                 WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3",
+                params![chain, tx_hash, log_index],
+                |row| row.get(0),
+            )?;
+            Ok(count as u64)
+        })
+    }
+
+    pub fn mark_erc20_deposit_failed(&self, chain: &str, local_key: &str) -> Result<()> {
+        let (tx_hash, log_index) = parse_local_key(local_key)?;
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE erc20_deposits SET status = 'failed'
+                 WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3",
+                params![chain, tx_hash, log_index],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn mark_erc20_deposits_failed_for_account_token(
         &self,
+        chain: &str,
         account_id: &str,
         token_address: &str,
     ) -> Result<Vec<String>> {
-        let write_txn = self.db.begin_write()?;
-        let mut marked_keys = Vec::new();
-        {
-            let mut deposits = write_txn.open_table(ERC20_DEPOSITS)?;
+        self.with_write(|conn| {
+            let mut stmt = conn.prepare(
+                "UPDATE erc20_deposits SET status = 'failed'
+                 WHERE chain = ?1 AND account_id = ?2 AND token_address = ?3 AND status = 'detected'
+                 RETURNING tx_hash, log_index",
+            )?;
+            let rows = stmt.query_map(params![chain, account_id, token_address], |row| {
+                let tx_hash: String = row.get(0)?;
+                let log_index: i64 = row.get(1)?;
+                Ok(format!("{tx_hash}:{log_index}"))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
 
-            let keys_to_update: Vec<(String, String, String, String)> = {
-                let mut to_update = Vec::new();
-                for item in deposits.iter()? {
-                    let (key, value) = item?;
-                    let (acc_id, amount, tok_addr, tok_symbol, status) = value.value();
-                    if status == "detected" && acc_id == account_id && tok_addr == token_address {
-                        to_update.push((
-                            key.value().to_string(),
-                            amount.to_string(),
-                            tok_symbol.to_string(),
-                            acc_id.to_string(),
-                        ));
-                    }
-                }
-                to_update
-            };
+    pub fn deposit_queue_counts(&self, chain: &str) -> Result<DepositQueueCounts> {
+        let conn = self.read.get()?;
+        let native_detected: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM deposits WHERE chain = ?1 AND status = 'detected'",
+            [chain],
+            |row| row.get(0),
+        )?;
+        let native_failed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM deposits WHERE chain = ?1 AND status = 'failed'",
+            [chain],
+            |row| row.get(0),
+        )?;
+        let erc20_detected: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM erc20_deposits WHERE chain = ?1 AND status = 'detected'",
+            [chain],
+            |row| row.get(0),
+        )?;
+        let erc20_failed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM erc20_deposits WHERE chain = ?1 AND status = 'failed'",
+            [chain],
+            |row| row.get(0),
+        )?;
+        Ok(DepositQueueCounts {
+            native_detected: native_detected as u64,
+            native_failed: native_failed as u64,
+            erc20_detected: erc20_detected as u64,
+            erc20_failed: erc20_failed as u64,
+        })
+    }
 
-            for (key, amount, tok_symbol, acc_id) in &keys_to_update {
-                deposits.insert(
-                    key.as_str(),
-                    (
-                        acc_id.as_str(),
-                        amount.as_str(),
-                        token_address,
-                        tok_symbol.as_str(),
-                        "failed",
-                    ),
+    pub fn retry_native_deposit(&self, chain: &str, tx_hash: &str) -> Result<bool> {
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE deposits SET status = 'detected'
+                 WHERE chain = ?1 AND tx_hash = ?2 AND status = 'failed'",
+                params![chain, tx_hash],
+            )?;
+            Ok(conn.changes() == 1)
+        })
+    }
+
+    pub fn retry_erc20_deposit(&self, chain: &str, tx_hash: &str, log_index: u64) -> Result<bool> {
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE erc20_deposits SET status = 'detected'
+                 WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3 AND status = 'failed'",
+                params![chain, tx_hash, log_index as i64],
+            )?;
+            let updated = conn.changes() == 1;
+            if updated {
+                conn.execute(
+                    "DELETE FROM sweep_failures
+                     WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3",
+                    params![chain, tx_hash, log_index as i64],
                 )?;
-                marked_keys.push(key.clone());
             }
-        }
-        write_txn.commit()?;
-        Ok(marked_keys)
+            Ok(updated)
+        })
+    }
+
+    pub fn get_sweep_failure_count(&self, chain: &str, local_key: &str) -> Result<u64> {
+        let (tx_hash, log_index) = parse_local_key(local_key)?;
+        let conn = self.read.get()?;
+        let count: Option<i64> = conn
+            .query_row(
+                "SELECT consecutive_failure_count FROM sweep_failures
+                 WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3",
+                params![chain, tx_hash, log_index],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(count.unwrap_or(0) as u64)
+    }
+
+    /// Insert or refresh a pending delivery. Returns true when the worker should be notified.
+    pub fn upsert_webhook_delivery(
+        &self,
+        id: &str,
+        event: &str,
+        registration_id: &str,
+        webhook_url: &str,
+        payload: &str,
+    ) -> Result<bool> {
+        self.with_write(|conn| {
+            let now = now_unix_secs();
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM webhook_deliveries WHERE id = ?1 AND event = ?2",
+                    params![id, event],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if existing.as_deref() == Some("delivered") {
+                return Ok(false);
+            }
+
+            if existing.is_none() {
+                conn.execute(
+                    "INSERT INTO webhook_deliveries
+                     (id, event, registration_id, webhook_url, payload, status, attempt_count,
+                      last_http_status, last_error, leased_until, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, NULL, NULL, NULL, ?6)",
+                    params![id, event, registration_id, webhook_url, payload, now],
+                )?;
+                return Ok(true);
+            }
+
+            if existing.as_deref() == Some("failed") {
+                return Ok(false);
+            }
+
+            conn.execute(
+                "UPDATE webhook_deliveries
+                 SET webhook_url = ?3, payload = ?4, updated_at = ?5
+                 WHERE id = ?1 AND event = ?2 AND status = 'pending'",
+                params![id, event, webhook_url, payload, now],
+            )?;
+            Ok(true)
+        })
+    }
+
+    pub fn claim_webhook_delivery(
+        &self,
+        id: &str,
+        event: &str,
+        lease_until: i64,
+        max_retries: u32,
+    ) -> Result<bool> {
+        let now = now_unix_secs();
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE webhook_deliveries
+                 SET leased_until = ?3, updated_at = ?4
+                 WHERE id = ?1 AND event = ?2
+                   AND status = 'pending'
+                   AND attempt_count < ?5
+                   AND (leased_until IS NULL OR leased_until < ?4)",
+                params![id, event, lease_until, now, max_retries as i64],
+            )?;
+            Ok(conn.changes() == 1)
+        })
+    }
+
+    pub fn record_webhook_attempt(
+        &self,
+        id: &str,
+        event: &str,
+        http_status: Option<u16>,
+        error: Option<&str>,
+        status: &str,
+    ) -> Result<u64> {
+        self.with_write(|conn| {
+            let now = now_unix_secs();
+            conn.execute(
+                "UPDATE webhook_deliveries
+                 SET attempt_count = attempt_count + 1,
+                     last_http_status = ?3,
+                     last_error = ?4,
+                     status = ?5,
+                     leased_until = NULL,
+                     updated_at = ?6
+                 WHERE id = ?1 AND event = ?2",
+                params![id, event, http_status.map(i64::from), error, status, now],
+            )?;
+            let count: i64 = conn.query_row(
+                "SELECT attempt_count FROM webhook_deliveries WHERE id = ?1 AND event = ?2",
+                params![id, event],
+                |row| row.get(0),
+            )?;
+            Ok(count as u64)
+        })
+    }
+
+    pub fn get_pending_webhook_delivery_keys(
+        &self,
+        max_retries: u32,
+        batch_size: u32,
+    ) -> Result<Vec<(String, String)>> {
+        let now = now_unix_secs();
+        let conn = self.read.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, event FROM webhook_deliveries
+             WHERE status = 'pending'
+               AND attempt_count < ?1
+               AND (leased_until IS NULL OR leased_until < ?2)
+             ORDER BY updated_at ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![max_retries as i64, now, batch_size as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn get_webhook_delivery(
+        &self,
+        id: &str,
+        event: &str,
+    ) -> Result<Option<WebhookDeliveryRecord>> {
+        let conn = self.read.get()?;
+        conn.query_row(
+            "SELECT id, event, registration_id, webhook_url, payload, status, attempt_count,
+                    last_http_status, last_error
+             FROM webhook_deliveries WHERE id = ?1 AND event = ?2",
+            params![id, event],
+            |row| {
+                let http_status: Option<i64> = row.get(7)?;
+                Ok(WebhookDeliveryRecord {
+                    id: row.get(0)?,
+                    event: row.get(1)?,
+                    registration_id: row.get(2)?,
+                    webhook_url: row.get(3)?,
+                    payload: row.get(4)?,
+                    status: row.get(5)?,
+                    attempt_count: row.get::<_, i64>(6)? as u64,
+                    last_http_status: http_status.map(|s| s as u16),
+                    last_error: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn retry_webhook_delivery(&self, id: &str, event: &str) -> Result<bool> {
+        let now = now_unix_secs();
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE webhook_deliveries
+                 SET status = 'pending', attempt_count = 0, leased_until = NULL,
+                     last_http_status = NULL, last_error = NULL, updated_at = ?3
+                 WHERE id = ?1 AND event = ?2 AND status = 'failed'",
+                params![id, event, now],
+            )?;
+            Ok(conn.changes() == 1)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_chain_isolated_deposits() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+        db.record_deposit("base", "0xabc", "user1", "100").unwrap();
+        db.record_deposit("polygon", "0xabc", "user2", "200")
+            .unwrap();
+
+        let base = db.get_detected_deposits("base").unwrap();
+        let polygon = db.get_detected_deposits("polygon").unwrap();
+
+        assert_eq!(base.len(), 1);
+        assert_eq!(base[0].0, "0xabc");
+        assert_eq!(base[0].2, "100");
+        assert_eq!(polygon.len(), 1);
+        assert_eq!(polygon[0].2, "200");
+    }
+
+    #[test]
+    fn test_per_chain_last_block() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+        db.set_last_processed_block("base", 100).unwrap();
+        db.set_last_processed_block("polygon", 200).unwrap();
+
+        assert_eq!(db.get_last_processed_block("base").unwrap(), 100);
+        assert_eq!(db.get_last_processed_block("polygon").unwrap(), 200);
+    }
+
+    #[test]
+    fn test_record_deposit_duplicate_returns_false() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+        assert!(db.record_deposit("base", "0xabc", "user1", "100").unwrap());
+        assert!(!db.record_deposit("base", "0xabc", "user1", "100").unwrap());
+    }
+
+    #[test]
+    fn test_record_erc20_deposit_duplicate_returns_false() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+        assert!(db
+            .record_erc20_deposit("polygon", "0xabc", 1, "user1", "100", "0xtoken", "USDC")
+            .unwrap());
+        assert!(!db
+            .record_erc20_deposit("polygon", "0xabc", 1, "user1", "100", "0xtoken", "USDC")
+            .unwrap());
+    }
+
+    #[test]
+    fn test_increment_zero_balance_count_monotonic() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            db.increment_zero_balance_count("polygon", "0xabc:1")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.increment_zero_balance_count("polygon", "0xabc:1")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.increment_sweep_failure_count("polygon", "0xabc:1")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_db_new_idempotent_on_same_path() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        let db1 = Db::new(path).unwrap();
+        db1.register_account("u1", 0, "0x1", "https://example.com")
+            .unwrap();
+
+        let db2 = Db::new(path).unwrap();
+        let acct = db2.get_account_by_id("u1").unwrap().unwrap();
+        assert_eq!(acct.1, "0x1");
+    }
+
+    #[test]
+    fn test_retry_erc20_deposit_resets_failed_status_and_clears_failures() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+        db.record_erc20_deposit("base", "0xabc", 120, "user1", "100", "0xtoken", "USDC")
+            .unwrap();
+        db.mark_erc20_deposit_failed("base", "0xabc:120").unwrap();
+        db.increment_sweep_failure_count("base", "0xabc:120")
+            .unwrap();
+
+        assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 0);
+        assert_eq!(db.get_sweep_failure_count("base", "0xabc:120").unwrap(), 1);
+
+        assert!(db.retry_erc20_deposit("base", "0xabc", 120).unwrap());
+        assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 1);
+        assert_eq!(db.get_sweep_failure_count("base", "0xabc:120").unwrap(), 0);
+        assert!(!db.retry_erc20_deposit("base", "0xabc", 120).unwrap());
+    }
+
+    #[test]
+    fn test_retry_native_deposit() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+        db.record_deposit("polygon", "0xabc", "user1", "100")
+            .unwrap();
+        db.mark_deposit_failed("polygon", "0xabc").unwrap();
+
+        assert!(db.retry_native_deposit("polygon", "0xabc").unwrap());
+        assert_eq!(db.get_detected_deposits("polygon").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_deposit_queue_counts() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+        db.record_deposit("base", "0x1", "u1", "100").unwrap();
+        db.record_erc20_deposit("base", "0x2", 1, "u1", "200", "0xt", "USDC")
+            .unwrap();
+        db.mark_erc20_deposit_failed("base", "0x2:1").unwrap();
+
+        let counts = db.deposit_queue_counts("base").unwrap();
+        assert_eq!(
+            counts,
+            DepositQueueCounts {
+                native_detected: 1,
+                native_failed: 0,
+                erc20_detected: 0,
+                erc20_failed: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn test_normalize_db_path_strips_sqlite_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("wallet.db");
+        let bare_str = bare.to_str().unwrap();
+
+        let db_bare = Db::new(bare_str).unwrap();
+        db_bare
+            .register_account("u1", 0, "0x1", "https://example.com")
+            .unwrap();
+
+        let prefixed = format!("sqlite:{bare_str}");
+        let db_prefixed = Db::new(&prefixed).unwrap();
+        assert!(db_prefixed.get_account_by_id("u1").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_upsert_webhook_delivery_skips_delivered() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+        assert!(db
+            .upsert_webhook_delivery(
+                "polygon:0xabc",
+                "deposit_detected",
+                "user1",
+                "https://example.com/hook",
+                r#"{"id":"polygon:0xabc","event":"deposit_detected"}"#,
+            )
+            .unwrap());
+
+        db.record_webhook_attempt(
+            "polygon:0xabc",
+            "deposit_detected",
+            Some(200),
+            None,
+            "delivered",
+        )
+        .unwrap();
+
+        assert!(!db
+            .upsert_webhook_delivery(
+                "polygon:0xabc",
+                "deposit_detected",
+                "user1",
+                "https://example.com/hook",
+                r#"{"id":"polygon:0xabc","event":"deposit_detected"}"#,
+            )
+            .unwrap());
+
+        let row = db
+            .get_webhook_delivery("polygon:0xabc", "deposit_detected")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "delivered");
+    }
+
+    #[test]
+    fn test_claim_webhook_delivery_respects_lease() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+        db.upsert_webhook_delivery(
+            "base:0x1",
+            "deposit_swept",
+            "user1",
+            "https://example.com/hook",
+            r#"{"id":"base:0x1","event":"deposit_swept"}"#,
+        )
+        .unwrap();
+
+        let now = now_unix_secs();
+        assert!(db
+            .claim_webhook_delivery("base:0x1", "deposit_swept", now + 60, 5)
+            .unwrap());
+        assert!(!db
+            .claim_webhook_delivery("base:0x1", "deposit_swept", now + 120, 5)
+            .unwrap());
+    }
+
+    #[test]
+    fn test_retry_webhook_delivery_resets_failed_row() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+
+        db.upsert_webhook_delivery(
+            "polygon:0xdead",
+            "deposit_detected",
+            "user1",
+            "https://example.com/hook",
+            r#"{"id":"polygon:0xdead","event":"deposit_detected"}"#,
+        )
+        .unwrap();
+        db.record_webhook_attempt(
+            "polygon:0xdead",
+            "deposit_detected",
+            Some(503),
+            Some("HTTP status 503"),
+            "failed",
+        )
+        .unwrap();
+
+        assert!(db
+            .retry_webhook_delivery("polygon:0xdead", "deposit_detected")
+            .unwrap());
+
+        let row = db
+            .get_webhook_delivery("polygon:0xdead", "deposit_detected")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.attempt_count, 0);
+        assert!(!db
+            .retry_webhook_delivery("polygon:0xdead", "deposit_detected")
+            .unwrap());
     }
 }
