@@ -95,13 +95,23 @@ impl WebhookDeliverer {
             .ok_or_else(|| anyhow!("webhook payload missing event"))?;
 
         let payload_str = payload.to_string();
-        let should_notify = self.db.upsert_webhook_delivery(
-            id,
-            event,
-            registration_id,
-            webhook_url,
-            &payload_str,
-        )?;
+        let should_notify = {
+            let id = id.to_string();
+            let event = event.to_string();
+            let registration_id = registration_id.to_string();
+            let webhook_url = webhook_url.to_string();
+            self.db
+                .blocking(move |db| {
+                    db.upsert_webhook_delivery(
+                        &id,
+                        &event,
+                        &registration_id,
+                        &webhook_url,
+                        &payload_str,
+                    )
+                })
+                .await?
+        };
 
         if should_notify {
             self.notify_worker();
@@ -111,7 +121,14 @@ impl WebhookDeliverer {
 
     /// Worker path: claim lease, perform one POST, record outcome.
     pub async fn attempt_stored(&self, id: &str, event: &str) -> Result<()> {
-        let Some(record) = self.db.get_webhook_delivery(id, event)? else {
+        let record = {
+            let id = id.to_string();
+            let event = event.to_string();
+            self.db
+                .blocking(move |db| db.get_webhook_delivery(&id, &event))
+                .await?
+        };
+        let Some(record) = record else {
             return Ok(());
         };
 
@@ -128,23 +145,37 @@ impl WebhookDeliverer {
             .unwrap_or_default()
             .as_secs() as i64;
         let lease_until = now + self.lease_seconds as i64;
-        if !self
-            .db
-            .claim_webhook_delivery(id, event, lease_until, self.max_retries)?
-        {
+        let claimed = {
+            let id = id.to_string();
+            let event = event.to_string();
+            let max_retries = self.max_retries;
+            self.db
+                .blocking(move |db| db.claim_webhook_delivery(&id, &event, lease_until, max_retries))
+                .await?
+        };
+        if !claimed {
             return Ok(());
         }
 
-        let record = self
-            .db
-            .get_webhook_delivery(id, event)?
-            .ok_or_else(|| anyhow!("webhook delivery disappeared after claim"))?;
+        let record = {
+            let id = id.to_string();
+            let event = event.to_string();
+            self.db
+                .blocking(move |db| db.get_webhook_delivery(&id, &event))
+                .await?
+                .ok_or_else(|| anyhow!("webhook delivery disappeared after claim"))?
+        };
 
         let payload: Value = serde_json::from_str(&record.payload)?;
         match self.try_post(&record.webhook_url, &payload).await {
             Ok(status) => {
+                let id_owned = id.to_string();
+                let event_owned = event.to_string();
                 self.db
-                    .record_webhook_attempt(id, event, Some(status), None, "delivered")?;
+                    .blocking(move |db| {
+                        db.record_webhook_attempt(&id_owned, &event_owned, Some(status), None, "delivered")
+                    })
+                    .await?;
                 info!(
                     "Webhook delivered: id={id}, event={event}, status={status}, registration_id={}",
                     record.registration_id
@@ -157,13 +188,23 @@ impl WebhookDeliverer {
                 } else {
                     "pending"
                 };
-                let attempts = self.db.record_webhook_attempt(
-                    id,
-                    event,
-                    http_status,
-                    Some(&err_msg),
-                    next_status,
-                )?;
+                let attempts = {
+                    let id_owned = id.to_string();
+                    let event_owned = event.to_string();
+                    let err_msg = err_msg.clone();
+                    let next_status_owned = next_status.to_string();
+                    self.db
+                        .blocking(move |db| {
+                            db.record_webhook_attempt(
+                                &id_owned,
+                                &event_owned,
+                                http_status,
+                                Some(&err_msg),
+                                &next_status_owned,
+                            )
+                        })
+                        .await?
+                };
                 let final_status = next_status;
 
                 if final_status == "failed" {
@@ -182,9 +223,12 @@ impl WebhookDeliverer {
     }
 
     pub async fn process_pending_batch(&self) -> Result<usize> {
+        let max_retries = self.max_retries;
+        let batch_size = self.batch_size;
         let keys = self
             .db
-            .get_pending_webhook_delivery_keys(self.max_retries, self.batch_size)?;
+            .blocking(move |db| db.get_pending_webhook_delivery_keys(max_retries, batch_size))
+            .await?;
 
         if keys.is_empty() {
             return Ok(0);

@@ -5,11 +5,24 @@
 # Registration is chain-agnostic; the same derived address receives deposits on all chains.
 # RPC URLs are polled over HTTP(S) only (no WebSocket streaming).
 # Lazy faucet: addresses are funded for gas at sweep time, not at registration.
+#
+# Production tips:
+# - Use a SEPARATE Alchemy API key per chain. A shared key means a busy chain
+#   (e.g. Polygon) throttles every other chain's compute-unit budget too.
+# - poll_interval = 2 keeps the monitor glued to a ~2s-block-time chain once caught
+#   up; this only affects steady-state polling, not backlog catch-up speed.
+# - When the monitor falls more than ~10 blocks behind head, it automatically
+#   switches from per-block scanning to a batched catch-up: one address-filtered
+#   ranged eth_getLogs call per catch_up_chunk_size blocks (bisecting the range if
+#   a provider rejects it as too large/too many results), plus concurrent
+#   eth_getBlockByNumber fetches (up to block_fetch_concurrency at a time) for
+#   native transfers. This is what lets a multi-thousand-block backlog actually
+#   drain instead of perpetually trailing a fast chain.
 
 [[chains]]
 name = "base"
 chain_id = 8453
-rpc_url = "https://base-mainnet.g.alchemy.com/v2/YOUR_KEY"
+rpc_url = "https://base-mainnet.g.alchemy.com/v2/YOUR_BASE_KEY"
 treasury_address = "0x1111111111111111111111111111111111111111"
 faucet_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
 existential_deposit = "10000000000000000"
@@ -17,22 +30,30 @@ allowed_token_addresses = [
   "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", # USDC on Base
 ]
 block_offset_from_head = 20
-poll_interval = 10
+poll_interval = 2
 get_logs_max_retries = 30
 get_logs_delay_ms = 50
+catch_up_chunk_size = 500
+block_fetch_concurrency = 10
 min_deposit_default = "0"
 min_deposit_native = "0"
 
 [[chains]]
 name = "polygon"
 chain_id = 137
-rpc_url = "https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY"
+rpc_url = "https://polygon-mainnet.g.alchemy.com/v2/YOUR_POLYGON_KEY"
 treasury_address = "0x2222222222222222222222222222222222222222"
 faucet_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
 existential_deposit = "10000000000000000"
 allowed_token_addresses = [
   "0xc2132D05D31c914a87C6611C10748AEb04B58e8f", # USDT on Polygon
 ]
+block_offset_from_head = 20
+poll_interval = 2
+get_logs_max_retries = 30
+get_logs_delay_ms = 50
+catch_up_chunk_size = 500
+block_fetch_concurrency = 10
 min_deposit_native = "0"
 [chains.min_deposits]
 "0xc2132d05d31c914a87c6611c10748aeb04b58e8f" = "10000"

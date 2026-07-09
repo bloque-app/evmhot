@@ -521,9 +521,11 @@ impl HotWalletService {
         use std::hash::{Hash, Hasher};
         use tracing::info;
 
-        if let Ok(Some((_index, existing_address, _webhook))) =
-            self.db.get_account_by_id(&request.id)
-        {
+        let existing = {
+            let id = request.id.clone();
+            self.db.blocking(move |db| db.get_account_by_id(&id)).await
+        };
+        if let Ok(Some((_index, existing_address, _webhook))) = existing {
             info!(
                 "Account {} already exists with address {}",
                 request.id, existing_address
@@ -542,8 +544,14 @@ impl HotWalletService {
         let address = self.wallet.derive_address(index)?;
         let address_str = address.to_string();
 
-        self.db
-            .register_account(&request.id, index, &address_str, &request.webhook_url)?;
+        {
+            let id = request.id.clone();
+            let addr = address_str.clone();
+            let webhook_url = request.webhook_url.clone();
+            self.db
+                .blocking(move |db| db.register_account(&id, index, &addr, &webhook_url))
+                .await?;
+        }
 
         info!(
             "Registered account {} with address {} (index: {})",

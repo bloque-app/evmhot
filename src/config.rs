@@ -54,6 +54,15 @@ pub struct ChainConfigRaw {
     pub get_logs_max_retries: u32,
     #[serde(default = "default_get_logs_delay_ms")]
     pub get_logs_delay_ms: u64,
+    /// Block span per ranged `eth_getLogs` call when the monitor is far behind head.
+    /// A soft performance hint, not a correctness knob: the monitor bisects any range
+    /// that a provider rejects as too large, regardless of this setting.
+    #[serde(default = "default_catch_up_chunk_size")]
+    pub catch_up_chunk_size: u64,
+    /// Max number of blocks fetched concurrently for native-transfer scanning while
+    /// draining a backlog.
+    #[serde(default = "default_block_fetch_concurrency")]
+    pub block_fetch_concurrency: u64,
 }
 
 fn default_existential_deposit() -> String {
@@ -76,6 +85,14 @@ fn default_get_logs_delay_ms() -> u64 {
     50
 }
 
+fn default_catch_up_chunk_size() -> u64 {
+    500
+}
+
+fn default_block_fetch_concurrency() -> u64 {
+    10
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct ChainsFile {
     chains: Vec<ChainConfigRaw>,
@@ -94,6 +111,8 @@ pub struct ChainConfig {
     pub poll_interval: u64,
     pub get_logs_max_retries: u32,
     pub get_logs_delay_ms: u64,
+    pub catch_up_chunk_size: u64,
+    pub block_fetch_concurrency: u64,
     pub min_deposits: MinDepositSettings,
     /// Lowercased `0x`-prefixed ERC20 contract addresses permitted for detection and sweep.
     pub allowed_token_addresses: HashSet<String>,
@@ -246,6 +265,8 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
             poll_interval: raw.poll_interval,
             get_logs_max_retries: raw.get_logs_max_retries,
             get_logs_delay_ms: raw.get_logs_delay_ms,
+            catch_up_chunk_size: raw.catch_up_chunk_size,
+            block_fetch_concurrency: raw.block_fetch_concurrency,
             min_deposits: MinDepositSettings {
                 per_token,
                 default: min_deposit_default,
