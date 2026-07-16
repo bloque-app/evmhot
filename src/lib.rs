@@ -218,7 +218,7 @@ impl HotWalletService {
     }
 
     pub async fn new(config: Config) -> anyhow::Result<Self> {
-        let db = Db::new(&config.database_url)?;
+        let db = Db::with_pool_size(&config.database_url, config.db_read_pool_size)?;
         let wallet = Wallet::new(config.mnemonic.clone());
 
         let mut chains = Vec::with_capacity(config.chains.len());

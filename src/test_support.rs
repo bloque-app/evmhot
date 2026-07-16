@@ -79,6 +79,7 @@ pub fn test_config_multichain(
         webhook_retry_batch_size,
         webhook_lease_seconds,
         legacy_chain: TEST_CHAIN.to_string(),
+        db_read_pool_size: 20,
         chains: vec![
             test_chain_config_named("base", base_rpc),
             test_chain_config_named("polygon", polygon_rpc),
@@ -106,6 +107,7 @@ pub fn test_config(db_path: impl Into<String>, rpc_url: impl Into<String>) -> Co
         webhook_retry_batch_size,
         webhook_lease_seconds,
         legacy_chain: TEST_CHAIN.to_string(),
+        db_read_pool_size: 20,
         chains: vec![test_chain_config(rpc_url)],
     }
 }

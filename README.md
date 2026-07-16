@@ -81,6 +81,7 @@ Secrets stay in environment variables. Per-chain settings (RPC, treasury, tokens
 | `FAUCET_MNEMONIC` | yes | BIP-39 mnemonic for the faucet wallet (lazy-funds addresses for gas at sweep time) | — |
 | `CHAINS_CONFIG` | no | Path to chains TOML file | `chains.toml` |
 | `DATABASE_URL` | no | SQLite database file path (`sqlite:` prefix optional) | `sqlite:wallet.db` |
+| `DB_READ_POOL_SIZE` | no | Max concurrent SQLite read-pool connections, shared by every chain's monitor/sweeper/webhook-retry loop plus inbound registrations. Raise this if you configure more chains or see `"timed out waiting for connection"` under load | `20` |
 | `PORT` | no | API server port | `3000` |
 | `WEBHOOK_JWT_TOKEN` | no | Optional JWT sent as `Authorization: Bearer` on webhooks and admin endpoints | — |
 | `WEBHOOK_MAX_RETRIES` | no | Max delivery attempts before marking a webhook `failed` | `5` |

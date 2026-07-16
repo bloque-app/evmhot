@@ -96,8 +96,28 @@ fn last_block_key(chain: &str) -> String {
     format!("last_block:{chain}")
 }
 
+/// r2d2's own default when `.max_size(..)` is not set on the pool builder.
+/// Used by `Db::new` so existing callers (in particular the ~50 test call
+/// sites that construct a `Db` directly) keep their current behavior.
+const DEFAULT_READ_POOL_MAX_SIZE: u32 = 10;
+
 impl Db {
     pub fn new(database_url: &str) -> Result<Self> {
+        Self::with_pool_size(database_url, DEFAULT_READ_POOL_MAX_SIZE)
+    }
+
+    /// Same as `Db::new`, but with an explicit read-pool size instead of
+    /// r2d2's default of 10. Production wiring (`HotWalletService::new`)
+    /// uses this so the pool size is configurable via `Config::db_read_pool_size`
+    /// (env `DB_READ_POOL_SIZE`) instead of being a silent hardcoded default.
+    ///
+    /// That default matters because every chain's monitor, sweeper, and
+    /// webhook-retry loop, plus inbound `/evm/register` calls, all share this
+    /// one pool. With multiple chains configured, those background loops
+    /// alone can exceed a small fixed pool under a catch-up backlog or a
+    /// flaky RPC provider, producing sustained `"timed out waiting for
+    /// connection"` errors even with the 5s fail-fast timeout below.
+    pub fn with_pool_size(database_url: &str, max_size: u32) -> Result<Self> {
         let path = normalize_db_path(database_url);
         let mut write_conn = Connection::open(path)?;
         apply_pragmas(&write_conn)?;
@@ -112,6 +132,7 @@ impl Db {
         // rather than a Tokio worker thread, but failing fast is still
         // preferable to a long silent stall either way.
         let read_pool = Pool::builder()
+            .max_size(max_size)
             .connection_timeout(Duration::from_secs(5))
             .build(manager)?;
 
@@ -1050,5 +1071,69 @@ mod tests {
         assert!(!db
             .retry_webhook_delivery("polygon:0xdead", "deposit_detected")
             .unwrap());
+    }
+
+    #[test]
+    fn test_new_uses_default_pool_max_size() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(db.read.max_size(), DEFAULT_READ_POOL_MAX_SIZE);
+    }
+
+    #[test]
+    fn test_with_pool_size_configures_read_pool_capacity() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::with_pool_size(tmp.path().to_str().unwrap(), 3).unwrap();
+        assert_eq!(db.read.max_size(), 3);
+    }
+
+    /// Regression test for the pool-exhaustion incident: a hardcoded pool size
+    /// (previously r2d2's implicit default of 10, with no way to raise it) is
+    /// shared by every chain's monitor/sweeper/webhook loops plus inbound
+    /// registrations. This proves `with_pool_size` actually bounds concurrent
+    /// checkouts to the configured value, rather than silently falling back to
+    /// r2d2's default.
+    #[test]
+    fn test_read_pool_respects_configured_max_size() {
+        use std::sync::Barrier;
+        use std::thread;
+        use std::time::Duration;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let pool_size = 2u32;
+        let db = Db::with_pool_size(tmp.path().to_str().unwrap(), pool_size).unwrap();
+
+        // Barrier for "every thread below has a connection checked out",
+        // signaling the main thread that the pool is genuinely exhausted.
+        // Parties = pool_size worker threads + the main thread itself.
+        let barrier = Arc::new(Barrier::new(pool_size as usize + 1));
+        let handles: Vec<_> = (0..pool_size)
+            .map(|_| {
+                let db = db.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let _conn = db
+                        .read
+                        .get()
+                        .expect("pool should have capacity for this thread");
+                    barrier.wait();
+                    // Hold the connection past the 5s connection_timeout so the
+                    // main thread's extra `get()` below contends for a pool
+                    // that's genuinely exhausted, not just briefly busy.
+                    thread::sleep(Duration::from_secs(6));
+                })
+            })
+            .collect();
+
+        barrier.wait();
+        let extra = db.read.get();
+        assert!(
+            extra.is_err(),
+            "expected read.get() to fail once all {pool_size} pooled connections are checked out"
+        );
+
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

@@ -143,6 +143,10 @@ pub struct Config {
     pub webhook_lease_seconds: u64,
     /// Default chain name for the redb→SQLite importer only (`LEGACY_CHAIN`, default: `polygon`).
     pub legacy_chain: String,
+    /// Max concurrent SQLite read-pool connections (`DB_READ_POOL_SIZE`, default 20).
+    /// Shared by every chain's monitor/sweeper/webhook-retry loop plus inbound
+    /// registrations, so this should scale with the number of configured chains.
+    pub db_read_pool_size: u32,
     pub chains: Vec<ChainConfig>,
 }
 
@@ -165,6 +169,7 @@ impl Config {
         let webhook_retry_batch_size = env_u32("WEBHOOK_RETRY_BATCH_SIZE", 50);
         let webhook_lease_seconds = env_u64("WEBHOOK_LEASE_SECONDS", 60);
         let legacy_chain = env::var("LEGACY_CHAIN").unwrap_or_else(|_| "polygon".to_string());
+        let db_read_pool_size = env_u32("DB_READ_POOL_SIZE", 20);
 
         let chains_config_path =
             env::var("CHAINS_CONFIG").unwrap_or_else(|_| "chains.toml".to_string());
@@ -182,6 +187,7 @@ impl Config {
             webhook_retry_batch_size,
             webhook_lease_seconds,
             legacy_chain,
+            db_read_pool_size,
             chains,
         })
     }
