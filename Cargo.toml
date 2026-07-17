@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "migrate_redb_to_sqlite"
 path = "src/bin/migrate_redb_to_sqlite.rs"
 
+[[bin]]
+name = "migrate_sqlite_to_postgres"
+path = "src/bin/migrate_sqlite_to_postgres.rs"
+
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }
 axum = "0.7"
@@ -39,7 +43,18 @@ r2d2 = "0.8.10"
 r2d2_sqlite = "0.34"
 rusqlite_migration = "2.5.0"
 clap = { version = "4.6.1", features = ["derive"] }
+# Postgres storage backend (evmhot Postgres storage migration). Sync client +
+# r2d2 pool mirror the existing rusqlite + r2d2_sqlite shape on purpose
+# (decision: keep Db's method signatures synchronous, no async/sqlx rewrite).
+postgres = "0.19"
+r2d2_postgres = "0.18"
+postgres-openssl = "0.5"
+openssl = "0.10"
+# Regular dependency (not dev-only): PostgresBackend::connect writes the
+# bundled RDS CA bundle to a short-lived temp file at production startup too.
+tempfile = "3.23.0"
 
 [dev-dependencies]
-tempfile = "3.23.0"
 wiremock = "0.5"
+testcontainers = "0.15"
+testcontainers-modules = { version = "0.3", features = ["postgres"] }

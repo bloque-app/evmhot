@@ -5,6 +5,7 @@ pub(crate) mod faucet;
 mod monitor;
 pub mod redb_import;
 pub mod redb_store;
+pub mod sqlite_import;
 mod sweeper;
 pub mod traits;
 mod wallet;
