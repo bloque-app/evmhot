@@ -39,8 +39,9 @@ clippy: ## Run clippy lints
 health: ## Check service health
 	@curl -f http://localhost:3000/health && echo " - Service is healthy!" || echo " - Service is unhealthy!"
 
-backup: ## Backup database
+backup: ## Backup database (WAL-safe)
 	@mkdir -p backups
+	docker exec evm-hot-wallet sqlite3 /app/data/wallet.db "PRAGMA wal_checkpoint(TRUNCATE);"
 	docker cp evm-hot-wallet:/app/data/wallet.db ./backups/wallet-$$(date +%Y%m%d-%H%M%S).db
 	@echo "Database backed up to ./backups/"
 

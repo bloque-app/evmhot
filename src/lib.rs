@@ -3,18 +3,23 @@ pub mod config;
 pub mod db;
 pub(crate) mod faucet;
 mod monitor;
+pub mod redb_import;
+pub mod redb_store;
 mod sweeper;
 pub mod traits;
 mod wallet;
+mod webhook;
 
 #[cfg(test)]
 mod e2e_tests;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
 
-use alloy::providers::{ProviderBuilder, WsConnect};
-use alloy::transports::Transport;
-use config::{Config, ProviderUrl};
+use alloy::providers::{ProviderBuilder, RootProvider};
+use alloy::transports::BoxTransport;
+use config::{ChainConfig, Config};
 use db::Db;
 use faucet::Faucet;
 use monitor::Monitor;
@@ -23,6 +28,7 @@ use std::sync::Arc;
 use sweeper::Sweeper;
 use traits::Service;
 use wallet::Wallet;
+use webhook::{WebhookDeliverer, WebhookRetryService};
 
 /// Request structure for registering a new account
 #[derive(Deserialize, Clone)]
@@ -42,6 +48,8 @@ pub struct RegisterResponse {
 /// Request structure for verifying a transfer
 #[derive(Deserialize, Clone, Debug)]
 pub struct VerifyTransferRequest {
+    /// Chain name (e.g. "base", "polygon")
+    pub chain: String,
     /// Transaction hash to verify
     pub tx_hash: String,
     /// Expected recipient address
@@ -49,7 +57,6 @@ pub struct VerifyTransferRequest {
     /// Expected amount (as string to handle large numbers)
     pub amount: String,
     /// Token type: "native" for ETH/native currency, or "erc20" for ERC20 tokens
-    /// Defaults to "native" if not specified
     #[serde(default = "default_token_type")]
     pub token_type: String,
     /// Token contract address (required for ERC20)
@@ -68,76 +75,257 @@ fn default_token_type() -> String {
 #[derive(Serialize, Clone, Debug)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum VerifyTransferResponse {
-    /// Transfer was successfully verified
     Success {
-        /// Actual recipient address found in the transaction
         actual_to: String,
-        /// Actual amount found in the transaction
         actual_amount: String,
-        /// Token type ("native" or "erc20")
         token_type: String,
-        /// Token symbol (for ERC20)
         #[serde(skip_serializing_if = "Option::is_none")]
         token_symbol: Option<String>,
-        /// Block number where the transaction was included
         #[serde(skip_serializing_if = "Option::is_none")]
         block_number: Option<u64>,
     },
-    /// Transfer verification failed
     Error {
-        /// Error message describing why verification failed
         message: String,
-        /// Token type ("native" or "erc20") if known
         #[serde(skip_serializing_if = "Option::is_none")]
         token_type: Option<String>,
-        /// Block number where the transaction was included (if found)
         #[serde(skip_serializing_if = "Option::is_none")]
         block_number: Option<u64>,
     },
 }
 
-/// Core Hot Wallet Service that manages background tasks and provides account registration
-pub struct HotWalletService<T>
-where
-    T: Transport + Clone + Send + Sync + 'static,
-{
+/// Request to re-queue a failed deposit for sweeping.
+#[derive(Deserialize, Clone, Debug)]
+pub struct RetrySweepRequest {
+    pub chain: String,
+    pub tx_hash: String,
+    /// Required for ERC20 deposits; omit for native deposits.
+    #[serde(default)]
+    pub log_index: Option<u64>,
+}
+
+/// Response for a sweep retry request.
+#[derive(Serialize, Clone, Debug)]
+pub struct RetrySweepResponse {
+    pub retried: bool,
+    pub token_type: String,
+}
+
+/// Request to re-queue a failed webhook delivery.
+#[derive(Deserialize, Clone, Debug)]
+pub struct RetryWebhookRequest {
+    pub id: String,
+    pub event: String,
+}
+
+/// Response for a webhook retry request.
+#[derive(Serialize, Clone, Debug)]
+pub struct RetryWebhookResponse {
+    pub retried: bool,
+    pub status: String,
+}
+
+/// Per-chain runtime context (provider + faucet).
+pub struct ChainContext {
+    pub cfg: ChainConfig,
+    pub provider: RootProvider<BoxTransport>,
+    pub faucet: Arc<Faucet>,
+}
+
+/// Core Hot Wallet Service that manages background tasks and provides account registration.
+pub struct HotWalletService {
     config: Config,
     db: Db,
     wallet: Wallet,
-    faucet: Arc<Faucet<alloy::providers::RootProvider<T>>>,
-    provider: alloy::providers::RootProvider<T>,
+    chains: Vec<ChainContext>,
+    webhook_deliverer: Arc<WebhookDeliverer>,
 }
 
-impl<T> HotWalletService<T>
-where
-    T: Transport + Clone + Send + Sync + 'static,
-{
-    /// Get a reference to the database
+impl HotWalletService {
     pub fn db(&self) -> &Db {
         &self.db
     }
 
-    /// Get a reference to the configuration
     pub fn config(&self) -> &Config {
         &self.config
     }
 
-    /// Health check method - returns Ok if service is healthy
+    pub fn chain_names(&self) -> Vec<String> {
+        self.chains.iter().map(|c| c.cfg.name.clone()).collect()
+    }
+
     pub async fn health(&self) -> anyhow::Result<String> {
-        Ok("OK".to_string())
+        if !self.db.writer_healthy() {
+            return Err(anyhow::anyhow!(
+                "database writer is not running; writes are impossible"
+            ));
+        }
+        let names: Vec<_> = self.chain_names();
+        Ok(format!("OK (chains: {})", names.join(", ")))
     }
 
-    /// Set the last processed block number manually
-    pub fn set_block_number(&self, block_number: u64) -> anyhow::Result<()> {
-        self.db.set_last_processed_block(block_number)
+    /// Interactive-lane write routed through `Db::blocking` so this HTTP path
+    /// never blocks a Tokio worker thread on the write queue.
+    pub async fn set_block_number(&self, chain: &str, block_number: u64) -> anyhow::Result<()> {
+        if self.config.chain(chain).is_none() {
+            return Err(anyhow::anyhow!("Unknown chain: {chain}"));
+        }
+        let chain = chain.to_string();
+        self.db
+            .blocking(move |db| db.set_last_processed_block_priority(&chain, block_number))
+            .await
     }
 
-    /// Get the current last processed block number
-    pub fn get_block_number(&self) -> anyhow::Result<u64> {
-        self.db.get_last_processed_block()
+    pub fn get_block_number(&self, chain: &str) -> anyhow::Result<u64> {
+        if self.config.chain(chain).is_none() {
+            return Err(anyhow::anyhow!("Unknown chain: {chain}"));
+        }
+        self.db.get_last_processed_block(chain)
     }
 
-    /// Verify if a transaction contains a transfer matching the expected criteria
+    /// Interactive-lane write routed through `Db::blocking` so this HTTP path
+    /// never blocks a Tokio worker thread on the write queue.
+    pub async fn retry_sweep(
+        &self,
+        request: RetrySweepRequest,
+    ) -> anyhow::Result<RetrySweepResponse> {
+        if self.config.chain(&request.chain).is_none() {
+            return Err(anyhow::anyhow!("Unknown chain: {}", request.chain));
+        }
+
+        if let Some(log_index) = request.log_index {
+            let retried = self
+                .db
+                .blocking(move |db| {
+                    db.retry_erc20_deposit(&request.chain, &request.tx_hash, log_index)
+                })
+                .await?;
+            Ok(RetrySweepResponse {
+                retried,
+                token_type: "erc20".to_string(),
+            })
+        } else {
+            let retried = self
+                .db
+                .blocking(move |db| db.retry_native_deposit(&request.chain, &request.tx_hash))
+                .await?;
+            Ok(RetrySweepResponse {
+                retried,
+                token_type: "native".to_string(),
+            })
+        }
+    }
+
+    /// Interactive-lane write routed through `Db::blocking` so this HTTP path
+    /// never blocks a Tokio worker thread on the write queue.
+    pub async fn retry_webhook(
+        &self,
+        request: RetryWebhookRequest,
+    ) -> anyhow::Result<RetryWebhookResponse> {
+        let id = request.id.clone();
+        let event = request.event.clone();
+        let retried = self
+            .db
+            .blocking(move |db| db.retry_webhook_delivery(&id, &event))
+            .await?;
+        if !retried {
+            return Err(anyhow::anyhow!(
+                "No failed webhook delivery found for id={} event={}",
+                request.id,
+                request.event
+            ));
+        }
+        self.webhook_deliverer.notify_worker();
+        Ok(RetryWebhookResponse {
+            retried: true,
+            status: "pending".to_string(),
+        })
+    }
+
+    pub async fn new(config: Config) -> anyhow::Result<Self> {
+        let db = Db::with_pool_size(&config.database_url, config.db_read_pool_size)?;
+        let wallet = Wallet::new(config.mnemonic.clone());
+
+        let mut chains = Vec::with_capacity(config.chains.len());
+        for chain_cfg in &config.chains {
+            let provider = ProviderBuilder::new()
+                .on_builtin(&chain_cfg.rpc_url)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to connect to chain '{}' at {}: {e}",
+                        chain_cfg.name,
+                        chain_cfg.rpc_url
+                    )
+                })?;
+
+            let faucet = Arc::new(Faucet::new(
+                config.faucet_mnemonic.clone(),
+                provider.clone(),
+                &chain_cfg.existential_deposit,
+            )?);
+
+            chains.push(ChainContext {
+                cfg: chain_cfg.clone(),
+                provider,
+                faucet,
+            });
+        }
+
+        let webhook_deliverer = Arc::new(WebhookDeliverer::new(db.clone(), &config)?);
+
+        Ok(Self {
+            config,
+            db,
+            wallet,
+            chains,
+            webhook_deliverer,
+        })
+    }
+
+    pub async fn start_background_services(&self) -> anyhow::Result<()> {
+        let webhook_worker = WebhookRetryService::new(Arc::clone(&self.webhook_deliverer));
+        tokio::spawn(async move {
+            tracing::info!("Starting Webhook retry worker");
+            webhook_worker.run().await;
+        });
+
+        for ctx in &self.chains {
+            let chain_name = ctx.cfg.name.clone();
+            let monitor = Monitor::new(
+                ctx.cfg.clone(),
+                Arc::clone(&self.webhook_deliverer),
+                self.db.clone(),
+                ctx.provider.clone(),
+            );
+            tokio::spawn(async move {
+                tracing::info!("[{chain_name}] Starting Monitor");
+                monitor.run().await;
+            });
+
+            let sweeper = Sweeper::new(
+                ctx.cfg.clone(),
+                Arc::clone(&self.webhook_deliverer),
+                self.db.clone(),
+                self.wallet.clone(),
+                ctx.provider.clone(),
+                Arc::clone(&ctx.faucet),
+            );
+            let chain_name = ctx.cfg.name.clone();
+            tokio::spawn(async move {
+                tracing::info!("[{chain_name}] Starting Sweeper");
+                sweeper.run().await;
+            });
+        }
+        Ok(())
+    }
+
+    fn chain_context(&self, name: &str) -> anyhow::Result<&ChainContext> {
+        self.chains
+            .iter()
+            .find(|c| c.cfg.name == name)
+            .ok_or_else(|| anyhow::anyhow!("Unknown chain: {name}"))
+    }
+
     pub async fn verify_transfer(
         &self,
         request: VerifyTransferRequest,
@@ -148,27 +336,24 @@ where
 
         info!("Verifying transfer: {:?}", request);
 
-        // Parse the transaction hash
+        let ctx = self.chain_context(&request.chain)?;
+
         let tx_hash: FixedBytes<32> = request
             .tx_hash
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid transaction hash format"))?;
 
-        // Parse expected values
         let expected_to = Address::from_str(&request.to_address)
             .map_err(|_| anyhow::anyhow!("Invalid to_address format"))?;
         let expected_amount = U256::from_str(&request.amount)
             .map_err(|_| anyhow::anyhow!("Invalid amount format"))?;
 
-        // Determine if this is a native or ERC20 transfer based on token_type
         let is_native = request.token_type.to_lowercase() == "native";
 
         if is_native {
-            // Verify native ETH transfer
-            self.verify_native_transfer(tx_hash, expected_to, expected_amount)
+            self.verify_native_transfer(&ctx.provider, tx_hash, expected_to, expected_amount)
                 .await
         } else {
-            // Verify ERC20 transfer - token_address is required
             let token_address_str = request
                 .token_address
                 .as_ref()
@@ -178,6 +363,7 @@ where
                 .map_err(|_| anyhow::anyhow!("Invalid token_address format"))?;
 
             self.verify_erc20_transfer(
+                &ctx.provider,
                 tx_hash,
                 expected_to,
                 expected_amount,
@@ -190,27 +376,21 @@ where
 
     async fn verify_native_transfer(
         &self,
+        provider: &RootProvider<BoxTransport>,
         tx_hash: alloy::primitives::FixedBytes<32>,
         expected_to: alloy::primitives::Address,
         expected_amount: alloy::primitives::U256,
     ) -> anyhow::Result<VerifyTransferResponse> {
         use alloy::providers::Provider;
-        use tracing::info;
 
-        // Fetch the transaction
-        let tx = self
-            .provider
+        let tx = provider
             .get_transaction_by_hash(tx_hash)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Transaction not found"))?;
 
-        info!("Found transaction: {:?}", tx.hash);
-
-        // Get block number from transaction receipt for confirmation
-        let receipt = self.provider.get_transaction_receipt(tx_hash).await?;
+        let receipt = provider.get_transaction_receipt(tx_hash).await?;
         let block_number = receipt.as_ref().and_then(|r| r.block_number);
 
-        // Check if transaction was successful
         if let Some(ref r) = receipt {
             if !r.status() {
                 return Ok(VerifyTransferResponse::Error {
@@ -221,7 +401,6 @@ where
             }
         }
 
-        // For native transfers, check the `to` field and `value` field
         let actual_to = tx.to;
         let actual_amount = tx.value;
 
@@ -255,6 +434,7 @@ where
 
     async fn verify_erc20_transfer(
         &self,
+        provider: &RootProvider<BoxTransport>,
         tx_hash: alloy::primitives::FixedBytes<32>,
         expected_to: alloy::primitives::Address,
         expected_amount: alloy::primitives::U256,
@@ -263,18 +443,14 @@ where
     ) -> anyhow::Result<VerifyTransferResponse> {
         use alloy::primitives::{Address, FixedBytes, U256};
         use alloy::providers::Provider;
-        use tracing::info;
 
-        // Fetch the transaction receipt to get logs
-        let receipt = self
-            .provider
+        let receipt = provider
             .get_transaction_receipt(tx_hash)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Transaction receipt not found"))?;
 
         let block_number = receipt.block_number;
 
-        // Check if transaction was successful
         if !receipt.status() {
             return Ok(VerifyTransferResponse::Error {
                 message: "Transaction failed (reverted)".to_string(),
@@ -283,10 +459,8 @@ where
             });
         }
 
-        // Fetch token symbol from chain if we need to validate it
-        let actual_symbol = self.fetch_token_symbol(token_address).await.ok();
+        let actual_symbol = self.fetch_token_symbol(provider, token_address).await.ok();
 
-        // Validate token symbol if provided
         if let Some(expected) = expected_symbol {
             if let Some(ref actual) = actual_symbol {
                 if !actual.eq_ignore_ascii_case(expected) {
@@ -302,38 +476,24 @@ where
             }
         }
 
-        // ERC20 Transfer event signature: Transfer(address,address,uint256)
         let transfer_signature: FixedBytes<32> =
             alloy::primitives::keccak256("Transfer(address,address,uint256)".as_bytes());
 
-        // Look for Transfer events from the specified token
         for log in receipt.inner.logs() {
-            // Check if this is from the expected token contract
             if log.address() != token_address {
                 continue;
             }
-
-            // Check if this is a Transfer event
             if log.topics().len() < 3 || log.topics()[0] != transfer_signature {
                 continue;
             }
 
-            // Decode Transfer event: topic[1] = from, topic[2] = to
             let to_address = Address::from_slice(&log.topics()[2].as_slice()[12..]);
-
-            // Decode amount from data
             let amount = if !log.data().data.is_empty() {
                 U256::from_be_slice(&log.data().data)
             } else {
                 U256::ZERO
             };
 
-            info!(
-                "Found ERC20 Transfer: to={}, amount={}, symbol={:?}",
-                to_address, amount, actual_symbol
-            );
-
-            // Check if this transfer matches our criteria
             let to_matches = to_address
                 .to_string()
                 .eq_ignore_ascii_case(&expected_to.to_string());
@@ -350,7 +510,6 @@ where
             }
         }
 
-        // No matching transfer found
         Ok(VerifyTransferResponse::Error {
             message: format!(
                 "No matching ERC20 Transfer event found to {} with amount >= {}",
@@ -361,9 +520,9 @@ where
         })
     }
 
-    /// Fetch token symbol from the blockchain
     async fn fetch_token_symbol(
         &self,
+        provider: &RootProvider<BoxTransport>,
         token_address: alloy::primitives::Address,
     ) -> anyhow::Result<String> {
         use alloy::sol;
@@ -375,22 +534,28 @@ where
             }
         }
 
-        let contract = IERC20Symbol::new(token_address, &self.provider);
+        let contract = IERC20Symbol::new(token_address, provider);
         let symbol = contract.symbol().call().await?._0;
         Ok(symbol)
     }
 
-    /// Register a new account with the hot wallet service
-    /// Returns the derived address and optionally a funding transaction hash
+    /// Register a new account. Address derivation is chain-agnostic; no faucet funding at registration.
+    ///
+    /// The derivation index is allocated from a persisted sequential counter
+    /// inside a single atomic writer command (P0 collision fix, replacing the
+    /// old `DefaultHasher`-derived index that had birthday collisions at
+    /// ~46k accounts and was unstable across Rust versions). The read-side
+    /// existing-account check below is only a fast path; the authoritative
+    /// check happens again inside the write transaction, so a re-register
+    /// race can never allocate a second index for the same id.
     pub async fn register(&self, request: RegisterRequest) -> anyhow::Result<RegisterResponse> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        use tracing::{error, info};
+        use tracing::info;
 
-        // Check if account already exists
-        if let Ok(Some((_index, existing_address, _webhook))) =
-            self.db.get_account_by_id(&request.id)
-        {
+        let existing = {
+            let id = request.id.clone();
+            self.db.blocking(move |db| db.get_account_by_id(&id)).await
+        };
+        if let Ok(Some((_index, existing_address, _webhook))) = existing {
             info!(
                 "Account {} already exists with address {}",
                 request.id, existing_address
@@ -401,310 +566,34 @@ where
             });
         }
 
-        // Derive deterministic index from account_id using hash
-        let mut hasher = DefaultHasher::new();
-        request.id.hash(&mut hasher);
-        let hash = hasher.finish();
-        let index = (hash & 0x7FFFFFFF) as u32;
+        let (index, address_str, created) = {
+            let id = request.id.clone();
+            let webhook_url = request.webhook_url.clone();
+            let wallet = self.wallet.clone();
+            self.db
+                .blocking(move |db| {
+                    db.register_account_auto(&id, &webhook_url, move |index| {
+                        Ok(wallet.derive_address(index)?.to_string())
+                    })
+                })
+                .await?
+        };
 
-        // Derive address from the deterministic index
-        let address = self.wallet.derive_address(index)?;
-        let address_str = address.to_string();
-
-        // Save to DB with webhook URL
-        self.db
-            .register_account(&request.id, index, &address_str, &request.webhook_url)?;
-
-        info!(
-            "Registered account {} with address {} (index: {})",
-            request.id, address_str, index
-        );
-
-        // Fire-and-forget: Fund the new address with existential deposit in the background
-        let faucet = Arc::clone(&self.faucet);
-        let db = self.db.clone();
-        let account_id = request.id.clone();
-        let address_for_funding = address_str.clone();
-        let webhook_jwt_token = self.config.webhook_jwt_token.clone();
-
-        tokio::spawn(async move {
+        if created {
             info!(
-                "Background task: Starting faucet funding for address {}",
-                address_for_funding
+                "Registered account {} with address {} (index: {})",
+                request.id, address_str, index
             );
-
-            match faucet.fund_new_address(&address_for_funding).await {
-                Ok(tx_hash) => {
-                    info!(
-                        "Successfully funded address {} with tx: {}",
-                        address_for_funding, tx_hash
-                    );
-
-                    // Send webhook notification for successful funding
-                    if let Err(e) = send_faucet_funding_webhook(
-                        &db,
-                        &account_id,
-                        &address_for_funding,
-                        &tx_hash,
-                        true,
-                        None,
-                        webhook_jwt_token.as_deref(),
-                    )
-                    .await
-                    {
-                        error!(
-                            "Failed to send faucet funding webhook for {}: {:?}",
-                            account_id, e
-                        );
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to fund address {}: {:?}", address_for_funding, e);
-
-                    // Send webhook notification for failed funding
-                    if let Err(webhook_err) = send_faucet_funding_webhook(
-                        &db,
-                        &account_id,
-                        &address_for_funding,
-                        "",
-                        false,
-                        Some(&e.to_string()),
-                        webhook_jwt_token.as_deref(),
-                    )
-                    .await
-                    {
-                        error!(
-                            "Failed to send faucet funding error webhook for {}: {:?}",
-                            account_id, webhook_err
-                        );
-                    }
-                }
-            }
-        });
+        } else {
+            info!(
+                "Account {} already exists with address {}",
+                request.id, address_str
+            );
+        }
 
         Ok(RegisterResponse {
             address: address_str,
-            funding_tx: None, // No longer waiting for funding - it's fire-and-forget
+            funding_tx: None,
         })
     }
-}
-
-// HTTP Provider implementation
-impl HotWalletService<alloy::transports::http::Http<reqwest::Client>> {
-    /// Create a new HotWalletService with HTTP provider from configuration
-    pub async fn new_http(config: Config) -> anyhow::Result<Self> {
-        let db = Db::new(&config.database_url)?;
-        let wallet = Wallet::new(config.mnemonic.clone());
-
-        let url = match &config.provider_url {
-            ProviderUrl::Http(url) => url,
-            _ => return Err(anyhow::anyhow!("Expected HTTP provider URL")),
-        };
-
-        let provider = ProviderBuilder::new().on_http(url.parse()?);
-        let faucet = Faucet::new(
-            config.faucet_mnemonic.clone(),
-            provider.clone(),
-            &config.existential_deposit,
-        )?;
-
-        Ok(Self {
-            config,
-            db,
-            wallet,
-            faucet: Arc::new(faucet),
-            provider,
-        })
-    }
-
-    /// Start background services (Monitor and Sweeper) for HTTP provider
-    /// Returns immediately after spawning the background tasks
-    pub async fn start_background_services(&self) -> anyhow::Result<()> {
-        let url = match &self.config.provider_url {
-            ProviderUrl::Http(url) => url,
-            _ => return Err(anyhow::anyhow!("Expected HTTP provider URL")),
-        };
-
-        let provider = ProviderBuilder::new().on_http(url.parse()?);
-
-        // Spawn Monitor
-        tokio::spawn({
-            let config = self.config.clone();
-            let db = self.db.clone();
-            let provider = provider.clone();
-
-            async move {
-                tracing::info!("Starting Monitor in Polling mode");
-                Monitor::new(config, db, provider).run().await;
-            }
-        });
-
-        // Create faucet for sweeper
-        let sweeper_faucet = Arc::new(Faucet::new(
-            self.config.faucet_mnemonic.clone(),
-            provider.clone(),
-            &self.config.existential_deposit,
-        )?);
-
-        // Spawn Sweeper
-        tokio::spawn({
-            let config = self.config.clone();
-            let db = self.db.clone();
-            let wallet = self.wallet.clone();
-            let provider = provider.clone();
-            let faucet = sweeper_faucet;
-            async move {
-                tracing::info!("Starting Sweeper in Polling mode");
-                Sweeper::new(config, db, wallet, provider, faucet)
-                    .run()
-                    .await;
-            }
-        });
-
-        Ok(())
-    }
-}
-
-// WebSocket Provider implementation
-impl HotWalletService<alloy::pubsub::PubSubFrontend> {
-    /// Create a new HotWalletService with WebSocket provider from configuration
-    pub async fn new_ws(config: Config) -> anyhow::Result<Self> {
-        let db = Db::new(&config.database_url)?;
-        let wallet = Wallet::new(config.mnemonic.clone());
-
-        let url = match &config.provider_url {
-            ProviderUrl::Ws(url) => url,
-            _ => return Err(anyhow::anyhow!("Expected WebSocket provider URL")),
-        };
-
-        let provider = ProviderBuilder::new().on_ws(WsConnect::new(url)).await?;
-        let faucet = Faucet::new(
-            config.faucet_mnemonic.clone(),
-            provider.clone(),
-            &config.existential_deposit,
-        )?;
-
-        Ok(Self {
-            config,
-            db,
-            wallet,
-            faucet: Arc::new(faucet),
-            provider,
-        })
-    }
-
-    /// Start background services (Monitor and Sweeper) for WebSocket provider
-    /// Returns immediately after spawning the background tasks
-    pub async fn start_background_services(&self) -> anyhow::Result<()> {
-        let url = match &self.config.provider_url {
-            ProviderUrl::Ws(url) => url,
-            _ => return Err(anyhow::anyhow!("Expected WebSocket provider URL")),
-        };
-
-        let provider = ProviderBuilder::new().on_ws(WsConnect::new(url)).await?;
-
-        // Spawn Monitor
-        tokio::spawn({
-            let config = self.config.clone();
-            let db = self.db.clone();
-            let provider = provider.clone();
-            async move {
-                tracing::info!("Starting Monitor in Streaming mode");
-                Monitor::new(config, db, provider).run().await;
-            }
-        });
-
-        // Create faucet for sweeper
-        let sweeper_faucet = Arc::new(Faucet::new(
-            self.config.faucet_mnemonic.clone(),
-            provider.clone(),
-            &self.config.existential_deposit,
-        )?);
-
-        // Spawn Sweeper
-        tokio::spawn({
-            let config = self.config.clone();
-            let db = self.db.clone();
-            let wallet = self.wallet.clone();
-            let provider = provider.clone();
-            let faucet = sweeper_faucet;
-            async move {
-                tracing::info!("Starting Sweeper in Streaming mode");
-                Sweeper::new(config, db, wallet, provider, faucet)
-                    .run()
-                    .await;
-            }
-        });
-
-        Ok(())
-    }
-}
-
-/// Send webhook notification for faucet funding event
-/// registration_id: The original id used when registering the account
-/// address: The Polygon address (account_id in webhook)
-/// jwt_token: Optional JWT token for authorization header
-async fn send_faucet_funding_webhook(
-    db: &Db,
-    registration_id: &str,
-    address: &str,
-    tx_hash: &str,
-    success: bool,
-    error_message: Option<&str>,
-    jwt_token: Option<&str>,
-) -> anyhow::Result<()> {
-    use tracing::{error, info};
-
-    // Get the webhook URL using registration_id (the key in ACCOUNTS table)
-    let Some(webhook_url) = db.get_webhook_url(registration_id)? else {
-        error!(
-            "No webhook URL found for registration_id: {}",
-            registration_id
-        );
-        return Ok(());
-    };
-
-    let client = reqwest::Client::new();
-
-    let mut payload = serde_json::json!({
-        "event": "faucet_funding",
-        "account_id": address,
-        "registration_id": registration_id,
-        "success": success,
-        "id": format!("{}:funding", registration_id)
-    });
-
-    // Add tx_hash if funding was successful
-    if success && !tx_hash.is_empty() {
-        payload["tx_hash"] = serde_json::json!(tx_hash);
-    }
-
-    // Add error message if funding failed
-    if let Some(error) = error_message {
-        payload["error"] = serde_json::json!(error);
-    }
-
-    let mut request = client.post(&webhook_url).json(&payload);
-
-    // Add JWT authorization header if provided
-    if let Some(token) = jwt_token {
-        request = request.header("Authorization", format!("Bearer {}", token));
-    }
-
-    let res = request.send().await;
-
-    match res {
-        Ok(r) => info!(
-            "Faucet funding webhook sent to {}: status={}, registration_id={}",
-            webhook_url,
-            r.status(),
-            registration_id
-        ),
-        Err(e) => error!(
-            "Failed to send faucet funding webhook to {}: {:?}",
-            webhook_url, e
-        ),
-    }
-
-    Ok(())
 }

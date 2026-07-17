@@ -6,7 +6,10 @@
 # Database files
 *.db
 *.db-shm
-*.db-wal# Docker
+*.db-wal
+*.db.bak
+
+# Docker
 docker-compose.override.yml
 
 # Backups
@@ -14,3 +17,9 @@ backups/
 
 # Logs
 *.log
+.envrc
+chains.toml
+*.bak
+
+# One-off operational scripts containing real PII / account data
+scripts/retry_deposit_webhooks.sh

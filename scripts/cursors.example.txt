@@ -1,0 +1,5 @@
+# Per-chain monitor cursors (chain name + block number).
+# Used with: ./scripts/set_all_block_numbers.sh --file scripts/cursors.example.txt
+#
+polygon 89211738
+base 47864100
