@@ -12,7 +12,10 @@ use std::path::PathBuf;
     about = "One-shot (or --verify, repeatable) migration from evmhot's SQLite wallet.db to Postgres"
 )]
 struct Args {
-    #[arg(long, help = "Path to the source SQLite file (opened read-only, never modified)")]
+    #[arg(
+        long,
+        help = "Path to the source SQLite file (opened read-only, never modified)"
+    )]
     from: PathBuf,
     #[arg(long, help = "Destination Postgres connection string (postgres://...)")]
     to: String,
@@ -65,7 +68,10 @@ fn main() -> Result<()> {
     if args.verify {
         println!("Reading source snapshot: {}", args.from.display());
         let snapshot = read_sqlite_snapshot(&args.from)?;
-        println!("Verifying against destination: {}", mask_credentials(&args.to));
+        println!(
+            "Verifying against destination: {}",
+            mask_credentials(&args.to)
+        );
         let report = verify_migration(&snapshot, &mut client)?;
         if report.is_match() {
             println!("VERIFY OK: source and destination match on every checked field.");
@@ -73,16 +79,24 @@ fn main() -> Result<()> {
         }
         println!("VERIFY FAILED: {} mismatch(es):", report.mismatches.len());
         for m in &report.mismatches {
-            println!("  {}: source={} destination={}", m.field, m.source, m.destination);
+            println!(
+                "  {}: source={} destination={}",
+                m.field, m.source, m.destination
+            );
         }
         std::process::exit(1);
     }
 
-    println!("Ensuring destination schema exists: {}", mask_credentials(&args.to));
+    println!(
+        "Ensuring destination schema exists: {}",
+        mask_credentials(&args.to)
+    );
     ensure_postgres_schema(&mut client)?;
 
     if !args.force {
-        let accounts_count: i64 = client.query_one("SELECT COUNT(*) FROM accounts", &[])?.get(0);
+        let accounts_count: i64 = client
+            .query_one("SELECT COUNT(*) FROM accounts", &[])?
+            .get(0);
         if accounts_count > 0 {
             anyhow::bail!(
                 "destination already has {accounts_count} accounts; pass --force to top it up \
@@ -113,8 +127,14 @@ fn main() -> Result<()> {
         args.from.display(),
         mask_credentials(&args.to)
     );
-    println!("accounts: {} sqlite -> {} inserted", summary.accounts.0, summary.accounts.1);
-    println!("deposits: {} sqlite -> {} inserted", summary.deposits.0, summary.deposits.1);
+    println!(
+        "accounts: {} sqlite -> {} inserted",
+        summary.accounts.0, summary.accounts.1
+    );
+    println!(
+        "deposits: {} sqlite -> {} inserted",
+        summary.deposits.0, summary.deposits.1
+    );
     println!(
         "erc20_deposits: {} sqlite -> {} inserted",
         summary.erc20_deposits.0, summary.erc20_deposits.1

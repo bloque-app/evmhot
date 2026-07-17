@@ -114,14 +114,65 @@ fn connect_pg(url: &str, pool_size: Option<u32>, migrate_from_sqlite: Option<&st
 /// Writes a minimal-but-non-empty SQLite `wallet.db` (passes the
 /// empty-source migration guard) and returns the temp file handle (keep it
 /// alive for the duration of the test).
+///
+/// Seeds one representative row into *every* migrated table (not just
+/// `accounts`/`state`) so the bootstrap-migration integration test proves
+/// end-to-end correctness for `deposits`, `erc20_deposits`,
+/// `token_metadata`, `sweep_meta`, `sweep_failures`, and
+/// `webhook_deliveries` too -- previously only `accounts`/`state` were
+/// exercised through the real migration path in an automated test; the
+/// other six tables were only proven by the one-off manual production dry
+/// run.
 fn seed_sqlite_source(next_index: i64, block_cursor: (&str, i64)) -> NamedTempFile {
     let tmp = NamedTempFile::new().unwrap();
     let mut conn = RusqliteConnection::open(tmp.path()).unwrap();
     evm_hot_wallet::db::apply_pragmas_for_import(&conn).unwrap();
-    evm_hot_wallet::db::migrations().to_latest(&mut conn).unwrap();
+    evm_hot_wallet::db::migrations()
+        .to_latest(&mut conn)
+        .unwrap();
     conn.execute(
         "INSERT INTO accounts (id, derivation_index, address, webhook_url)
          VALUES ('seed-user', 0, '0xseed', 'https://example.com/webhook')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO deposits (chain, tx_hash, account_id, amount, status)
+         VALUES ('base', '0xdep1', 'seed-user', '100', 'detected')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO erc20_deposits
+         (chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status)
+         VALUES ('base', '0xerc1', 0, 'seed-user', '50', '0xtoken1', 'USDC', 'detected')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO token_metadata (chain, token_address, symbol, decimals, name)
+         VALUES ('base', '0xtoken1', 'USDC', 6, 'USD Coin')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sweep_meta (chain, tx_hash, log_index, sweep_tx_hash, zero_balance_retry_count)
+         VALUES ('base', '0xdep1', 0, '0xsweep1', 2)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sweep_failures (chain, tx_hash, log_index, consecutive_failure_count)
+         VALUES ('base', '0xdep1', 0, 3)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO webhook_deliveries
+         (id, event, registration_id, webhook_url, payload, status, attempt_count,
+          last_http_status, last_error, leased_until, updated_at)
+         VALUES ('wh1', 'deposit.detected', 'seed-user', 'https://example.com/webhook',
+                 '{\"foo\":\"bar\"}', 'pending', 1, 502, 'timeout', 1700000100, 1700000000)",
         [],
     )
     .unwrap();
@@ -133,11 +184,209 @@ fn seed_sqlite_source(next_index: i64, block_cursor: (&str, i64)) -> NamedTempFi
     conn.execute(
         "INSERT INTO state (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![format!("last_block:{}", block_cursor.0), block_cursor.1.to_string()],
+        rusqlite::params![
+            format!("last_block:{}", block_cursor.0),
+            block_cursor.1.to_string()
+        ],
     )
     .unwrap();
     drop(conn);
     tmp
+}
+
+/// Opens a plain (no-TLS) raw `postgres::Client` against a test container's
+/// URL, for asserting exact migrated row values with raw SQL -- the same
+/// style `sqlite_import::verify_migration` uses -- independent of any
+/// business-logic filtering the `Db` facade's higher-level methods apply
+/// (e.g. status filters), so this is a direct proof of what actually landed
+/// in the table.
+fn raw_pg_client(url: &str) -> postgres::Client {
+    postgres::Client::connect(url, postgres::NoTls)
+        .expect("failed to open raw verification connection to test Postgres container")
+}
+
+/// Asserts that every row `seed_sqlite_source` wrote into `deposits`,
+/// `erc20_deposits`, `token_metadata`, `sweep_meta`, `sweep_failures`, and
+/// `webhook_deliveries` landed in Postgres with the exact values from the
+/// SQLite source -- and that each table has exactly one row (proves a
+/// second bootstrap-migration attempt against an already-populated
+/// destination does not duplicate rows). `context` is included in panic
+/// messages to identify which call site (first vs. second connect) failed.
+fn assert_all_migrated_tables(url: &str, context: &str) {
+    let mut client = raw_pg_client(url);
+
+    let deposit = client
+        .query_one(
+            "SELECT account_id, amount, status FROM deposits WHERE chain = 'base' AND tx_hash = '0xdep1'",
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("{context}: deposits row missing or query failed: {e}"));
+    assert_eq!(
+        deposit.get::<_, String>(0),
+        "seed-user",
+        "{context}: deposits.account_id"
+    );
+    assert_eq!(
+        deposit.get::<_, String>(1),
+        "100",
+        "{context}: deposits.amount"
+    );
+    assert_eq!(
+        deposit.get::<_, String>(2),
+        "detected",
+        "{context}: deposits.status"
+    );
+    let deposit_count: i64 = client
+        .query_one("SELECT COUNT(*) FROM deposits WHERE chain = 'base'", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        deposit_count, 1,
+        "{context}: deposits must not be duplicated by a re-run"
+    );
+
+    let erc20 = client
+        .query_one(
+            "SELECT account_id, amount, token_address, token_symbol, status
+             FROM erc20_deposits WHERE chain = 'base' AND tx_hash = '0xerc1' AND log_index = 0",
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("{context}: erc20_deposits row missing or query failed: {e}"));
+    assert_eq!(
+        erc20.get::<_, String>(0),
+        "seed-user",
+        "{context}: erc20_deposits.account_id"
+    );
+    assert_eq!(
+        erc20.get::<_, String>(1),
+        "50",
+        "{context}: erc20_deposits.amount"
+    );
+    assert_eq!(
+        erc20.get::<_, String>(2),
+        "0xtoken1",
+        "{context}: erc20_deposits.token_address"
+    );
+    assert_eq!(
+        erc20.get::<_, String>(3),
+        "USDC",
+        "{context}: erc20_deposits.token_symbol"
+    );
+    assert_eq!(
+        erc20.get::<_, String>(4),
+        "detected",
+        "{context}: erc20_deposits.status"
+    );
+
+    let token = client
+        .query_one(
+            "SELECT symbol, decimals, name FROM token_metadata
+             WHERE chain = 'base' AND token_address = '0xtoken1'",
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("{context}: token_metadata row missing or query failed: {e}"));
+    assert_eq!(
+        token.get::<_, String>(0),
+        "USDC",
+        "{context}: token_metadata.symbol"
+    );
+    assert_eq!(
+        token.get::<_, i16>(1),
+        6,
+        "{context}: token_metadata.decimals"
+    );
+    assert_eq!(
+        token.get::<_, String>(2),
+        "USD Coin",
+        "{context}: token_metadata.name"
+    );
+
+    let sweep_meta = client
+        .query_one(
+            "SELECT sweep_tx_hash, zero_balance_retry_count FROM sweep_meta
+             WHERE chain = 'base' AND tx_hash = '0xdep1' AND log_index = 0",
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("{context}: sweep_meta row missing or query failed: {e}"));
+    assert_eq!(
+        sweep_meta.get::<_, String>(0),
+        "0xsweep1",
+        "{context}: sweep_meta.sweep_tx_hash"
+    );
+    assert_eq!(
+        sweep_meta.get::<_, i64>(1),
+        2,
+        "{context}: sweep_meta.zero_balance_retry_count"
+    );
+
+    let sweep_failure = client
+        .query_one(
+            "SELECT consecutive_failure_count FROM sweep_failures
+             WHERE chain = 'base' AND tx_hash = '0xdep1' AND log_index = 0",
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("{context}: sweep_failures row missing or query failed: {e}"));
+    assert_eq!(
+        sweep_failure.get::<_, i64>(0),
+        3,
+        "{context}: sweep_failures.consecutive_failure_count"
+    );
+
+    let webhook = client
+        .query_one(
+            "SELECT registration_id, webhook_url, payload, status, attempt_count,
+                    last_http_status, last_error, leased_until, updated_at
+             FROM webhook_deliveries WHERE id = 'wh1' AND event = 'deposit.detected'",
+            &[],
+        )
+        .unwrap_or_else(|e| {
+            panic!("{context}: webhook_deliveries row missing or query failed: {e}")
+        });
+    assert_eq!(
+        webhook.get::<_, String>(0),
+        "seed-user",
+        "{context}: webhook_deliveries.registration_id"
+    );
+    assert_eq!(
+        webhook.get::<_, String>(1),
+        "https://example.com/webhook",
+        "{context}: webhook_deliveries.webhook_url"
+    );
+    assert_eq!(
+        webhook.get::<_, String>(2),
+        "{\"foo\":\"bar\"}",
+        "{context}: webhook_deliveries.payload"
+    );
+    assert_eq!(
+        webhook.get::<_, String>(3),
+        "pending",
+        "{context}: webhook_deliveries.status"
+    );
+    assert_eq!(
+        webhook.get::<_, i64>(4),
+        1,
+        "{context}: webhook_deliveries.attempt_count"
+    );
+    assert_eq!(
+        webhook.get::<_, Option<i32>>(5),
+        Some(502),
+        "{context}: webhook_deliveries.last_http_status"
+    );
+    assert_eq!(
+        webhook.get::<_, Option<String>>(6),
+        Some("timeout".to_string()),
+        "{context}: webhook_deliveries.last_error"
+    );
+    assert_eq!(
+        webhook.get::<_, Option<i64>>(7),
+        Some(1700000100),
+        "{context}: webhook_deliveries.leased_until"
+    );
+    assert_eq!(
+        webhook.get::<_, i64>(8),
+        1700000000,
+        "{context}: webhook_deliveries.updated_at"
+    );
 }
 
 /// Shared behavior assertions run against a live `Db`, regardless of
@@ -148,14 +397,18 @@ fn seed_sqlite_source(next_index: i64, block_cursor: (&str, i64)) -> NamedTempFi
 fn assert_full_crud_cycle(db: &Db) {
     // Accounts / derivation index allocation.
     let (idx0, addr0, created0) = db
-        .register_account_auto("acct-a", "https://hook.example/a", |i| Ok(format!("0xaddr{i}")))
+        .register_account_auto("acct-a", "https://hook.example/a", |i| {
+            Ok(format!("0xaddr{i}"))
+        })
         .unwrap();
     assert_eq!(idx0, 0);
     assert_eq!(addr0, "0xaddr0");
     assert!(created0);
 
     let (idx1, addr1, created1) = db
-        .register_account_auto("acct-b", "https://hook.example/b", |i| Ok(format!("0xaddr{i}")))
+        .register_account_auto("acct-b", "https://hook.example/b", |i| {
+            Ok(format!("0xaddr{i}"))
+        })
         .unwrap();
     assert_eq!(idx1, 1);
     assert_eq!(addr1, "0xaddr1");
@@ -177,7 +430,11 @@ fn assert_full_crud_cycle(db: &Db) {
     );
     assert_eq!(
         db.get_account_by_id("acct-a").unwrap(),
-        Some((0, "0xaddr0".to_string(), "https://hook.example/a".to_string()))
+        Some((
+            0,
+            "0xaddr0".to_string(),
+            "https://hook.example/a".to_string()
+        ))
     );
     assert_eq!(
         db.get_webhook_url("acct-b").unwrap(),
@@ -185,10 +442,21 @@ fn assert_full_crud_cycle(db: &Db) {
     );
 
     // Native deposits.
-    assert!(db.record_deposit("base", "0xtx1", "acct-a", "1000").unwrap());
-    assert!(!db.record_deposit("base", "0xtx1", "acct-a", "1000").unwrap()); // dup is a no-op
+    assert!(db
+        .record_deposit("base", "0xtx1", "acct-a", "1000")
+        .unwrap());
+    assert!(!db
+        .record_deposit("base", "0xtx1", "acct-a", "1000")
+        .unwrap()); // dup is a no-op
     let detected = db.get_detected_deposits("base").unwrap();
-    assert_eq!(detected, vec![("0xtx1".to_string(), "acct-a".to_string(), "1000".to_string())]);
+    assert_eq!(
+        detected,
+        vec![(
+            "0xtx1".to_string(),
+            "acct-a".to_string(),
+            "1000".to_string()
+        )]
+    );
 
     db.mark_deposit_failed("base", "0xtx1").unwrap();
     assert!(db.retry_native_deposit("base", "0xtx1").unwrap());
@@ -204,7 +472,8 @@ fn assert_full_crud_cycle(db: &Db) {
     assert_eq!(db.get_last_processed_block("base").unwrap(), 150);
 
     // Token metadata.
-    db.store_token_metadata("base", "0xtoken1", "USDC", 6, "USD Coin").unwrap();
+    db.store_token_metadata("base", "0xtoken1", "USDC", 6, "USD Coin")
+        .unwrap();
     assert_eq!(
         db.get_token_metadata("base", "0xtoken1").unwrap(),
         Some(("USDC".to_string(), 6, "USD Coin".to_string()))
@@ -238,10 +507,20 @@ fn assert_full_crud_cycle(db: &Db) {
     assert!(db.retry_erc20_deposit("base", "0xtx3", 1).unwrap());
 
     // Sweep bookkeeping.
-    assert_eq!(db.increment_zero_balance_count("base", "0xtx3:1").unwrap(), 1);
-    assert_eq!(db.increment_zero_balance_count("base", "0xtx3:1").unwrap(), 2);
-    db.set_sweep_tx_hash_for_keys("base", &["0xtx3:1".to_string()], "0xsweep1").unwrap();
-    assert_eq!(db.increment_sweep_failure_count("base", "0xtx3:1").unwrap(), 1);
+    assert_eq!(
+        db.increment_zero_balance_count("base", "0xtx3:1").unwrap(),
+        1
+    );
+    assert_eq!(
+        db.increment_zero_balance_count("base", "0xtx3:1").unwrap(),
+        2
+    );
+    db.set_sweep_tx_hash_for_keys("base", &["0xtx3:1".to_string()], "0xsweep1")
+        .unwrap();
+    assert_eq!(
+        db.increment_sweep_failure_count("base", "0xtx3:1").unwrap(),
+        1
+    );
     assert_eq!(db.get_sweep_failure_count("base", "0xtx3:1").unwrap(), 1);
 
     // Deposit queue counts reflect the current mix of detected/failed rows.
@@ -258,7 +537,9 @@ fn assert_full_crud_cycle(db: &Db) {
     let pending = db.get_pending_webhook_delivery_keys(5, 10).unwrap();
     assert!(pending.contains(&("wh1".to_string(), "deposit".to_string())));
 
-    assert!(db.claim_webhook_delivery("wh1", "deposit", 9_999_999_999, 5).unwrap());
+    assert!(db
+        .claim_webhook_delivery("wh1", "deposit", 9_999_999_999, 5)
+        .unwrap());
     let attempts = db
         .record_webhook_attempt("wh1", "deposit", Some(500), Some("boom"), "failed")
         .unwrap();
@@ -313,9 +594,11 @@ fn postgres_concurrent_register_account_auto_allocates_distinct_sequential_indic
             let db = db.clone();
             std::thread::spawn(move || {
                 let (index, _address, created) = db
-                    .register_account_auto(&format!("concurrent-{i}"), "https://hook.example", |idx| {
-                        Ok(format!("0xconcurrent{idx}"))
-                    })
+                    .register_account_auto(
+                        &format!("concurrent-{i}"),
+                        "https://hook.example",
+                        |idx| Ok(format!("0xconcurrent{idx}")),
+                    )
                     .unwrap();
                 assert!(created);
                 index
@@ -337,7 +620,9 @@ fn postgres_concurrent_register_account_auto_allocates_distinct_sequential_indic
 #[test]
 fn postgres_pool_exhaustion_maps_to_write_queue_error() {
     if !docker_available() {
-        eprintln!("skipping postgres_pool_exhaustion_maps_to_write_queue_error: Docker not available");
+        eprintln!(
+            "skipping postgres_pool_exhaustion_maps_to_write_queue_error: Docker not available"
+        );
         return;
     }
     let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -374,10 +659,10 @@ fn postgres_pool_exhaustion_maps_to_write_queue_error() {
         "a second concurrent write against a pool of size 1 must fail while the first \
          write's transaction is in flight",
     );
-    let write_queue_err = err
-        .downcast_ref::<WriteQueueError>()
-        .expect("pool-exhaustion error must be a WriteQueueError (so api.rs's existing 503 \
-                 mapping keeps working unchanged on the Postgres path)");
+    let write_queue_err = err.downcast_ref::<WriteQueueError>().expect(
+        "pool-exhaustion error must be a WriteQueueError (so api.rs's existing 503 \
+                 mapping keeps working unchanged on the Postgres path)",
+    );
     assert!(
         matches!(write_queue_err, WriteQueueError::Timeout(_)),
         "expected WriteQueueError::Timeout, got: {write_queue_err:?}"
@@ -387,14 +672,19 @@ fn postgres_pool_exhaustion_maps_to_write_queue_error() {
 #[test]
 fn postgres_health_check_reflects_container_availability() {
     if !docker_available() {
-        eprintln!("skipping postgres_health_check_reflects_container_availability: Docker not available");
+        eprintln!(
+            "skipping postgres_health_check_reflects_container_availability: Docker not available"
+        );
         return;
     }
     let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let (container, url) = start_postgres();
     let db = connect_pg(&url, None, None);
 
-    assert!(db.writer_healthy(), "writer_healthy() must be true while the container is up");
+    assert!(
+        db.writer_healthy(),
+        "writer_healthy() must be true while the container is up"
+    );
 
     container.stop();
     // The pool's acquire timeout (5s) plus a little slack is enough for an
@@ -405,7 +695,10 @@ fn postgres_health_check_reflects_container_availability() {
         std::thread::sleep(Duration::from_millis(500));
         !db.writer_healthy()
     });
-    assert!(became_unhealthy, "writer_healthy() must become false once the container is stopped");
+    assert!(
+        became_unhealthy,
+        "writer_healthy() must become false once the container is stopped"
+    );
 
     container.start();
     // Docker (at least on Docker Desktop) can remap a dynamically-assigned
@@ -456,9 +749,14 @@ fn postgres_bootstrap_migration_runs_once_at_connect_and_is_idempotent() {
     let db1 = connect_pg(&url, None, Some(&sqlite_path));
     assert_eq!(
         db1.get_account_by_id("seed-user").unwrap(),
-        Some((0, "0xseed".to_string(), "https://example.com/webhook".to_string()))
+        Some((
+            0,
+            "0xseed".to_string(),
+            "https://example.com/webhook".to_string()
+        ))
     );
     assert_eq!(db1.get_last_processed_block("base").unwrap(), 12345);
+    assert_all_migrated_tables(&url, "after first (bootstrap) connect");
 
     // Registering a new account continues the migrated next_index counter
     // rather than restarting from 0 (the correctness-critical property: a
@@ -470,7 +768,10 @@ fn postgres_bootstrap_migration_runs_once_at_connect_and_is_idempotent() {
         })
         .unwrap();
     assert!(created);
-    assert_eq!(next_idx, 7, "next_index must continue from the migrated counter, not restart at 0");
+    assert_eq!(
+        next_idx, 7,
+        "next_index must continue from the migrated counter, not restart at 0"
+    );
 
     // Second connect against the SAME (now-populated) Postgres instance,
     // with EVM_MIGRATE_FROM_SQLITE still set: must be a no-op (the
@@ -478,7 +779,9 @@ fn postgres_bootstrap_migration_runs_once_at_connect_and_is_idempotent() {
     // already exist), not a duplicate-insert or an overwrite.
     let db2 = connect_pg(&url, None, Some(&sqlite_path));
     assert_eq!(
-        db2.get_account_by_id("post-migration-user").unwrap().map(|(idx, ..)| idx),
+        db2.get_account_by_id("post-migration-user")
+            .unwrap()
+            .map(|(idx, ..)| idx),
         Some(7),
         "re-running the bootstrap migration against an already-populated Postgres must not \
          disturb data written after the first migration"
@@ -490,6 +793,11 @@ fn postgres_bootstrap_migration_runs_once_at_connect_and_is_idempotent() {
         .unwrap();
     assert_eq!(idx_again, 7);
     assert!(!created_again);
+
+    // Re-running the bootstrap migration must be a true no-op for the other
+    // six tables too: still exactly the one seeded row each, not duplicated
+    // (which `ON CONFLICT DO NOTHING` should prevent) and not disturbed.
+    assert_all_migrated_tables(&url, "after second (idempotent) connect");
 }
 
 #[test]
@@ -508,16 +816,23 @@ fn postgres_bootstrap_migration_skips_cleanly_when_source_file_missing() {
     // freshly-seeded next_index=0 counter.
     let db = connect_pg(&url, None, Some("/nonexistent/path/wallet.db"));
     let (idx, _addr, created) = db
-        .register_account_auto("fresh-user", "https://hook.example", |idx| Ok(format!("0xfresh{idx}")))
+        .register_account_auto("fresh-user", "https://hook.example", |idx| {
+            Ok(format!("0xfresh{idx}"))
+        })
         .unwrap();
     assert!(created);
-    assert_eq!(idx, 0, "with no source file present, next_index must start from the fresh seed (0)");
+    assert_eq!(
+        idx, 0,
+        "with no source file present, next_index must start from the fresh seed (0)"
+    );
 }
 
 #[test]
 fn postgres_bootstrap_migration_skips_when_env_var_unset() {
     if !docker_available() {
-        eprintln!("skipping postgres_bootstrap_migration_skips_when_env_var_unset: Docker not available");
+        eprintln!(
+            "skipping postgres_bootstrap_migration_skips_when_env_var_unset: Docker not available"
+        );
         return;
     }
     let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -552,7 +867,9 @@ fn postgres_bootstrap_migration_rolls_back_on_empty_source_guard() {
     {
         let mut conn = RusqliteConnection::open(empty_source.path()).unwrap();
         evm_hot_wallet::db::apply_pragmas_for_import(&conn).unwrap();
-        evm_hot_wallet::db::migrations().to_latest(&mut conn).unwrap();
+        evm_hot_wallet::db::migrations()
+            .to_latest(&mut conn)
+            .unwrap();
     }
 
     set_pg_env(true, None, Some(empty_source.path().to_str().unwrap()));

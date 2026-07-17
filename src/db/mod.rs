@@ -496,9 +496,7 @@ impl Db {
     ) -> Result<u64> {
         match self.inner.as_ref() {
             DbInner::Sqlite(s) => s.record_webhook_attempt(id, event, http_status, error, status),
-            DbInner::Postgres(p) => {
-                p.record_webhook_attempt(id, event, http_status, error, status)
-            }
+            DbInner::Postgres(p) => p.record_webhook_attempt(id, event, http_status, error, status),
         }
     }
 

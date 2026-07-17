@@ -146,7 +146,8 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
 
     let mut snapshot = SqliteSnapshot::default();
 
-    let mut stmt = conn.prepare("SELECT id, derivation_index, address, webhook_url FROM accounts")?;
+    let mut stmt =
+        conn.prepare("SELECT id, derivation_index, address, webhook_url FROM accounts")?;
     let rows = stmt.query_map([], |r| {
         Ok(AccountRow {
             id: r.get(0)?,
@@ -157,7 +158,8 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
     })?;
     snapshot.accounts = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let mut stmt = conn.prepare("SELECT chain, tx_hash, account_id, amount, status FROM deposits")?;
+    let mut stmt =
+        conn.prepare("SELECT chain, tx_hash, account_id, amount, status FROM deposits")?;
     let rows = stmt.query_map([], |r| {
         Ok(DepositRow {
             chain: r.get(0)?,
@@ -214,8 +216,9 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
     })?;
     snapshot.sweep_meta = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let mut stmt = conn
-        .prepare("SELECT chain, tx_hash, log_index, consecutive_failure_count FROM sweep_failures")?;
+    let mut stmt = conn.prepare(
+        "SELECT chain, tx_hash, log_index, consecutive_failure_count FROM sweep_failures",
+    )?;
     let rows = stmt.query_map([], |r| {
         Ok(SweepFailureRow {
             chain: r.get(0)?,
@@ -326,7 +329,12 @@ pub fn migrate_snapshot_to_postgres(
             "INSERT INTO accounts (id, derivation_index, address, webhook_url)
              VALUES ($1, $2, $3, $4)
              ON CONFLICT (id) DO NOTHING",
-            &[&row.id, &row.derivation_index, &row.address, &row.webhook_url],
+            &[
+                &row.id,
+                &row.derivation_index,
+                &row.address,
+                &row.webhook_url,
+            ],
         )?;
         summary.accounts.1 += changes as usize;
     }
@@ -337,7 +345,13 @@ pub fn migrate_snapshot_to_postgres(
             "INSERT INTO deposits (chain, tx_hash, account_id, amount, status)
              VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (chain, tx_hash) DO NOTHING",
-            &[&row.chain, &row.tx_hash, &row.account_id, &row.amount, &row.status],
+            &[
+                &row.chain,
+                &row.tx_hash,
+                &row.account_id,
+                &row.amount,
+                &row.status,
+            ],
         )?;
         summary.deposits.1 += changes as usize;
     }
@@ -365,6 +379,18 @@ pub fn migrate_snapshot_to_postgres(
 
     summary.token_metadata.0 = snapshot.token_metadata.len();
     for row in &snapshot.token_metadata {
+        // `token_metadata.decimals` is `SMALLINT` (int2) in the Postgres
+        // schema -- matches `PostgresBackend::store_token_metadata`'s own
+        // `u8` parameter -- but SQLite has no fixed-width integer types, so
+        // `read_sqlite_snapshot` reads it as `i64`. ERC20 decimals always
+        // fit comfortably in i16 (never seen above 18), but check explicitly
+        // rather than truncating silently, same as `last_http_status` below.
+        let decimals = i16::try_from(row.decimals).with_context(|| {
+            format!(
+                "token_metadata[{}:{}].decimals={} does not fit in i16",
+                row.chain, row.token_address, row.decimals
+            )
+        })?;
         let changes = tx.execute(
             "INSERT INTO token_metadata (chain, token_address, symbol, decimals, name)
              VALUES ($1, $2, $3, $4, $5)
@@ -373,7 +399,7 @@ pub fn migrate_snapshot_to_postgres(
                 &row.chain,
                 &row.token_address,
                 &row.symbol,
-                &(row.decimals as i16),
+                &decimals,
                 &row.name,
             ],
         )?;
@@ -404,7 +430,12 @@ pub fn migrate_snapshot_to_postgres(
             "INSERT INTO sweep_failures (chain, tx_hash, log_index, consecutive_failure_count)
              VALUES ($1, $2, $3, $4)
              ON CONFLICT (chain, tx_hash, log_index) DO NOTHING",
-            &[&row.chain, &row.tx_hash, &row.log_index, &row.consecutive_failure_count],
+            &[
+                &row.chain,
+                &row.tx_hash,
+                &row.log_index,
+                &row.consecutive_failure_count,
+            ],
         )?;
         summary.sweep_failures.1 += changes as usize;
     }
@@ -561,7 +592,11 @@ pub fn verify_migration(snapshot: &SqliteSnapshot, client: &mut Client) -> Resul
             .query_opt("SELECT value FROM state WHERE key = $1", &[&key])?
             .map(|r| r.get(0));
         let actual = actual.and_then(|v| v.parse::<i64>().ok());
-        report.check(&format!("state.last_block:{chain}"), Some(expected_block), actual);
+        report.check(
+            &format!("state.last_block:{chain}"),
+            Some(expected_block),
+            actual,
+        );
     }
 
     // Spot-check up to 25 account addresses and their derivation indices —
@@ -576,7 +611,11 @@ pub fn verify_migration(snapshot: &SqliteSnapshot, client: &mut Client) -> Resul
             .map(|r| (r.get(0), r.get(1), r.get(2)));
         report.check(
             &format!("accounts[{}]", row.id),
-            Some((row.derivation_index, row.address.clone(), row.webhook_url.clone())),
+            Some((
+                row.derivation_index,
+                row.address.clone(),
+                row.webhook_url.clone(),
+            )),
             actual,
         );
     }
@@ -628,11 +667,8 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.execute(
-            "UPDATE state SET value = '1' WHERE key = 'next_index'",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE state SET value = '1' WHERE key = 'next_index'", [])
+            .unwrap();
         drop(conn);
         tmp
     }
@@ -644,10 +680,7 @@ mod tests {
         assert_eq!(snapshot.accounts.len(), 1);
         assert_eq!(snapshot.deposits.len(), 1);
         assert_eq!(snapshot.next_index(), Some(1));
-        assert_eq!(
-            snapshot.block_cursors(),
-            vec![("base".to_string(), 42)]
-        );
+        assert_eq!(snapshot.block_cursors(), vec![("base".to_string(), 42)]);
     }
 
     #[test]

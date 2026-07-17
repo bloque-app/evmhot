@@ -940,7 +940,9 @@ fn last_block_key(chain: &str) -> String {
 }
 
 fn postgres_already_populated(client: &mut Client) -> Result<bool> {
-    let accounts_count: i64 = client.query_one("SELECT COUNT(*) FROM accounts", &[])?.get(0);
+    let accounts_count: i64 = client
+        .query_one("SELECT COUNT(*) FROM accounts", &[])?
+        .get(0);
     let has_next_index = client
         .query_opt("SELECT 1 FROM state WHERE key = 'next_index'", &[])?
         .is_some();

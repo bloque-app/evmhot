@@ -2267,7 +2267,9 @@ mod tests {
         let hold = occupy_writer(&db, Duration::from_millis(400));
 
         let err = db
-            .register_account_auto("late_user", "https://example.com", |i| Ok(format!("0xaddr{i}")))
+            .register_account_auto("late_user", "https://example.com", |i| {
+                Ok(format!("0xaddr{i}"))
+            })
             .unwrap_err();
         assert!(
             matches!(
@@ -2290,7 +2292,9 @@ mod tests {
 
         // Retry returns the existing account: same index, same address.
         let (retry_index, retry_address, created) = db
-            .register_account_auto("late_user", "https://example.com", |i| Ok(format!("0xaddr{i}")))
+            .register_account_auto("late_user", "https://example.com", |i| {
+                Ok(format!("0xaddr{i}"))
+            })
             .unwrap();
         assert!(!created);
         assert_eq!(retry_index, index);
