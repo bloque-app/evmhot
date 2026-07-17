@@ -1,3 +1,4 @@
+use super::{DepositQueueCounts, Erc20Deposit, WebhookDeliveryRecord, WriteQueueError};
 use anyhow::{anyhow, Result};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -10,64 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DepositQueueCounts {
-    pub native_detected: u64,
-    pub native_failed: u64,
-    pub erc20_detected: u64,
-    pub erc20_failed: u64,
-}
-
-impl DepositQueueCounts {
-    pub fn has_pending(&self) -> bool {
-        self.native_detected > 0
-            || self.native_failed > 0
-            || self.erc20_detected > 0
-            || self.erc20_failed > 0
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WebhookDeliveryRecord {
-    pub id: String,
-    pub event: String,
-    pub registration_id: String,
-    pub webhook_url: String,
-    pub payload: String,
-    pub status: String,
-    pub attempt_count: u64,
-    pub last_http_status: Option<u16>,
-    pub last_error: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Erc20Deposit {
-    pub key: String,
-    pub account_id: String,
-    pub amount: String,
-    pub token_address: String,
-    pub token_symbol: String,
-}
-
-/// Typed errors for the write-queue fast paths, so HTTP layers can map
-/// queue-full / timeout conditions to 503s instead of generic 500s.
-#[derive(Debug, thiserror::Error)]
-pub enum WriteQueueError {
-    /// The interactive write lane is at capacity; the caller should fail fast
-    /// (HTTP 503) and let the client retry.
-    #[error("write queue full: interactive lane at capacity")]
-    QueueFull,
-    /// The write was enqueued but no result arrived within the configured
-    /// timeout. The command may still execute later (at-least-once); all
-    /// interactive writes are idempotent, so a retry is safe.
-    #[error("write timed out after {0:?} (command may still execute)")]
-    Timeout(Duration),
-    /// The dedicated writer thread is gone. In production this precedes a
-    /// process abort; only reads can still be served.
-    #[error("database writer is not running")]
-    WriterGone,
-}
 
 /// Result payload flowing back from the writer thread. Type-erased because a
 /// single command channel carries closures with heterogeneous return types.
@@ -346,9 +289,9 @@ pub fn normalize_db_path(database_url: &str) -> &str {
 
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
-        M::up(include_str!("../migrations/V1__initial.sql")),
-        M::up(include_str!("../migrations/V2__webhook_deliveries.sql")),
-        M::up(include_str!("../migrations/V3__next_index_counter.sql")),
+        M::up(include_str!("../../migrations/V1__initial.sql")),
+        M::up(include_str!("../../migrations/V2__webhook_deliveries.sql")),
+        M::up(include_str!("../../migrations/V3__next_index_counter.sql")),
     ])
 }
 
@@ -692,6 +635,12 @@ fn downcast_result<T: 'static>(boxed: Box<dyn Any + Send>) -> Result<T> {
 }
 
 impl Db {
+    /// Only reached directly by this module's own tests now — the crate's
+    /// `db::Db` facade calls `with_pool_size`/`with_options` directly since
+    /// the Postgres arm needs a different construction path. Kept `pub` and
+    /// unremoved so the pre-migration SQLite test suite below (moved here
+    /// verbatim) needs zero edits.
+    #[allow(dead_code)]
     pub fn new(database_url: &str) -> Result<Self> {
         Self::with_pool_size(database_url, DEFAULT_READ_POOL_MAX_SIZE)
     }
@@ -759,6 +708,10 @@ impl Db {
     /// worker thread happens to run the call, which can starve everything
     /// else on that runtime (see the monitor/sweeper/webhook callers). `Db`
     /// is a cheap `Clone`, so this just moves a clone onto `spawn_blocking`.
+    /// Superseded at the crate boundary by `db::Db::blocking` (identical
+    /// logic, generic over either backend); kept here for parity in case
+    /// this module's own tests ever need it directly.
+    #[allow(dead_code)]
     pub async fn blocking<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Db) -> Result<T> + Send + 'static,
@@ -946,6 +899,10 @@ impl Db {
         .map_err(Into::into)
     }
 
+    /// Superseded at the crate boundary by `db::Db::get_account_by_address`,
+    /// which calls the dispatch-level `get_registration_id_by_address`
+    /// directly rather than round-tripping through this alias.
+    #[allow(dead_code)]
     pub fn get_account_by_address(&self, address: &str) -> Result<Option<String>> {
         self.get_registration_id_by_address(address)
     }
@@ -2310,7 +2267,9 @@ mod tests {
         let hold = occupy_writer(&db, Duration::from_millis(400));
 
         let err = db
-            .register_account_auto("late_user", "https://example.com", |i| Ok(format!("0xaddr{i}")))
+            .register_account_auto("late_user", "https://example.com", |i| {
+                Ok(format!("0xaddr{i}"))
+            })
             .unwrap_err();
         assert!(
             matches!(
@@ -2333,7 +2292,9 @@ mod tests {
 
         // Retry returns the existing account: same index, same address.
         let (retry_index, retry_address, created) = db
-            .register_account_auto("late_user", "https://example.com", |i| Ok(format!("0xaddr{i}")))
+            .register_account_auto("late_user", "https://example.com", |i| {
+                Ok(format!("0xaddr{i}"))
+            })
             .unwrap();
         assert!(!created);
         assert_eq!(retry_index, index);
@@ -2694,8 +2655,8 @@ mod tests {
             let mut conn = Connection::open(&path).unwrap();
             apply_pragmas(&conn).unwrap();
             Migrations::new(vec![
-                M::up(include_str!("../migrations/V1__initial.sql")),
-                M::up(include_str!("../migrations/V2__webhook_deliveries.sql")),
+                M::up(include_str!("../../migrations/V1__initial.sql")),
+                M::up(include_str!("../../migrations/V2__webhook_deliveries.sql")),
             ])
             .to_latest(&mut conn)
             .unwrap();
