@@ -6,8 +6,9 @@ use axum::{
     Router,
 };
 use evm_hot_wallet::{
-    HotWalletService, RegisterRequest, RegisterResponse, RetrySweepRequest, RetrySweepResponse,
-    RetryWebhookRequest, RetryWebhookResponse, VerifyTransferRequest, VerifyTransferResponse,
+    db::WriteQueueError, HotWalletService, RegisterRequest, RegisterResponse, RetrySweepRequest,
+    RetrySweepResponse, RetryWebhookRequest, RetryWebhookResponse, VerifyTransferRequest,
+    VerifyTransferResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -69,7 +70,17 @@ async fn register(
 ) -> Result<Json<RegisterResponse>, ApiError> {
     match state.service.register(payload).await {
         Ok(response) => Ok(Json(response)),
-        Err(e) => Err(ApiError::Internal(format!("Failed to register: {}", e))),
+        Err(e) => Err(map_write_error(e, "Failed to register")),
+    }
+}
+
+/// Maps write-queue saturation/timeout errors to 503 (retryable, the write
+/// path is overloaded or down) instead of a generic 500.
+fn map_write_error(e: anyhow::Error, context: &str) -> ApiError {
+    if e.downcast_ref::<WriteQueueError>().is_some() {
+        ApiError::ServiceUnavailable(format!("{}: {}", context, e))
+    } else {
+        ApiError::Internal(format!("{}: {}", context, e))
     }
 }
 
@@ -107,7 +118,8 @@ async fn set_block_number(
     state
         .service
         .set_block_number(&payload.chain, payload.block_number)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .await
+        .map_err(|e| map_write_error(e, "Failed to set block number"))?;
     Ok(Json(BlockNumberResponse {
         chain: payload.chain,
         block_number: payload.block_number,
@@ -139,8 +151,9 @@ async fn retry_sweeps(
     state
         .service
         .retry_sweep(payload)
+        .await
         .map(Json)
-        .map_err(|e| ApiError::Internal(e.to_string()))
+        .map_err(|e| map_write_error(e, "Failed to retry sweep"))
 }
 
 async fn retry_webhooks(
@@ -149,14 +162,19 @@ async fn retry_webhooks(
     Json(payload): Json<RetryWebhookRequest>,
 ) -> Result<Json<RetryWebhookResponse>, ApiError> {
     authorize_admin(&state, &headers)?;
-    state.service.retry_webhook(payload).map(Json).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("No failed webhook delivery found") {
-            ApiError::NotFound(msg)
-        } else {
-            ApiError::Internal(msg)
-        }
-    })
+    state
+        .service
+        .retry_webhook(payload)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("No failed webhook delivery found") {
+                ApiError::NotFound(msg)
+            } else {
+                map_write_error(e, "Failed to retry webhook")
+            }
+        })
 }
 
 #[derive(Debug)]
@@ -164,6 +182,7 @@ enum ApiError {
     Internal(String),
     Unauthorized(String),
     NotFound(String),
+    ServiceUnavailable(String),
 }
 
 impl IntoResponse for ApiError {
@@ -172,6 +191,7 @@ impl IntoResponse for ApiError {
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
         };
 
         (status, message).into_response()

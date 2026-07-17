@@ -154,15 +154,25 @@ impl HotWalletService {
     }
 
     pub async fn health(&self) -> anyhow::Result<String> {
+        if !self.db.writer_healthy() {
+            return Err(anyhow::anyhow!(
+                "database writer is not running; writes are impossible"
+            ));
+        }
         let names: Vec<_> = self.chain_names();
         Ok(format!("OK (chains: {})", names.join(", ")))
     }
 
-    pub fn set_block_number(&self, chain: &str, block_number: u64) -> anyhow::Result<()> {
+    /// Interactive-lane write routed through `Db::blocking` so this HTTP path
+    /// never blocks a Tokio worker thread on the write queue.
+    pub async fn set_block_number(&self, chain: &str, block_number: u64) -> anyhow::Result<()> {
         if self.config.chain(chain).is_none() {
             return Err(anyhow::anyhow!("Unknown chain: {chain}"));
         }
-        self.db.set_last_processed_block(chain, block_number)
+        let chain = chain.to_string();
+        self.db
+            .blocking(move |db| db.set_last_processed_block_priority(&chain, block_number))
+            .await
     }
 
     pub fn get_block_number(&self, chain: &str) -> anyhow::Result<u64> {
@@ -172,15 +182,23 @@ impl HotWalletService {
         self.db.get_last_processed_block(chain)
     }
 
-    pub fn retry_sweep(&self, request: RetrySweepRequest) -> anyhow::Result<RetrySweepResponse> {
+    /// Interactive-lane write routed through `Db::blocking` so this HTTP path
+    /// never blocks a Tokio worker thread on the write queue.
+    pub async fn retry_sweep(
+        &self,
+        request: RetrySweepRequest,
+    ) -> anyhow::Result<RetrySweepResponse> {
         if self.config.chain(&request.chain).is_none() {
             return Err(anyhow::anyhow!("Unknown chain: {}", request.chain));
         }
 
         if let Some(log_index) = request.log_index {
-            let retried =
-                self.db
-                    .retry_erc20_deposit(&request.chain, &request.tx_hash, log_index)?;
+            let retried = self
+                .db
+                .blocking(move |db| {
+                    db.retry_erc20_deposit(&request.chain, &request.tx_hash, log_index)
+                })
+                .await?;
             Ok(RetrySweepResponse {
                 retried,
                 token_type: "erc20".to_string(),
@@ -188,7 +206,8 @@ impl HotWalletService {
         } else {
             let retried = self
                 .db
-                .retry_native_deposit(&request.chain, &request.tx_hash)?;
+                .blocking(move |db| db.retry_native_deposit(&request.chain, &request.tx_hash))
+                .await?;
             Ok(RetrySweepResponse {
                 retried,
                 token_type: "native".to_string(),
@@ -196,13 +215,18 @@ impl HotWalletService {
         }
     }
 
-    pub fn retry_webhook(
+    /// Interactive-lane write routed through `Db::blocking` so this HTTP path
+    /// never blocks a Tokio worker thread on the write queue.
+    pub async fn retry_webhook(
         &self,
         request: RetryWebhookRequest,
     ) -> anyhow::Result<RetryWebhookResponse> {
+        let id = request.id.clone();
+        let event = request.event.clone();
         let retried = self
             .db
-            .retry_webhook_delivery(&request.id, &request.event)?;
+            .blocking(move |db| db.retry_webhook_delivery(&id, &event))
+            .await?;
         if !retried {
             return Err(anyhow::anyhow!(
                 "No failed webhook delivery found for id={} event={}",
@@ -516,9 +540,15 @@ impl HotWalletService {
     }
 
     /// Register a new account. Address derivation is chain-agnostic; no faucet funding at registration.
+    ///
+    /// The derivation index is allocated from a persisted sequential counter
+    /// inside a single atomic writer command (P0 collision fix, replacing the
+    /// old `DefaultHasher`-derived index that had birthday collisions at
+    /// ~46k accounts and was unstable across Rust versions). The read-side
+    /// existing-account check below is only a fast path; the authoritative
+    /// check happens again inside the write transaction, so a re-register
+    /// race can never allocate a second index for the same id.
     pub async fn register(&self, request: RegisterRequest) -> anyhow::Result<RegisterResponse> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
         use tracing::info;
 
         let existing = {
@@ -536,27 +566,30 @@ impl HotWalletService {
             });
         }
 
-        let mut hasher = DefaultHasher::new();
-        request.id.hash(&mut hasher);
-        let hash = hasher.finish();
-        let index = (hash & 0x7FFFFFFF) as u32;
-
-        let address = self.wallet.derive_address(index)?;
-        let address_str = address.to_string();
-
-        {
+        let (index, address_str, created) = {
             let id = request.id.clone();
-            let addr = address_str.clone();
             let webhook_url = request.webhook_url.clone();
+            let wallet = self.wallet.clone();
             self.db
-                .blocking(move |db| db.register_account(&id, index, &addr, &webhook_url))
-                .await?;
-        }
+                .blocking(move |db| {
+                    db.register_account_auto(&id, &webhook_url, move |index| {
+                        Ok(wallet.derive_address(index)?.to_string())
+                    })
+                })
+                .await?
+        };
 
-        info!(
-            "Registered account {} with address {} (index: {})",
-            request.id, address_str, index
-        );
+        if created {
+            info!(
+                "Registered account {} with address {} (index: {})",
+                request.id, address_str, index
+            );
+        } else {
+            info!(
+                "Account {} already exists with address {}",
+                request.id, address_str
+            );
+        }
 
         Ok(RegisterResponse {
             address: address_str,
