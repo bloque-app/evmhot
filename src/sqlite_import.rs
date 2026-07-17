@@ -411,6 +411,22 @@ pub fn migrate_snapshot_to_postgres(
 
     summary.webhook_deliveries.0 = snapshot.webhook_deliveries.len();
     for row in &snapshot.webhook_deliveries {
+        // `last_http_status` is `webhook_deliveries.last_http_status INTEGER`
+        // (int4) in the Postgres schema -- matches `PostgresBackend`'s own
+        // reads/writes of this column (`Option<i32>`) -- but SQLite has no
+        // fixed-width integer types, so `read_sqlite_snapshot` reads it as
+        // `Option<i64>`. HTTP status codes always fit in i32; cast at the
+        // insert boundary rather than widening the column to BIGINT.
+        let last_http_status = row
+            .last_http_status
+            .map(i32::try_from)
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "webhook_deliveries[{}:{}].last_http_status={:?} does not fit in i32",
+                    row.id, row.event, row.last_http_status
+                )
+            })?;
         let changes = tx.execute(
             "INSERT INTO webhook_deliveries
              (id, event, registration_id, webhook_url, payload, status, attempt_count,
@@ -425,7 +441,7 @@ pub fn migrate_snapshot_to_postgres(
                 &row.payload,
                 &row.status,
                 &row.attempt_count,
-                &row.last_http_status,
+                &last_http_status,
                 &row.last_error,
                 &row.leased_until,
                 &row.updated_at,
