@@ -1808,6 +1808,7 @@ async fn test_admin_retry_webhooks_resets_and_notifies() {
             id: "base:0xabc:120".to_string(),
             event: "deposit_swept".to_string(),
         })
+        .await
         .unwrap();
     assert!(response.retried);
     assert_eq!(response.status, "pending");
@@ -2241,12 +2242,12 @@ fn test_retry_sweep_service_requeues_failed_erc20_deposit() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let service = rt.block_on(HotWalletService::new(config)).unwrap();
 
-    let response = service
-        .retry_sweep(RetrySweepRequest {
+    let response = rt
+        .block_on(service.retry_sweep(RetrySweepRequest {
             chain: TEST_CHAIN.to_string(),
             tx_hash: "0xabc".to_string(),
             log_index: Some(120),
-        })
+        }))
         .unwrap();
 
     assert!(response.retried);
@@ -2627,6 +2628,54 @@ async fn test_register_does_not_fund_at_registration() {
         .unwrap();
 
     assert!(response.funding_tx.is_none());
+}
+
+/// P0 collision fix: registers allocate sequential derivation indices from
+/// the persisted counter (no more hash-derived indices), every account gets
+/// a distinct address, and re-registering returns the existing address.
+#[tokio::test]
+async fn test_register_allocates_sequential_indices_and_is_idempotent() {
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let config = test_config(db_file.path().to_str().unwrap(), rpc_server.uri());
+    let wallet = Wallet::new(config.mnemonic.clone());
+    let service = HotWalletService::new(config).await.unwrap();
+
+    let mut addresses = std::collections::HashSet::new();
+    for i in 0..5 {
+        let response = service
+            .register(RegisterRequest {
+                id: format!("seq_user_{i}"),
+                webhook_url: "http://localhost/webhook".to_string(),
+            })
+            .await
+            .unwrap();
+        // Sequential allocation: account i gets derivation index i.
+        assert_eq!(response.address, wallet.derive_address(i).unwrap().to_string());
+        assert!(addresses.insert(response.address));
+    }
+
+    // Re-register returns the existing address without burning an index.
+    let again = service
+        .register(RegisterRequest {
+            id: "seq_user_2".to_string(),
+            webhook_url: "http://localhost/webhook".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        again.address,
+        wallet.derive_address(2).unwrap().to_string()
+    );
+
+    let next = service
+        .register(RegisterRequest {
+            id: "seq_user_next".to_string(),
+            webhook_url: "http://localhost/webhook".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(next.address, wallet.derive_address(5).unwrap().to_string());
 }
 
 #[test]
