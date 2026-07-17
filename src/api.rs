@@ -103,7 +103,8 @@ async fn get_block_number(
 ) -> Result<Json<BlockNumberResponse>, ApiError> {
     let block_number = state
         .service
-        .get_block_number(&query.chain)
+        .get_block_number_async(&query.chain)
+        .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(BlockNumberResponse {
         chain: query.chain,

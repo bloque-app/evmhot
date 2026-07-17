@@ -155,7 +155,17 @@ impl HotWalletService {
     }
 
     pub async fn health(&self) -> anyhow::Result<String> {
-        if !self.db.writer_healthy() {
+        // `writer_healthy()` is cheap/non-blocking on the SQLite arm (just
+        // checks the writer thread's status flag) but the Postgres arm runs
+        // a live `SELECT 1` through the sync client pool (decision D3) —
+        // route through `spawn_blocking` so this async handler never calls
+        // blocking network I/O directly on a Tokio worker thread (same
+        // "runtime within a runtime" hazard as `Db::with_pool_size`).
+        let db = self.db.clone();
+        let healthy = tokio::task::spawn_blocking(move || db.writer_healthy())
+            .await
+            .unwrap_or(false);
+        if !healthy {
             return Err(anyhow::anyhow!(
                 "database writer is not running; writes are impossible"
             ));
@@ -176,11 +186,27 @@ impl HotWalletService {
             .await
     }
 
+    /// Kept sync in signature for API-compat with existing call sites, but
+    /// internally this must never be invoked directly from an async Tokio
+    /// worker thread — see the `spawn_blocking` note on `health()` above.
+    /// The `api.rs` handler is responsible for calling this off-runtime
+    /// (via `get_block_number_async`).
     pub fn get_block_number(&self, chain: &str) -> anyhow::Result<u64> {
         if self.config.chain(chain).is_none() {
             return Err(anyhow::anyhow!("Unknown chain: {chain}"));
         }
         self.db.get_last_processed_block(chain)
+    }
+
+    pub async fn get_block_number_async(&self, chain: &str) -> anyhow::Result<u64> {
+        if self.config.chain(chain).is_none() {
+            return Err(anyhow::anyhow!("Unknown chain: {chain}"));
+        }
+        let db = self.db.clone();
+        let chain = chain.to_string();
+        tokio::task::spawn_blocking(move || db.get_last_processed_block(&chain))
+            .await
+            .map_err(|e| anyhow::anyhow!("get_block_number task panicked or was cancelled: {e}"))?
     }
 
     /// Interactive-lane write routed through `Db::blocking` so this HTTP path
@@ -243,7 +269,24 @@ impl HotWalletService {
     }
 
     pub async fn new(config: Config) -> anyhow::Result<Self> {
-        let db = Db::with_pool_size(&config.database_url, config.db_read_pool_size)?;
+        // `Db::with_pool_size` is synchronous and, for the Postgres backend,
+        // uses the sync `postgres` crate under the hood. That crate drives
+        // its connections via an internally-owned Tokio `Runtime` and calls
+        // `Runtime::block_on` on it for every request *and* on connection
+        // drop/close — which panics ("Cannot start a runtime from within a
+        // runtime") if called directly from a thread that already has an
+        // async runtime entered, which every `main`-task call site does
+        // under `#[tokio::main]`. Routing through `spawn_blocking` (a plain
+        // thread-pool thread with no ambient runtime context) avoids this;
+        // every other `Db` call already goes through `Db::blocking()` for
+        // the same reason.
+        let database_url = config.database_url.clone();
+        let db_read_pool_size = config.db_read_pool_size;
+        let db = tokio::task::spawn_blocking(move || {
+            Db::with_pool_size(&database_url, db_read_pool_size)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Db init task panicked or was cancelled: {e}"))??;
         let wallet = Wallet::new(config.mnemonic.clone());
 
         let mut chains = Vec::with_capacity(config.chains.len());
