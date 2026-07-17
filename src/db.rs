@@ -98,6 +98,11 @@ pub struct WriterConfig {
     /// Max background commands grouped into one transaction
     /// (`EVM_BACKGROUND_BATCH_SIZE`, default 50).
     pub batch_size: usize,
+    /// Minimum time between opportunistic runtime `wal_checkpoint(PASSIVE)`
+    /// attempts (`EVM_CHECKPOINT_INTERVAL_SECS`, default 30). Keeps the WAL
+    /// from growing unbounded under sustained load without adding a
+    /// checkpoint after every single background batch.
+    pub checkpoint_interval: Duration,
     /// Abort the process if the writer thread panics (always true in
     /// production; disabled only by writer-death unit tests).
     pub abort_on_panic: bool,
@@ -110,6 +115,7 @@ impl Default for WriterConfig {
             interactive_capacity: 64,
             background_capacity: 2048,
             batch_size: 50,
+            checkpoint_interval: Duration::from_secs(30),
             abort_on_panic: true,
         }
     }
@@ -135,6 +141,10 @@ impl WriterConfig {
             ),
             background_capacity: env_parse("EVM_BACKGROUND_QUEUE_CAPACITY", d.background_capacity),
             batch_size: env_parse("EVM_BACKGROUND_BATCH_SIZE", d.batch_size).max(1),
+            checkpoint_interval: Duration::from_secs(env_parse(
+                "EVM_CHECKPOINT_INTERVAL_SECS",
+                d.checkpoint_interval.as_secs(),
+            )),
             abort_on_panic: true,
         }
     }
@@ -368,6 +378,117 @@ pub fn apply_pragmas_for_import(conn: &Connection) -> Result<()> {
     apply_pragmas(conn).map_err(Into::into)
 }
 
+/// Result columns of `PRAGMA wal_checkpoint(..)`: `busy` is non-zero if the
+/// checkpoint could not fully complete because of a concurrent reader/writer,
+/// `log_frames` is the WAL size in frames at the time of the call, and
+/// `checkpointed_frames` is how many of those were moved into the main
+/// database file (for `TRUNCATE`, a fully successful checkpoint truncates the
+/// WAL to zero afterward; for `PASSIVE`, only what could be moved without
+/// blocking is).
+struct WalCheckpointResult {
+    busy: i64,
+    log_frames: i64,
+    checkpointed_frames: i64,
+}
+
+fn run_wal_checkpoint(conn: &Connection, mode: &str) -> rusqlite::Result<WalCheckpointResult> {
+    conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
+        Ok(WalCheckpointResult {
+            busy: row.get(0)?,
+            log_frames: row.get(1)?,
+            checkpointed_frames: row.get(2)?,
+        })
+    })
+}
+
+/// Size in bytes of the `-wal` sidecar file, if present. `None` once the WAL
+/// has been fully checkpointed away (SQLite may delete or zero it) or if the
+/// path can't be stat'd for any other reason — purely informational logging,
+/// never treated as an error.
+fn wal_file_size_bytes(db_path: &str) -> Option<u64> {
+    std::fs::metadata(format!("{db_path}-wal"))
+        .ok()
+        .map(|m| m.len())
+}
+
+/// Forces a full checkpoint before the writer starts serving traffic, so
+/// every restart begins from a small WAL regardless of how large it grew in
+/// the previous run. Without this, restarting alone does not help: SQLite
+/// simply reopens the same oversized `-wal` file and resumes fighting
+/// auto-checkpoint attempts against it on every commit (the root cause of the
+/// 2026-07 write-queue-saturation incident — see docs/fix-p0-* history).
+fn checkpoint_startup(conn: &Connection, db_path: &str) -> Result<()> {
+    let before_bytes = wal_file_size_bytes(db_path);
+    let result = run_wal_checkpoint(conn, "TRUNCATE")?;
+    let after_bytes = wal_file_size_bytes(db_path);
+    tracing::info!(
+        wal_bytes_before = ?before_bytes,
+        wal_bytes_after = ?after_bytes,
+        busy = result.busy,
+        log_frames = result.log_frames,
+        checkpointed_frames = result.checkpointed_frames,
+        "startup WAL checkpoint complete"
+    );
+    if result.busy != 0 {
+        tracing::warn!(
+            log_frames = result.log_frames,
+            checkpointed_frames = result.checkpointed_frames,
+            "startup WAL checkpoint did not fully complete (busy); WAL may still be large"
+        );
+    }
+    Ok(())
+}
+
+/// Opportunistic, non-blocking runtime checkpoint: called from the writer
+/// thread after a background batch commits. Only runs when nothing
+/// interactive is waiting and at least `interval` has passed since the last
+/// attempt, so it never competes with request latency and never runs on
+/// every single batch. `PASSIVE` mode never blocks concurrent readers or
+/// writers, so it's safe to call from the single writer thread with no extra
+/// locking.
+///
+/// Returns the checkpoint outcome when an attempt was actually made (mainly
+/// so tests can assert on it deterministically); production callers ignore
+/// it. Note `PASSIVE` never truncates the physical `-wal` file — unlike
+/// `TRUNCATE`, its "before/after WAL bytes" log fields are expected to be
+/// equal even on a fully successful checkpoint; `log_frames`/
+/// `checkpointed_frames` are the meaningful signal here instead.
+fn maybe_checkpoint(
+    conn: &Connection,
+    queue: &WriteQueue,
+    db_path: &str,
+    interval: Duration,
+    last_checkpoint: &mut Instant,
+) -> Option<WalCheckpointResult> {
+    if queue.has_interactive() || last_checkpoint.elapsed() < interval {
+        return None;
+    }
+    *last_checkpoint = Instant::now();
+
+    let before_bytes = wal_file_size_bytes(db_path);
+    match run_wal_checkpoint(conn, "PASSIVE") {
+        Ok(result) => {
+            let after_bytes = wal_file_size_bytes(db_path);
+            tracing::info!(
+                wal_bytes_before = ?before_bytes,
+                wal_bytes_after = ?after_bytes,
+                busy = result.busy,
+                log_frames = result.log_frames,
+                checkpointed_frames = result.checkpointed_frames,
+                "opportunistic runtime WAL checkpoint"
+            );
+            Some(result)
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "opportunistic runtime WAL checkpoint failed"
+            );
+            None
+        }
+    }
+}
+
 /// Parse `"0xtx:42"` -> (`0xtx`, 42). Bare `"0xtx"` -> (`0xtx`, 0).
 fn parse_local_key(local_key: &str) -> Result<(String, i64)> {
     if let Some((tx, idx)) = local_key.rsplit_once(':') {
@@ -389,7 +510,7 @@ const DEFAULT_READ_POOL_MAX_SIZE: u32 = 10;
 
 /// Spawns the dedicated writer thread that exclusively owns the write
 /// `Connection`. Returns the cloneable handle used by `Db`.
-fn spawn_writer(conn: Connection, cfg: WriterConfig) -> WriterHandle {
+fn spawn_writer(conn: Connection, db_path: String, cfg: WriterConfig) -> WriterHandle {
     let queue = Arc::new(WriteQueue::new(
         cfg.interactive_capacity,
         cfg.background_capacity,
@@ -399,13 +520,20 @@ fn spawn_writer(conn: Connection, cfg: WriterConfig) -> WriterHandle {
     let thread_queue = Arc::clone(&queue);
     let thread_healthy = Arc::clone(&healthy);
     let batch_size = cfg.batch_size;
+    let checkpoint_interval = cfg.checkpoint_interval;
     let abort_on_panic = cfg.abort_on_panic;
 
     std::thread::Builder::new()
         .name("evmhot-sqlite-writer".to_string())
         .spawn(move || {
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                writer_loop(&conn, &thread_queue, batch_size);
+                writer_loop(
+                    &conn,
+                    &thread_queue,
+                    batch_size,
+                    &db_path,
+                    checkpoint_interval,
+                );
             }));
             let graceful = thread_queue.is_shutting_down() && outcome.is_ok();
             thread_healthy.store(false, Ordering::SeqCst);
@@ -437,11 +565,28 @@ fn spawn_writer(conn: Connection, cfg: WriterConfig) -> WriterHandle {
 /// background commands are grouped into batched transactions (fewer commits
 /// means fewer WAL appends, which matters on EFS where each fsync is a
 /// network round-trip).
-fn writer_loop(conn: &Connection, queue: &WriteQueue, batch_size: usize) {
+fn writer_loop(
+    conn: &Connection,
+    queue: &WriteQueue,
+    batch_size: usize,
+    db_path: &str,
+    checkpoint_interval: Duration,
+) {
+    // Owned by this thread alone (the writer), so no locking is needed even
+    // though it's mutated on every background batch.
+    let mut last_checkpoint = Instant::now();
     while let Some((cmd, lane)) = queue.pop_blocking() {
         match lane {
             Lane::Interactive => execute_interactive(conn, queue, cmd),
-            Lane::Background => run_background_batch(conn, queue, cmd, batch_size),
+            Lane::Background => run_background_batch(
+                conn,
+                queue,
+                cmd,
+                batch_size,
+                db_path,
+                checkpoint_interval,
+                &mut last_checkpoint,
+            ),
         }
     }
 }
@@ -477,6 +622,9 @@ fn run_background_batch(
     queue: &WriteQueue,
     first: WriteCommand,
     batch_size: usize,
+    db_path: &str,
+    checkpoint_interval: Duration,
+    last_checkpoint: &mut Instant,
 ) {
     if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
         // busy_timeout exhausted or similar: fall back to executing this one
@@ -516,6 +664,7 @@ fn run_background_batch(
             for (cmd, result) in executed {
                 let _ = cmd.reply.send(result);
             }
+            maybe_checkpoint(conn, queue, db_path, checkpoint_interval, last_checkpoint);
         }
         Err(_) => {
             let _ = conn.execute_batch("ROLLBACK");
@@ -573,6 +722,7 @@ impl Db {
         let mut write_conn = Connection::open(path)?;
         apply_pragmas(&write_conn)?;
         migrations().to_latest(&mut write_conn)?;
+        checkpoint_startup(&write_conn, path)?;
 
         let manager = SqliteConnectionManager::file(path).with_init(|c| apply_pragmas(&*c));
         // Explicit, short connection_timeout: r2d2's default is 30s, which
@@ -588,7 +738,7 @@ impl Db {
             .build(manager)?;
 
         Ok(Self {
-            writer: spawn_writer(write_conn, writer_config),
+            writer: spawn_writer(write_conn, path.to_string(), writer_config),
             read: read_pool,
         })
     }
@@ -1837,6 +1987,269 @@ mod tests {
             .query_row("PRAGMA synchronous", [], |row| row.get(0))
             .unwrap();
         assert_eq!(mode, 1, "expected synchronous=NORMAL (1), got {mode}");
+    }
+
+    // ========== WAL checkpoint tests ==========
+
+    /// Writes rows without ever checkpointing, then returns the WAL size in
+    /// bytes so callers can assert it's grown past zero.
+    fn write_rows_without_checkpoint(conn: &Connection, count: usize) {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS t (v TEXT)")
+            .unwrap();
+        for i in 0..count {
+            conn.execute("INSERT INTO t (v) VALUES (?1)", params![format!("row-{i}")])
+                .unwrap();
+        }
+    }
+
+    /// Regression for the 2026-07 write-queue-saturation incident: a
+    /// restart alone did nothing because SQLite just reopened the same
+    /// oversized WAL. `checkpoint_startup` must actually shrink it.
+    #[test]
+    fn test_checkpoint_startup_truncates_existing_wal() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let conn = Connection::open(path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        write_rows_without_checkpoint(&conn, 500);
+
+        let wal_before = wal_file_size_bytes(path).unwrap_or(0);
+        assert!(
+            wal_before > 0,
+            "expected uncheckpointed writes to leave a non-empty WAL, got {wal_before}"
+        );
+
+        checkpoint_startup(&conn, path).unwrap();
+
+        let wal_after = wal_file_size_bytes(path).unwrap_or(0);
+        assert!(
+            wal_after < wal_before,
+            "expected startup checkpoint to shrink the WAL: before={wal_before} after={wal_after}"
+        );
+    }
+
+    /// `Db::with_options` must run the startup checkpoint itself (not just
+    /// the standalone helper) so every real construction path is covered,
+    /// including the one production actually uses.
+    #[test]
+    fn test_db_with_options_checkpoints_preexisting_wal_on_open() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        let conn = Connection::open(path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        write_rows_without_checkpoint(&conn, 500);
+        // Deliberately leak rather than drop: closing the last connection to
+        // a WAL database triggers SQLite's own checkpoint-on-close, which
+        // would clean up the WAL before `Db::with_options` ever gets a
+        // chance to and defeat the point of this test. A real incident looks
+        // like this too — the previous process's connection never got a
+        // clean close (killed, or the close-time checkpoint itself stalled
+        // on EFS), leaving an oversized WAL for the next process to inherit.
+        std::mem::forget(conn);
+
+        let wal_before = wal_file_size_bytes(path).unwrap_or(0);
+        assert!(
+            wal_before > 0,
+            "expected uncheckpointed writes to leave a non-empty WAL, got {wal_before}"
+        );
+
+        let db = Db::with_options(path, 5, test_writer_config()).unwrap();
+        let wal_after = wal_file_size_bytes(path).unwrap_or(0);
+        assert!(
+            wal_after < wal_before,
+            "expected Db::with_options to checkpoint the pre-existing WAL on open: \
+             before={wal_before} after={wal_after}"
+        );
+        drop(db);
+    }
+
+    #[test]
+    fn test_run_wal_checkpoint_reports_frame_counts() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let conn = Connection::open(path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        write_rows_without_checkpoint(&conn, 200);
+
+        // PASSIVE never truncates the physical file, so its returned counts
+        // are the reliable signal for "how much was actually pending."
+        let result = run_wal_checkpoint(&conn, "PASSIVE").unwrap();
+        assert_eq!(
+            result.busy, 0,
+            "expected an uncontended checkpoint to succeed"
+        );
+        assert!(
+            result.log_frames > 0,
+            "expected a non-zero WAL frame count before checkpointing"
+        );
+        assert_eq!(
+            result.checkpointed_frames, result.log_frames,
+            "a fully successful checkpoint with no concurrent readers should \
+             checkpoint every WAL frame"
+        );
+
+        // Nothing new to do: with no writes in between, a repeat PASSIVE
+        // checkpoint reports the same (already fully backfilled) counts
+        // rather than erroring or double-counting.
+        let second = run_wal_checkpoint(&conn, "PASSIVE").unwrap();
+        assert_eq!(second.busy, 0);
+        assert_eq!(second.checkpointed_frames, second.log_frames);
+    }
+
+    /// `TRUNCATE` mode additionally shrinks the physical `-wal` file to zero
+    /// bytes on full success — this is the property `checkpoint_startup`
+    /// relies on to fix "restart reopens the same oversized WAL."
+    #[test]
+    fn test_run_wal_checkpoint_truncate_shrinks_file_on_full_success() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let conn = Connection::open(path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        write_rows_without_checkpoint(&conn, 200);
+
+        let wal_before = wal_file_size_bytes(path).unwrap_or(0);
+        assert!(wal_before > 0);
+
+        let result = run_wal_checkpoint(&conn, "TRUNCATE").unwrap();
+        assert_eq!(
+            result.busy, 0,
+            "expected an uncontended checkpoint to succeed"
+        );
+
+        let wal_after = wal_file_size_bytes(path).unwrap_or(0);
+        assert_eq!(
+            wal_after, 0,
+            "expected a fully successful TRUNCATE checkpoint to shrink the WAL to 0 bytes"
+        );
+    }
+
+    fn make_test_queue() -> WriteQueue {
+        WriteQueue::new(64, 2048)
+    }
+
+    /// `maybe_checkpoint` must skip entirely (no attempt, timer untouched)
+    /// while an interactive command is waiting, so the opportunistic
+    /// checkpoint never adds latency to a real request.
+    #[test]
+    fn test_maybe_checkpoint_skips_when_interactive_waiting() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let conn = Connection::open(path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        write_rows_without_checkpoint(&conn, 500);
+        let wal_before = wal_file_size_bytes(path).unwrap_or(0);
+        assert!(wal_before > 0);
+
+        let queue = make_test_queue();
+        let (reply_tx, _reply_rx) = sync_channel::<WriteResult>(1);
+        queue
+            .try_push_interactive(WriteCommand {
+                run: Box::new(|_conn| Ok(Box::new(()) as Box<dyn Any + Send>)),
+                reply: reply_tx,
+                enqueued_at: Instant::now(),
+            })
+            .unwrap();
+
+        let mut last_checkpoint = Instant::now() - Duration::from_secs(3600);
+        let outcome = maybe_checkpoint(
+            &conn,
+            &queue,
+            path,
+            Duration::from_secs(30),
+            &mut last_checkpoint,
+        );
+
+        assert!(
+            outcome.is_none(),
+            "expected no checkpoint attempt while an interactive command is queued"
+        );
+        let wal_after = wal_file_size_bytes(path).unwrap_or(0);
+        assert_eq!(wal_after, wal_before);
+    }
+
+    /// `maybe_checkpoint` must skip when the interval hasn't elapsed yet,
+    /// even with an empty interactive lane, so it never runs on every single
+    /// background batch.
+    #[test]
+    fn test_maybe_checkpoint_skips_before_interval_elapses() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let conn = Connection::open(path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        write_rows_without_checkpoint(&conn, 500);
+        let wal_before = wal_file_size_bytes(path).unwrap_or(0);
+        assert!(wal_before > 0);
+
+        let queue = make_test_queue();
+        let mut last_checkpoint = Instant::now();
+        let outcome = maybe_checkpoint(
+            &conn,
+            &queue,
+            path,
+            Duration::from_secs(3600),
+            &mut last_checkpoint,
+        );
+
+        assert!(
+            outcome.is_none(),
+            "expected no checkpoint attempt before the interval elapses"
+        );
+        let wal_after = wal_file_size_bytes(path).unwrap_or(0);
+        assert_eq!(wal_after, wal_before);
+    }
+
+    /// Once both gates are open (no interactive work, interval elapsed) the
+    /// checkpoint actually runs and shrinks the WAL, and the timer resets so
+    /// the next call doesn't immediately re-run.
+    #[test]
+    fn test_maybe_checkpoint_runs_and_resets_timer_once_due() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let conn = Connection::open(path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        write_rows_without_checkpoint(&conn, 500);
+
+        let queue = make_test_queue();
+        let mut last_checkpoint = Instant::now() - Duration::from_secs(3600);
+        let outcome = maybe_checkpoint(
+            &conn,
+            &queue,
+            path,
+            Duration::from_secs(30),
+            &mut last_checkpoint,
+        );
+
+        // PASSIVE never shrinks the physical file (see module docs on
+        // `maybe_checkpoint`), so the frame counts it returns — not WAL
+        // byte size — are the correct signal that it actually ran.
+        let result = outcome.expect("expected a due checkpoint to actually run");
+        assert_eq!(result.busy, 0);
+        assert!(
+            result.log_frames > 0 && result.checkpointed_frames == result.log_frames,
+            "expected the due checkpoint to fully backfill the pending frames, got {:?}/{:?}",
+            result.log_frames,
+            result.checkpointed_frames
+        );
+        assert!(
+            last_checkpoint.elapsed() < Duration::from_secs(5),
+            "expected the timer to reset to roughly now after running"
+        );
+
+        // Immediately calling again should be a no-op (interval not
+        // elapsed), proving the reset timer actually gates the next call.
+        write_rows_without_checkpoint(&conn, 500);
+        let second_outcome = maybe_checkpoint(
+            &conn,
+            &queue,
+            path,
+            Duration::from_secs(30),
+            &mut last_checkpoint,
+        );
+        assert!(
+            second_outcome.is_none(),
+            "expected the just-reset timer to skip an immediate second checkpoint"
+        );
     }
 
     /// Regression (mandatory): one failing command inside a batch rolls the
