@@ -572,7 +572,7 @@ async fn test_verify_erc20_transfer_success() {
     let from_topic = "0x0000000000000000000000000000000000000000000000000000000000000001";
     let to_topic = format!(
         "0x000000000000000000000000{}",
-        &to_address[2..].to_lowercase()
+        to_address[2..].to_lowercase()
     );
 
     // Amount as 32-byte hex (1000000 = 0xF4240)
