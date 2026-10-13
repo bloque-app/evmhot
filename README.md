@@ -1,4 +1,15 @@
-# EVM Hot Wallet Service
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lockup-dark.svg">
+    <img src="docs/brand/lockup.svg" alt="evmhot by bloque" height="64">
+  </picture>
+</p>
+
+# evmhot
+
+evmhot administers EVM hot wallets for deposits: a deposit address per user, monitoring of every
+arrival, gas from a faucet, and sweeps to the treasury. It is part of Bloque's open-source tech
+family, with aledgent, bezent and rutent.
 
 A Rust-based hot wallet service for EVM-compatible blockchains that monitors deposits and automatically sweeps funds to a treasury address. Built with performance, safety, and reliability in mind.
 
@@ -694,3 +705,11 @@ Contributions are welcome! Please ensure:
 ## Support
 
 For issues and questions, please open an issue on GitHub.
+
+## Brand
+
+The evmhot mark and lockups are in [`docs/brand/`](docs/brand/): `symbol.svg`, one-colour versions,
+horizontal and stacked lockups for light and dark grounds, and 16 and 32 px favicons. Keep one grid
+module (a block plus a gap) clear around the symbol and two around a lockup; use the full symbol from
+24 px and the favicons below that. Don't recolour, stretch or put the mark in a tile, except as an app
+icon. The name and the marks belong to Pagos Cube LLC (Bloque) and are not licensed with the code.
