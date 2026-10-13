@@ -9,7 +9,7 @@
 
 evmhot administers EVM hot wallets for deposits: a deposit address per user, monitoring of every
 arrival, gas from a faucet, and sweeps to the treasury. It is part of Bloque's open-source tech
-family, with aledgent, bezent and rutent.
+family.
 
 A Rust-based hot wallet service for EVM-compatible blockchains that monitors deposits and automatically sweeps funds to a treasury address. Built with performance, safety, and reliability in mind.
 
