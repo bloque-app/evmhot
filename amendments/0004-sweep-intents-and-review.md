@@ -30,8 +30,14 @@ intent:
      has waited 10 passes, evmhot signs another transaction at the same nonce with both fee fields raised by at least
      10% (or to the current estimate, whichever is higher), stores its hash next to the earlier ones, and broadcasts
      it. A transaction held for other reasons is only rebroadcast.
-   - With no receipt for any stored hash and the nonce used, receipts are looked up once more, and if the state holds
-     on a second pass the nonce was used by something outside evmhot: the deposits go to review (`A2`).
+   - With no receipt for any stored hash and the nonce used for 64 blocks, the nonce was used by something outside
+     evmhot, or a receipt is late: the deposits go to review (`A2`) and the intent stays watched. For 5,000 blocks every
+     pass reads its receipts; a late receipt records the sweep and releases the deposits (`kind=review_self_resolved`),
+     and an operator retry is refused meanwhile. The verdict counts blocks, not passes, because a load-balanced
+     provider can serve the nonce from a node ahead of the one serving receipts.
+   - A transaction unmined with its nonce free raises `kind=sweep_stuck` once after 30 minutes.
+   - A native sweep estimates its gas. A failed estimate or a revert counts toward `REQ-SW-4`'s 5 failures; the fifth
+     sends the native deposits to review (`kind=native_sweep_failed`).
    - Only an intent with no signed transaction at all (the process stopped before signing) is dropped: nothing exists
      to wait for.
 
@@ -96,7 +102,8 @@ retrying such a review is the operator's word that nothing more is owed. That se
 
 New `REQ-OB-4`: an alert is a log line that starts with `EVMHOT_ALERT kind=<kind> network=<network>` and carries the
 deposit's identity and transaction where there are some. Kinds: `sweep_review`, `balance_shortfall`, `no_sender`,
-`pair_blocked` (review or failed blockers only), `dust` and `settled_without_sweep`; `lag` and `provider` come with F-002b. `dust` and `pair_blocked` are raised once per
+`pair_blocked` (review or failed blockers only), `dust`, `settled_without_sweep`, `native_sweep_failed`,
+`review_self_resolved` and `sweep_stuck`; `lag` and `provider` come with F-002b. `dust` and `pair_blocked` are raised once per
 deposit and blocking state; later passes log quietly. Metric filters match the marker and the kind.
 
 ## A7 — Where the target is recorded
@@ -109,7 +116,7 @@ as `sweep_target`.
 | Action | Identifiers |
 |---|---|
 | New | `REQ-SW-13`, `REQ-SW-14`, `REQ-SW-15`, `REQ-OB-4`, `INV-7`, `INV-8` |
-| Revised | `REQ-SW-3`, `REQ-SW-7`, `REQ-SW-10`, §9.2 |
+| Revised | `REQ-SW-3`, `REQ-SW-4`, `REQ-SW-7`, `REQ-SW-10`, §9.2 |
 | Withdrawn | none |
 
 ## What this costs, stated plainly

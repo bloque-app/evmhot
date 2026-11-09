@@ -1,6 +1,6 @@
 # evmhot — System Specification
 
-**Version:** 0.2.3 · **Status:** draft for review · **Owner:** @pandres95
+**Version:** 0.2.4 · **Status:** draft for review · **Owner:** @pandres95
 
 ## 0. How to read this document
 
@@ -16,6 +16,7 @@ yet are marked **(not built)**, and `PLAN.md` §4 names the feature that builds 
 | Version | Date | Change |
 |---|---|---|
 | 0.1.0 | 2026-11-09 | The service as it ran: registration, detection, sweeps, faucet, webhooks, store, API |
+| 0.2.4 | 2026-11-09 | Amendment 0005: a second delivery of `deposit_swept` to a target's notify URL; the published `deposit_swept` contract |
 | 0.2.3 | 2026-11-09 | Amendment 0004: sweep intents before broadcast, review states, one sweep per transfer, alerts, `sweep_target` |
 | 0.2.2 | 2026-11-09 | Amendment 0003: the `hold` target kind; `sweeps` in `deposit_swept` |
 | 0.2.1 | 2026-11-09 | Amendment 0002: derivation indices are 32-bit raw child numbers; `register`'s response shape; JSON error bodies |
@@ -168,7 +169,8 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   intent history it raises `settled_without_sweep` (amendment 0004).
 - `REQ-SW-4` A sweep that fails with a funding error waits for the faucet and is retried. A token sweep that fails
   otherwise counts the failure; after 5 consecutive failures, or at once on a decoding error, the deposit is recorded as
-  failed and can be retried by an operator. A native sweep that fails is retried on every pass.
+  failed and can be retried by an operator. A native sweep estimates its gas; a failed estimate or a revert counts toward the same 5 failures, and the
+  fifth sends the native deposits to review (`native_sweep_failed`) (amendment 0004).
 - `REQ-SW-11` A native sweep sends the balance minus the cost of 21,000 gas at the current maximum fee plus 10%. A
   balance at or below that cost is not swept.
 - `REQ-SW-5` A deposit MUST be marked swept only after its sweep's receipt shows success. A reverted
@@ -220,7 +222,10 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   pass the address's open intent is resolved first. A signed intent is never dropped and keeps its nonce: a receipt for
   any of its hashes settles or fails it; with no receipt and the nonce unused, the newest bytes are broadcast again, and
   an underpriced transaction that waited 10 passes is re-signed at the same nonce with both fee fields raised by at
-  least 10% (or to the estimate); with the nonce used and no receipt of ours on two passes, the deposits go to review.
+  least 10% (or to the estimate); once the nonce has been used for 64 blocks with no receipt of ours, the deposits go to review and the
+  intent stays watched: for 5,000 blocks every pass reads its receipts, a late receipt records the sweep and releases
+  the deposits (`review_self_resolved`), and an operator retry is refused meanwhile. A sweep unmined with its nonce
+  free raises `sweep_stuck` once after 30 minutes.
   Only an intent never signed is dropped.
 - `REQ-SW-14` A deposit enters `needs_review`, and is not swept until an operator releases it, when its sweep's
   receipt holds no matching `Transfer` or a different amount, or its nonce was used by another transaction
@@ -272,6 +277,14 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
 - `REQ-WH-8` **(not built)** The bearer token sent to webhook URLs and the operator token MUST be different secrets.
   The operator token MUST never be sent to a webhook URL.
 - `REQ-WH-6` A receiver MUST treat `(id, event)` as its idempotency key.
+- `REQ-WH-10` A sweep target MAY declare a notify URL and the name of the environment variable holding its bearer
+  token. Each token `deposit_swept` for a deposit settled into that target is then also delivered there: the same
+  body, an outbox row of its own (`(id, "deposit_swept:notify")`) written in the same transaction, the target's own
+  token, and the delivery rules of `REQ-WH-5`. evmhot refuses to start when a notify URL's token is empty. The swap
+  service receives bezent's Safe sweeps this way (R12). (Amendment 0005.)
+- `REQ-WH-11` The token `deposit_swept` body is published as a versioned contract in `contracts/deposit_swept/`
+  (JSON Schema, fixtures, changelog); a test checks the payload evmhot builds against it. Consumers ignore unknown
+  fields; an additive change bumps the minor version. (Amendment 0005.)
 
 ## 9. HTTP surface
 
@@ -327,7 +340,8 @@ more is owed (amendment 0004).
   growing back-off, and MUST raise an alert when it persists.
 - `REQ-OB-4` An alert is a log line starting `EVMHOT_ALERT kind=<kind> network=<network>`, with the deposit's identity
   and transaction where there are some. Kinds: `sweep_review`, `balance_shortfall`, `no_sender`, `pair_blocked`
-  (review or failed blockers only), `dust`, `settled_without_sweep`, and with `REQ-OB-1`/`REQ-OB-2` `lag` and `provider`. `dust` and `pair_blocked` are raised once per deposit
+  (review or failed blockers only), `dust`, `settled_without_sweep`, `native_sweep_failed`, `review_self_resolved`,
+  `sweep_stuck`, and with `REQ-OB-1`/`REQ-OB-2` `lag` and `provider`. `dust` and `pair_blocked` are raised once per deposit
   and blocking state. (Amendment 0004.)
 - `REQ-OB-3` Health reports the store's writer and lists the networks. **(not built)** It also reports whether each
   network's provider answers.
