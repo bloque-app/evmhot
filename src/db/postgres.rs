@@ -20,8 +20,8 @@ use std::time::Duration;
 const RDS_CA_BUNDLE: &str = include_str!("../../certs/rds-global-bundle.pem");
 
 /// Health-check pool-acquire timeout (decision D3 from eng review): a task
-/// that loses RDS connectivity fails ALB health checks within one
-/// unhealthy-threshold window instead of silently serving errors.
+/// that loses database connectivity fails its load balancer's health checks
+/// within one unhealthy-threshold window instead of silently serving errors.
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Advisory-lock key for the bootstrap migration (decision from eng review:

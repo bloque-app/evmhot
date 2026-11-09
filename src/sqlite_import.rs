@@ -9,8 +9,8 @@
 //!   1. [`crate::db::postgres::PostgresBackend`]'s automatic bootstrap
 //!      migration at service startup (triggered by `EVM_MIGRATE_FROM_SQLITE`
 //!      + an empty destination).
-//!   2. The standalone `migrate_sqlite_to_postgres` binary, for laptop-driven
-//!      dry runs against a real production SQLite snapshot.
+//!   2. The standalone `migrate_sqlite_to_postgres` binary, for dry runs
+//!      against a copy of the source database.
 use anyhow::{bail, Context, Result};
 use postgres::Client;
 use rusqlite::{Connection, OpenFlags};
@@ -289,8 +289,8 @@ fn assert_source_is_non_empty(snapshot: &SqliteSnapshot) -> Result<()> {
     if snapshot.accounts.is_empty() {
         bail!(
             "refusing to migrate: source SQLite file has zero accounts \
-             (this looks like an empty/freshly-seeded database, not a real \
-             production snapshot — migrating it would let the service \
+             (this looks like an empty/freshly-seeded database, not a copy \
+             of a populated store — migrating it would let the service \
              re-issue derivation indices from index 0, producing duplicate \
              deposit addresses)"
         );
@@ -528,9 +528,8 @@ impl VerifyReport {
 
 /// Read-only source-vs-destination comparison: per-table counts,
 /// `next_index`, every `last_block:<chain>` cursor, plus spot-checks of a
-/// handful of account addresses and deposit statuses. Used both after a
-/// laptop dry run and after the production bootstrap migration (via the
-/// binary's `--verify` mode).
+/// handful of account addresses and deposit statuses. Used after a dry run
+/// and after a real migration (via the binary's `--verify` mode).
 pub fn verify_migration(snapshot: &SqliteSnapshot, client: &mut Client) -> Result<VerifyReport> {
     let mut report = VerifyReport::default();
 
