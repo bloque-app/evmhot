@@ -69,6 +69,11 @@ impl Monitor {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn catch_up_once(&self) -> Result<()> {
+        self.catch_up().await
+    }
+
     async fn catch_up(&self) -> Result<()> {
         let latest_block = self.provider.get_block_number().await?;
         let current_block = latest_block.saturating_sub(self.chain.block_offset_from_head);

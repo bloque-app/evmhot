@@ -26,6 +26,7 @@ Polling-only: there is no WebSocket streaming mode.
   "account_id": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
   "registration_id": "user_123",
   "tx_hash": "0x1234...",
+  "from_address": "0x00000000000000000000000000000000000a11ce",
   "amount": "1000000",
   "token_type": "erc20",
   "token_symbol": "USDT",
@@ -34,15 +35,44 @@ Polling-only: there is no WebSocket streaming mode.
 }
 ```
 
+`from_address` is the sender of the inbound transfer: the `from` of the `Transfer` log for a token, the `from` of the
+transaction for the native coin. A consumer can use it as the refund address. It is `null` in `deposit_swept` for a
+deposit recorded before senders were stored.
+
+A token whose `symbol()` cannot be read is reported with `token_symbol: "UNKNOWN"` (and 18 decimals); it is handled like
+any other admitted token. A token whose target is `hold` (see `chains.toml.example`) gets `deposit_detected` and no
+`deposit_swept` until its target changes.
+
 ## deposit_swept
 
-Same fields as detection, plus for ERC20:
+Same fields as detection (the transaction hash is `original_tx_hash`, not `tx_hash`; `from_address` is repeated). A
+native deposit carries no sweep fields. A token deposit adds:
 
 ```json
 {
-  "sweep_tx_hash": "0xsweep..."
+  "sweep_tx_hash": "0xsweep1...",
+  "sweeps": [
+    {
+      "sweep_tx_hash": "0xsweep1...",
+      "sweep_block_number": 123456,
+      "sweep_block_hash": "0xblock...",
+      "sweep_log_index": 17,
+      "sweep_amount": "1000000"
+    }
+  ]
 }
 ```
+
+- `sweeps` has one entry per sweep that settled the deposit: usually one, several when the amount was split by the
+  target's `max`. Each entry is the sweep coordinate: the sweep transaction, its block, and the **block-level** log
+  index of the `Transfer` into the target (from the receipt, not the log's position in the transaction), plus the amount
+  that sweep moved.
+- The top-level `sweep_tx_hash` is the first entry's, so clients that read only it keep working.
+- `deposit_swept` is sent once, after the deposit's last sweep succeeded and was verified on its receipt; until then
+  only `deposit_detected` has been sent. A reverted sweep produces no event.
+- Several deposits settled by one sweep (a whole-balance sweep) each get their own event, all naming the same entry. With
+  `per_sender` a sweep covers one sender's deposits only.
+- `(id, event)` stays the receiver's idempotency key.
 
 ## Lazy faucet
 
@@ -50,7 +80,8 @@ Registration does **not** fund addresses. Gas is funded just-in-time by the swee
 
 ## Delivery and retries
 
-Monitor and sweeper **enqueue** webhooks only; a background worker performs HTTP delivery with configurable retries.
+Monitor and sweeper **enqueue** webhooks only, in the same database transaction as the state change they report (a
+stored deposit or swept mark always has its webhook row); a background worker performs HTTP delivery with configurable retries.
 
 | Status | Meaning |
 |--------|---------|

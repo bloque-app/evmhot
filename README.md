@@ -49,8 +49,27 @@ Secrets and process settings come from the environment; per-network settings com
 Copy [`chains.toml.example`](chains.toml.example). Each `[[chains]]` block configures one network: `name`,
 `chain_id`, `rpc_url` (HTTP polling only), `treasury_address` (the default sweep target), `faucet_address`,
 `existential_deposit`, a non-empty `allowed_token_addresses`, and optionally `token_treasuries` (a per-token sweep
-target), `min_deposits`, `min_deposit_default`, `min_deposit_native`, `poll_interval` and `block_offset_from_head`.
-Use a separate RPC key per network in production so one busy network cannot exhaust another's quota.
+target), `token_targets` (see below), `min_deposits`, `min_deposit_default`, `min_deposit_native`, `poll_interval` and
+`block_offset_from_head`. Use a separate RPC key per network in production so one busy network cannot exhaust
+another's quota.
+
+A token's sweep target is, in order: its `[chains.token_targets."0x..."]` table, its `token_treasuries` address, or the
+network's `treasury_address`. The native coin always uses `treasury_address`. A token is listed in `token_treasuries`
+or in `token_targets`, not both.
+
+| `token_targets` key | Meaning |
+|---|---|
+| `kind` | `"transfer"` (sweep to `address`) or `"hold"` (detect and notify, never sweep). Changing a held token to `"transfer"` releases its held deposits on the next pass. |
+| `address` | Required for `transfer`; not allowed for `hold`. |
+| `min` | Smallest sweep, in the token's minor units. A balance below it (or, with `per_sender`, one sender's unswept total) waits for later deposits. |
+| `max` | Largest sweep. A larger amount is swept in several sweeps, each at most `max`; `deposit_swept` lists them all in `sweeps` and is sent once, after the last. A remainder below `min` is topped up from the previous part when both can stay in bounds, otherwise it stays in the deposit address. |
+| `admits_only` | `true` when the address admits only this token. The process refuses to start if another token, the native coin or the network default target routes to that address; the error names the conflict. |
+| `per_sender` | `true` when each sweep needs one refund address. A sweep moves one sender's unswept deposits (not the whole balance) and never mixes senders; deposits with no recorded sender (stored before senders were) are swept one at a time. |
+
+Each sweep is one `transfer` call into the target. evmhot reads the sweep's coordinate (transaction hash, block number,
+block hash, block-level log index of the `Transfer` into the target, amount) from the receipt and reports it in
+`deposit_swept` ([`WEBHOOK_SPEC.md`](WEBHOOK_SPEC.md)). A sweep whose receipt shows a revert, or has no such `Transfer`
+log, is a failure and is never reported.
 
 ## HTTP API
 

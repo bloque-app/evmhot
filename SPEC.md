@@ -129,7 +129,7 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
 - `REQ-RG-3` The counter MUST start above every derivation index already in the store. Indices are not contiguous:
   older registrations used hashed indices, some at or above 2^31 (`REQ-KY-1`).
 - `REQ-RG-4` Registration funds nothing. Gas is funded at sweep time (§6.3).
-- `REQ-RG-5` **(not built)** Derivation indices are 32-bit. When the counter reaches 2^32, registration MUST be refused
+- `REQ-RG-5` Derivation indices are 32-bit. When the counter reaches 2^32, registration MUST be refused
   with an error; it MUST NOT wrap or overflow. (Revised by amendment 0002.)
 
 ## 6. Deposits and sweeps
@@ -168,7 +168,7 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   failed and can be retried by an operator. A native sweep that fails is retried on every pass.
 - `REQ-SW-11` A native sweep sends the balance minus the cost of 21,000 gas at the current maximum fee plus 10%. A
   balance at or below that cost is not swept.
-- `REQ-SW-5` **(not built)** A deposit MUST be marked swept only after its sweep's receipt shows success. A reverted
+- `REQ-SW-5` A deposit MUST be marked swept only after its sweep's receipt shows success. A reverted
   sweep is recorded as failed.
 
 ### 6.3 Gas
@@ -184,24 +184,24 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   - `directed_deposit` **(not built)**: a contract and a 32-byte recipient. The sweep calls the contract's deposit
     function with the amount and the recipient. The recipient is configuration, one per network and token, and is
     the same for every deposit address.
-  - `hold` **(not built)**: no sweep. Deposits are detected, stored and notified with `deposit_detected`, and stay in
+  - `hold`: no sweep. Deposits are detected, stored and notified with `deposit_detected`, and stay in
     their deposit addresses until the token's target changes to another kind. Changing it releases every held
     deposit to the new target. (Amendment 0003.)
-- `REQ-SW-7` **(not built)** A target MAY declare a minimum and a maximum per sweep, in the token's minor units:
+- `REQ-SW-7` A target MAY declare a minimum and a maximum per sweep, in the token's minor units:
   - A balance below the minimum MUST NOT be swept to that target. It stays in the deposit address until later
     deposits bring it to the minimum.
   - A balance above the maximum MUST be swept in several sweeps, each at most the maximum.
-- `REQ-SW-8` **(not built)** A target MAY declare that it admits only one token. Configuration that routes any other
+- `REQ-SW-8` A target MAY declare that it admits only one token. Configuration that routes any other
   token to it MUST be refused at load time, and the process MUST NOT start.
-- `REQ-SW-9` **(not built)** Each sweep into a target emits exactly one token `Transfer` into it.
+- `REQ-SW-9` Each sweep into a target emits exactly one token `Transfer` into it.
 
-- `REQ-SW-12` **(not built)** A target MAY declare that each sweep needs one refund address. For such a target, a
+- `REQ-SW-12` A target MAY declare that each sweep needs one refund address. For such a target, a
   sweep MUST NOT combine deposits from different senders: each sweep covers one inbound transfer, or several from the
   same sender. Deposits from one sender below the target's minimum MAY accumulate until together they reach it.
 
 ### 6.5 The sweep coordinate (amendment 0001)
 
-- `REQ-SW-10` **(not built)** For each sweep evmhot records, and reports in `deposit_swept`, the sweep's
+- `REQ-SW-10` For each sweep evmhot records, and reports in `deposit_swept`, the sweep's
   transaction hash, block number, block hash, the block-level log index of the `Transfer` into the target, and the
   amount swept. The log index is the position of that log in its block, taken from the receipt, not its position
   within the transaction.
@@ -224,19 +224,19 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   `registration_id`, `amount` (minor units, decimal string), `token_type` (`native` or `erc20`), and for tokens
   `token_symbol`, `token_address`, `token_decimals`. The deposit's transaction hash is `tx_hash` in `deposit_detected`
   and `original_tx_hash` in `deposit_swept`.
-- `REQ-WH-4` A token `deposit_swept` adds `sweep_tx_hash`; a native one carries no sweep fields. **(not built)** A
+- `REQ-WH-4` A token `deposit_swept` adds `sweep_tx_hash`; a native one carries no sweep fields. A
   token `deposit_swept` also adds `sweeps`, a list with one entry per sweep that settled the deposit, each the sweep
   coordinate of `REQ-SW-10`: `{sweep_tx_hash, sweep_block_number, sweep_block_hash, sweep_log_index, sweep_amount}`.
   It usually has one entry; it has several when the amount was split by a target's maximum (`REQ-SW-7`). The
   top-level `sweep_tx_hash` is the first entry's. Several deposits settled by one sweep produce one `deposit_swept`
   each, all naming the same entry. `deposit_swept` is sent only once every sweep of the deposit has succeeded.
   (Revised by amendment 0003.)
-- `REQ-WH-9` **(not built)** Every deposit records the sender of its inbound transfer, and both events carry it as
+- `REQ-WH-9` Every deposit records the sender of its inbound transfer, and both events carry it as
   `from_address`. A consumer uses it as the refund address.
 - `REQ-WH-5` Once a webhook is in the outbox, delivery is at least once: a worker delivers it, retrying non-2xx answers
   up to a configured number of attempts, and leases each attempt so that two workers never post the same delivery at
   once. In 0.1.0 the outbox write happens after the state change it reports, and a failed write is only logged.
-- `REQ-WH-7` **(not built)** The outbox write MUST be in the same transaction as the state change it reports, so a
+- `REQ-WH-7` The outbox write MUST be in the same transaction as the state change it reports, so a
   stored deposit or sweep always has its webhook.
 - `REQ-WH-8` **(not built)** The bearer token sent to webhook URLs and the operator token MUST be different secrets.
   The operator token MUST never be sent to a webhook URL.
@@ -299,9 +299,9 @@ Both require the bearer token. The host service did not serve them in production
 - `INV-2` A deposit is recorded at most once per identity (`REQ-DT-2`, `REQ-DT-3`).
 - `INV-3` A derivation index belongs to at most one registration.
 - `INV-4` No key or mnemonic leaves the process (`REQ-KY-3`).
-- `INV-5` **(not built)** A deposit marked swept with a sweep transaction has a successful receipt for that
+- `INV-5` A deposit marked swept with a sweep transaction has a successful receipt for that
   transaction (`REQ-SW-5`).
-- `INV-6` **(not built)** No sweep sends a token to a target that does not admit it (`REQ-SW-8`).
+- `INV-6` No sweep sends a token to a target that does not admit it (`REQ-SW-8`).
 
 What this version does not protect, stated plainly:
 

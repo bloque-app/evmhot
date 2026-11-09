@@ -203,6 +203,7 @@ impl PostgresBackend {
                 sweep_meta = summary.sweep_meta.1,
                 sweep_failures = summary.sweep_failures.1,
                 webhook_deliveries = summary.webhook_deliveries.1,
+                sweeps = summary.sweeps.1,
                 next_index = ?summary.next_index,
                 block_cursors = ?summary.block_cursors,
                 "bootstrap migration complete"

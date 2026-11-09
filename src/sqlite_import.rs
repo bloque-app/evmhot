@@ -45,6 +45,8 @@ pub struct DepositRow {
     pub account_id: String,
     pub amount: String,
     pub status: String,
+    /// Sender (REQ-WH-9). `None` for rows written before it was stored.
+    pub from_address: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -57,6 +59,21 @@ pub struct Erc20DepositRow {
     pub token_address: String,
     pub token_symbol: String,
     pub status: String,
+    /// Sender (REQ-WH-9). `None` for rows written before it was stored.
+    pub from_address: Option<String>,
+}
+
+/// One sweep that settled a deposit (REQ-SW-10).
+#[derive(Debug, Default, Clone)]
+pub struct SweepRow {
+    pub chain: String,
+    pub tx_hash: String,
+    pub log_index: i64,
+    pub sweep_tx_hash: String,
+    pub sweep_block_number: i64,
+    pub sweep_block_hash: String,
+    pub sweep_log_index: i64,
+    pub sweep_amount: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -112,6 +129,7 @@ pub struct SqliteSnapshot {
     pub sweep_meta: Vec<SweepMetaRow>,
     pub sweep_failures: Vec<SweepFailureRow>,
     pub webhook_deliveries: Vec<WebhookDeliveryRow>,
+    pub sweeps: Vec<SweepRow>,
     /// Raw `state` table key/value pairs, including `next_index` and every
     /// `last_block:<chain>` cursor.
     pub state: Vec<(String, String)>,
@@ -156,8 +174,19 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
     })?;
     snapshot.accounts = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let mut stmt =
-        conn.prepare("SELECT chain, tx_hash, account_id, amount, status FROM deposits")?;
+    // A source written before F-002a has no `from_address` column.
+    let from_expr = |table: &str| -> Result<&'static str> {
+        Ok(if table_has_column(&conn, table, "from_address")? {
+            "from_address"
+        } else {
+            "NULL"
+        })
+    };
+
+    let mut stmt = conn.prepare(&format!(
+        "SELECT chain, tx_hash, account_id, amount, status, {} FROM deposits",
+        from_expr("deposits")?
+    ))?;
     let rows = stmt.query_map([], |r| {
         Ok(DepositRow {
             chain: r.get(0)?,
@@ -165,14 +194,16 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
             account_id: r.get(2)?,
             amount: r.get(3)?,
             status: r.get(4)?,
+            from_address: r.get(5)?,
         })
     })?;
     snapshot.deposits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let mut stmt = conn.prepare(
-        "SELECT chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status
+    let mut stmt = conn.prepare(&format!(
+        "SELECT chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status, {}
          FROM erc20_deposits",
-    )?;
+        from_expr("erc20_deposits")?
+    ))?;
     let rows = stmt.query_map([], |r| {
         Ok(Erc20DepositRow {
             chain: r.get(0)?,
@@ -183,6 +214,7 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
             token_address: r.get(5)?,
             token_symbol: r.get(6)?,
             status: r.get(7)?,
+            from_address: r.get(8)?,
         })
     })?;
     snapshot.erc20_deposits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -249,11 +281,51 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
     })?;
     snapshot.webhook_deliveries = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
+    if table_exists(&conn, "sweeps")? {
+        let mut stmt = conn.prepare(
+            "SELECT chain, tx_hash, log_index, sweep_tx_hash, sweep_block_number,
+                    sweep_block_hash, sweep_log_index, sweep_amount
+             FROM sweeps ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SweepRow {
+                chain: r.get(0)?,
+                tx_hash: r.get(1)?,
+                log_index: r.get(2)?,
+                sweep_tx_hash: r.get(3)?,
+                sweep_block_number: r.get(4)?,
+                sweep_block_hash: r.get(5)?,
+                sweep_log_index: r.get(6)?,
+                sweep_amount: r.get(7)?,
+            })
+        })?;
+        snapshot.sweeps = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    }
+
     let mut stmt = conn.prepare("SELECT key, value FROM state")?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     snapshot.state = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(snapshot)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |r| r.get::<_, i64>(0),
+    )? > 0)
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Per-table (source_count, inserted_count) migration summary, mirroring
@@ -267,6 +339,7 @@ pub struct MigrationSummary {
     pub sweep_meta: (usize, usize),
     pub sweep_failures: (usize, usize),
     pub webhook_deliveries: (usize, usize),
+    pub sweeps: (usize, usize),
     pub next_index: Option<i64>,
     pub block_cursors: Vec<(String, i64)>,
 }
@@ -340,8 +413,8 @@ pub fn migrate_snapshot_to_postgres(
     summary.deposits.0 = snapshot.deposits.len();
     for row in &snapshot.deposits {
         let changes = tx.execute(
-            "INSERT INTO deposits (chain, tx_hash, account_id, amount, status)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO deposits (chain, tx_hash, account_id, amount, status, from_address)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (chain, tx_hash) DO NOTHING",
             &[
                 &row.chain,
@@ -349,6 +422,7 @@ pub fn migrate_snapshot_to_postgres(
                 &row.account_id,
                 &row.amount,
                 &row.status,
+                &row.from_address,
             ],
         )?;
         summary.deposits.1 += changes as usize;
@@ -358,8 +432,9 @@ pub fn migrate_snapshot_to_postgres(
     for row in &snapshot.erc20_deposits {
         let changes = tx.execute(
             "INSERT INTO erc20_deposits
-             (chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             (chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status,
+              from_address)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (chain, tx_hash, log_index) DO NOTHING",
             &[
                 &row.chain,
@@ -370,9 +445,32 @@ pub fn migrate_snapshot_to_postgres(
                 &row.token_address,
                 &row.token_symbol,
                 &row.status,
+                &row.from_address,
             ],
         )?;
         summary.erc20_deposits.1 += changes as usize;
+    }
+
+    summary.sweeps.0 = snapshot.sweeps.len();
+    for row in &snapshot.sweeps {
+        let changes = tx.execute(
+            "INSERT INTO sweeps
+             (chain, tx_hash, log_index, sweep_tx_hash, sweep_block_number,
+              sweep_block_hash, sweep_log_index, sweep_amount)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT DO NOTHING",
+            &[
+                &row.chain,
+                &row.tx_hash,
+                &row.log_index,
+                &row.sweep_tx_hash,
+                &row.sweep_block_number,
+                &row.sweep_block_hash,
+                &row.sweep_log_index,
+                &row.sweep_amount,
+            ],
+        )?;
+        summary.sweeps.1 += changes as usize;
     }
 
     summary.token_metadata.0 = snapshot.token_metadata.len();
@@ -568,6 +666,11 @@ pub fn verify_migration(snapshot: &SqliteSnapshot, client: &mut Client) -> Resul
         "sweep_failures.count",
         snapshot.sweep_failures.len() as i64,
         pg_count(client, "sweep_failures")?,
+    );
+    report.check(
+        "sweeps.count",
+        snapshot.sweeps.len() as i64,
+        pg_count(client, "sweeps")?,
     );
     report.check(
         "webhook_deliveries.count",

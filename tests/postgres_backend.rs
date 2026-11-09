@@ -133,15 +133,25 @@ fn seed_sqlite_source(next_index: i64, block_cursor: (&str, i64)) -> NamedTempFi
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO deposits (chain, tx_hash, account_id, amount, status)
-         VALUES ('base', '0xdep1', 'seed-user', '100', 'detected')",
+        "INSERT INTO deposits (chain, tx_hash, account_id, amount, status, from_address)
+         VALUES ('base', '0xdep1', 'seed-user', '100', 'detected', '0xsender-native')",
         [],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO erc20_deposits
-         (chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status)
-         VALUES ('base', '0xerc1', 0, 'seed-user', '50', '0xtoken1', 'USDC', 'detected')",
+         (chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status,
+          from_address)
+         VALUES ('base', '0xerc1', 0, 'seed-user', '50', '0xtoken1', 'USDC', 'detected',
+                 '0xsender-token')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sweeps
+         (chain, tx_hash, log_index, sweep_tx_hash, sweep_block_number, sweep_block_hash,
+          sweep_log_index, sweep_amount)
+         VALUES ('base', '0xerc1', 0, '0xsweepA', 77, '0xblockA', 12, '50')",
         [],
     )
     .unwrap();
@@ -232,6 +242,73 @@ fn assert_all_migrated_tables(url: &str, context: &str) {
         "detected",
         "{context}: deposits.status"
     );
+    // F-002a: the sender and the sweep coordinates travel with the rows
+    // (REQ-ST-2: a move to a new database carries every row).
+    let senders: (Option<String>, Option<String>) = (
+        client
+            .query_one(
+                "SELECT from_address FROM deposits WHERE chain = 'base' AND tx_hash = '0xdep1'",
+                &[],
+            )
+            .unwrap()
+            .get(0),
+        client
+            .query_one(
+                "SELECT from_address FROM erc20_deposits WHERE chain = 'base' AND tx_hash = '0xerc1'",
+                &[],
+            )
+            .unwrap()
+            .get(0),
+    );
+    assert_eq!(
+        senders,
+        (
+            Some("0xsender-native".to_string()),
+            Some("0xsender-token".to_string())
+        ),
+        "{context}: from_address"
+    );
+    let sweep = client
+        .query_one(
+            "SELECT sweep_tx_hash, sweep_block_number, sweep_block_hash, sweep_log_index, sweep_amount
+             FROM sweeps WHERE chain = 'base' AND tx_hash = '0xerc1' AND log_index = 0",
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("{context}: sweeps row missing or query failed: {e}"));
+    assert_eq!(
+        sweep.get::<_, String>(0),
+        "0xsweepA",
+        "{context}: sweeps.sweep_tx_hash"
+    );
+    assert_eq!(
+        sweep.get::<_, i64>(1),
+        77,
+        "{context}: sweeps.sweep_block_number"
+    );
+    assert_eq!(
+        sweep.get::<_, String>(2),
+        "0xblockA",
+        "{context}: sweeps.sweep_block_hash"
+    );
+    assert_eq!(
+        sweep.get::<_, i64>(3),
+        12,
+        "{context}: sweeps.sweep_log_index"
+    );
+    assert_eq!(
+        sweep.get::<_, String>(4),
+        "50",
+        "{context}: sweeps.sweep_amount"
+    );
+    let sweep_count: i64 = client
+        .query_one("SELECT COUNT(*) FROM sweeps", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        sweep_count, 1,
+        "{context}: sweeps must not be duplicated by a re-run"
+    );
+
     let deposit_count: i64 = client
         .query_one("SELECT COUNT(*) FROM deposits WHERE chain = 'base'", &[])
         .unwrap()
@@ -922,4 +999,321 @@ fn postgres_counter_seed_starts_above_existing_hashed_index() {
         "the next registration must get an index strictly above the highest stored one, got {idx}"
     );
     assert_eq!(i64::from(idx), HASHED_INDEX + 1);
+}
+
+// ---------------------------------------------------------------- F-002a
+
+fn f002a_outbox(id: &str, event: &str) -> evmhot::db::OutboxEntry {
+    evmhot::db::OutboxEntry {
+        id: id.to_string(),
+        event: event.to_string(),
+        registration_id: "acct-a".to_string(),
+        webhook_url: "https://hook.example/a".to_string(),
+        payload: format!("{{\"id\":\"{id}\",\"event\":\"{event}\"}}"),
+    }
+}
+
+fn f002a_token_deposit(
+    tx: &str,
+    log_index: u64,
+    from: Option<&str>,
+) -> evmhot::db::NewErc20Deposit {
+    evmhot::db::NewErc20Deposit {
+        chain: "base".to_string(),
+        tx_hash: tx.to_string(),
+        log_index,
+        account_id: "acct-a".to_string(),
+        amount: "10".to_string(),
+        token_address: "0xtoken1".to_string(),
+        token_symbol: "TKN".to_string(),
+        from_address: from.map(str::to_string),
+    }
+}
+
+/// REQ-WH-7, REQ-WH-9, REQ-SW-10 on a live `Db`, whichever backend.
+fn assert_f002a_store_cycle(db: &Db) {
+    let native = evmhot::db::NewNativeDeposit {
+        chain: "base".to_string(),
+        tx_hash: "0xn1".to_string(),
+        account_id: "acct-a".to_string(),
+        amount: "5".to_string(),
+        from_address: Some("0xsender-n".to_string()),
+    };
+    assert!(db
+        .record_native_deposit_atomic(
+            &native,
+            Some(&f002a_outbox("base:0xn1", "deposit_detected"))
+        )
+        .unwrap());
+    assert!(!db
+        .record_native_deposit_atomic(
+            &native,
+            Some(&f002a_outbox("base:0xn1", "deposit_detected"))
+        )
+        .unwrap());
+    assert_eq!(
+        db.get_deposit_from_address("base", "0xn1")
+            .unwrap()
+            .as_deref(),
+        Some("0xsender-n")
+    );
+    assert!(db
+        .get_webhook_delivery("base:0xn1", "deposit_detected")
+        .unwrap()
+        .is_some());
+
+    let token = f002a_token_deposit("0xt1", 3, Some("0xsender-t"));
+    assert!(db
+        .record_erc20_deposit_atomic(
+            &token,
+            Some(&f002a_outbox("base:0xt1:3", "deposit_detected"))
+        )
+        .unwrap());
+    let detected = db.get_detected_erc20_deposits("base").unwrap();
+    assert_eq!(detected.len(), 1);
+    assert_eq!(detected[0].from_address.as_deref(), Some("0xsender-t"));
+
+    let rec = |tx: &str, log: u64| evmhot::db::SweepRecord {
+        sweep_tx_hash: tx.to_string(),
+        sweep_block_number: 9,
+        sweep_block_hash: "0xblock".to_string(),
+        sweep_log_index: log,
+        sweep_amount: "10".to_string(),
+    };
+    let keys = vec!["0xt1:3".to_string()];
+    db.record_sweep("base", &keys, &rec("0xs1", 4)).unwrap();
+    db.record_sweep("base", &keys, &rec("0xs2", 5)).unwrap();
+    db.record_sweep("base", &keys, &rec("0xs1", 4)).unwrap();
+    assert_eq!(
+        db.get_sweeps("base", "0xt1:3").unwrap(),
+        vec![rec("0xs1", 4), rec("0xs2", 5)]
+    );
+
+    let settlements = vec![evmhot::db::Erc20Settlement {
+        key: "0xt1:3".to_string(),
+        outbox: Some(f002a_outbox("base:0xt1:3", "deposit_swept")),
+    }];
+    assert_eq!(db.complete_erc20_sweep("base", &settlements).unwrap(), 1);
+    assert!(db.get_detected_erc20_deposits("base").unwrap().is_empty());
+    assert!(db
+        .get_webhook_delivery("base:0xt1:3", "deposit_swept")
+        .unwrap()
+        .is_some());
+    assert!(db
+        .complete_native_sweep(
+            "base",
+            "0xn1",
+            Some(&f002a_outbox("base:0xn1", "deposit_swept"))
+        )
+        .unwrap());
+    assert!(db.get_detected_deposits("base").unwrap().is_empty());
+}
+
+fn seed_account(db: &Db) {
+    db.register_account("acct-a", 0, "0xaddr-a", "https://hook.example/a")
+        .unwrap();
+}
+
+#[test]
+fn sqlite_f002a_store_cycle() {
+    let tmp = NamedTempFile::new().unwrap();
+    let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+    seed_account(&db);
+    assert_f002a_store_cycle(&db);
+}
+
+#[test]
+fn postgres_f002a_store_cycle_matches_sqlite() {
+    if !docker_available() {
+        eprintln!("skipping postgres_f002a_store_cycle_matches_sqlite: Docker not available");
+        return;
+    }
+    let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let (_container, url) = start_postgres();
+    let db = connect_pg(&url, None, None);
+    seed_account(&db);
+    assert_f002a_store_cycle(&db);
+}
+
+/// An older Postgres store (tables without the F-002a columns) gains them on
+/// connect, and its old rows stay readable (nullable columns, no backfill).
+#[test]
+fn postgres_f002a_schema_upgrades_an_existing_store() {
+    if !docker_available() {
+        eprintln!(
+            "skipping postgres_f002a_schema_upgrades_an_existing_store: Docker not available"
+        );
+        return;
+    }
+    let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let (_container, url) = start_postgres();
+    {
+        let mut client = raw_pg_client(&url);
+        client
+            .batch_execute(
+                "CREATE TABLE erc20_deposits (
+                   chain TEXT NOT NULL, tx_hash TEXT NOT NULL, log_index BIGINT NOT NULL,
+                   account_id TEXT NOT NULL, amount TEXT NOT NULL, token_address TEXT NOT NULL,
+                   token_symbol TEXT NOT NULL, status TEXT NOT NULL,
+                   PRIMARY KEY (chain, tx_hash, log_index));
+                 INSERT INTO erc20_deposits VALUES ('base', '0xold', 1, 'acct-a', '7', '0xtoken1', 'TKN', 'detected');",
+            )
+            .unwrap();
+    }
+    let db = connect_pg(&url, None, None);
+    let detected = db.get_detected_erc20_deposits("base").unwrap();
+    assert_eq!(detected.len(), 1);
+    assert_eq!(detected[0].from_address, None);
+}
+
+/// REQ-WH-7 on Postgres: when the outbox write fails, the state change it
+/// reports is rolled back with it.
+#[test]
+fn postgres_req_wh_7_failed_outbox_write_rolls_back_the_state_change() {
+    if !docker_available() {
+        eprintln!("skipping postgres_req_wh_7_failed_outbox_write_rolls_back_the_state_change: Docker not available");
+        return;
+    }
+    let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let (_container, url) = start_postgres();
+    let db = connect_pg(&url, None, None);
+    seed_account(&db);
+    let token = f002a_token_deposit("0xt1", 3, Some("0xsender-t"));
+    db.record_erc20_deposit_atomic(&token, None).unwrap();
+    db.record_native_deposit_atomic(
+        &evmhot::db::NewNativeDeposit {
+            chain: "base".to_string(),
+            tx_hash: "0xn0".to_string(),
+            account_id: "acct-a".to_string(),
+            amount: "5".to_string(),
+            from_address: None,
+        },
+        None,
+    )
+    .unwrap();
+
+    let mut client = raw_pg_client(&url);
+    client
+        .batch_execute(
+            "CREATE FUNCTION fail_outbox() RETURNS trigger AS $$
+             BEGIN RAISE EXCEPTION 'outbox unavailable'; END $$ LANGUAGE plpgsql;
+             CREATE TRIGGER fail_outbox BEFORE INSERT ON webhook_deliveries
+             FOR EACH ROW EXECUTE FUNCTION fail_outbox();",
+        )
+        .unwrap();
+
+    // Detection: nothing is stored.
+    let fresh = f002a_token_deposit("0xt2", 4, Some("0xsender-t"));
+    assert!(db
+        .record_erc20_deposit_atomic(
+            &fresh,
+            Some(&f002a_outbox("base:0xt2:4", "deposit_detected"))
+        )
+        .is_err());
+    assert!(db
+        .record_native_deposit_atomic(
+            &evmhot::db::NewNativeDeposit {
+                chain: "base".to_string(),
+                tx_hash: "0xn1".to_string(),
+                account_id: "acct-a".to_string(),
+                amount: "5".to_string(),
+                from_address: None,
+            },
+            Some(&f002a_outbox("base:0xn1", "deposit_detected")),
+        )
+        .is_err());
+    let detected = db.get_detected_erc20_deposits("base").unwrap();
+    assert_eq!(
+        detected.len(),
+        1,
+        "the failed detection left no deposit behind"
+    );
+    assert_eq!(detected[0].key, "0xt1:3");
+    assert_eq!(db.get_detected_deposits("base").unwrap().len(), 1);
+
+    // Sweep completion: nothing is marked swept.
+    let settlements = vec![evmhot::db::Erc20Settlement {
+        key: "0xt1:3".to_string(),
+        outbox: Some(f002a_outbox("base:0xt1:3", "deposit_swept")),
+    }];
+    assert!(db.complete_erc20_sweep("base", &settlements).is_err());
+    assert!(db
+        .complete_native_sweep(
+            "base",
+            "0xn0",
+            Some(&f002a_outbox("base:0xn0", "deposit_swept"))
+        )
+        .is_err());
+    assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 1);
+    assert_eq!(db.get_detected_deposits("base").unwrap().len(), 1);
+
+    client
+        .batch_execute("DROP TRIGGER fail_outbox ON webhook_deliveries;")
+        .unwrap();
+    assert_eq!(db.complete_erc20_sweep("base", &settlements).unwrap(), 1);
+    assert!(db.get_detected_erc20_deposits("base").unwrap().is_empty());
+}
+
+fn assert_registration_refused_at_the_ceiling(db: &Db, set_counter: impl Fn(u64)) {
+    let derive = |i: u32| -> anyhow::Result<String> { Ok(format!("0xaddr{i}")) };
+    // The last index, 2^32 - 1, is still issued, once.
+    set_counter(u64::from(u32::MAX));
+    let (index, _, created) = db
+        .register_account_auto("last", "https://x", derive)
+        .unwrap();
+    assert_eq!((index, created), (u32::MAX, true));
+
+    // The counter is now 2^32: refused, never wrapped.
+    let err = db
+        .register_account_auto("one-too-many", "https://x", derive)
+        .unwrap_err();
+    assert!(err.to_string().contains("REQ-RG-5"), "{err}");
+    assert!(db.get_account_by_id("one-too-many").unwrap().is_none());
+    // Refusing again is stable (the counter did not move).
+    assert!(db
+        .register_account_auto("one-too-many", "https://x", derive)
+        .is_err());
+    // A repeated registration of an existing id still answers.
+    let (index, _, created) = db
+        .register_account_auto("last", "https://x", derive)
+        .unwrap();
+    assert_eq!((index, created), (u32::MAX, false));
+}
+
+#[test]
+fn sqlite_req_rg_5_registration_at_2_pow_32_is_refused() {
+    let tmp = NamedTempFile::new().unwrap();
+    let path = tmp.path().to_str().unwrap().to_string();
+    let db = Db::new(&path).unwrap();
+    assert_registration_refused_at_the_ceiling(&db, |value| {
+        let conn = RusqliteConnection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO state (key, value) VALUES ('next_index', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [value.to_string()],
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn postgres_req_rg_5_registration_at_2_pow_32_is_refused() {
+    if !docker_available() {
+        eprintln!(
+            "skipping postgres_req_rg_5_registration_at_2_pow_32_is_refused: Docker not available"
+        );
+        return;
+    }
+    let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let (_container, url) = start_postgres();
+    let db = connect_pg(&url, None, None);
+    assert_registration_refused_at_the_ceiling(&db, |value| {
+        let mut client = raw_pg_client(&url);
+        client
+            .execute(
+                "UPDATE state SET value = $1 WHERE key = 'next_index'",
+                &[&value.to_string()],
+            )
+            .unwrap();
+    });
 }
