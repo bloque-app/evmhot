@@ -16,7 +16,7 @@ yet are marked **(not built)**, and `PLAN.md` §4 names the feature that builds 
 | Version | Date | Change |
 |---|---|---|
 | 0.1.0 | 2026-11-09 | The service as it ran: registration, detection, sweeps, faucet, webhooks, store, API |
-| 0.2.1 | 2026-11-09 | Amendment 0002: derivation indices are 32-bit raw child numbers; `register`'s response shape |
+| 0.2.1 | 2026-11-09 | Amendment 0002: derivation indices are 32-bit raw child numbers; `register`'s response shape; JSON error bodies |
 | 0.2.0 | 2026-11-09 | Amendment 0001: sweep target kinds and bounds, the sweep coordinate, finality per network, sweep outcome check, lag and provider alerts, atomic outbox, separate tokens, counter ceiling; withdraws the symbol filter |
 
 ### Normative language
@@ -253,7 +253,7 @@ where it takes no network.
 | `POST /evm/block_number` | `{block_number}` | `{block_number}`: moves the default network's cursor. An operator action |
 
 When the wallet is disabled, `register` and both `block_number` routes answer `503`, and `verify_transfer` answers
-`500`. Errors are a status code with a plain-text body.
+`500`. Errors are the status code with a JSON body `{error, status}`: the message and the numeric status.
 
 ### 9.2 Operator routes
 

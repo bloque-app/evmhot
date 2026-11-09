@@ -11,9 +11,10 @@ registration; the wallet library derives those indices deterministically as hard
 Revise `REQ-KY-1`: the index is a raw 32-bit child number, and one at or above 2^31 is a hardened child at that
 number (the library parses `m/44'/60'/0'/0/<n>` with `n` as a `u32`). Revise `REQ-RG-5`: the ceiling is 2^32, not 2^31.
 
-## A2 — `register`'s response
+## A2 — `register`'s response and error bodies
 
-Correct §9.1: the host omitted `funding_tx` rather than sending null.
+Correct §9.1: the host omitted `funding_tx` rather than sending null, and its error bodies were JSON
+`{error, status}`, not plain text.
 
 ## Identifier ledger
 
