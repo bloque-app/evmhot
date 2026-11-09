@@ -21,6 +21,10 @@ path = "src/bin/migrate_redb_to_sqlite.rs"
 name = "migrate_sqlite_to_postgres"
 path = "src/bin/migrate_sqlite_to_postgres.rs"
 
+[[bin]]
+name = "evmhot-gapscan"
+path = "src/bin/evmhot-gapscan.rs"
+
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }
 axum = "0.7"

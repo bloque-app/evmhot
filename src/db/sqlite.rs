@@ -1001,8 +1001,9 @@ impl Db {
 
     pub fn list_registrations(&self) -> Result<Vec<(String, u32, String)>> {
         let conn = self.read.get()?;
-        let mut stmt = conn
-            .prepare("SELECT id, derivation_index, address FROM accounts ORDER BY derivation_index")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, derivation_index, address FROM accounts ORDER BY derivation_index",
+        )?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
