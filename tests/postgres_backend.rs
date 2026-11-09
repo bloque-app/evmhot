@@ -1500,3 +1500,187 @@ fn postgres_detected_order_is_stable() {
     seed_account(&db);
     assert_order_intents_and_review(&db);
 }
+
+/// `information_schema.columns` of the public schema, as a sortable snapshot.
+fn column_snapshot(client: &mut postgres::Client) -> Vec<String> {
+    client
+        .query(
+            "SELECT table_name || '.' || column_name || ':' || data_type || ':' ||
+                    COALESCE(column_default, '-') || ':' || is_nullable
+             FROM information_schema.columns WHERE table_schema = 'public'
+             ORDER BY table_name, column_name",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+/// The schema upgrade, from production's actual tables (read 2026-11-09), not
+/// from an older evmhot schema: every row survives, the new columns are NULL or
+/// defaulted, the new tables exist empty, and a second start changes nothing.
+#[test]
+fn postgres_f002a_upgrades_the_production_ledger_schema() {
+    if !docker_available() {
+        eprintln!(
+            "skipping postgres_f002a_upgrades_the_production_ledger_schema: Docker not available"
+        );
+        return;
+    }
+    let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let (_container, url) = start_postgres();
+    {
+        let mut client = raw_pg_client(&url);
+        client
+            .batch_execute(include_str!("fixtures/prod_ledger_schema_2026-11-09.sql"))
+            .unwrap();
+        client
+            .batch_execute(
+                "INSERT INTO accounts VALUES ('acct-1', 5, '0xa1', 'https://hook.example/a');
+                 INSERT INTO accounts VALUES ('acct-2', 2147500000, '0xa2', 'https://hook.example/b');
+                 INSERT INTO deposits VALUES ('polygon', '0xnative1', 'acct-1', '1000', 'swept');
+                 INSERT INTO erc20_deposits VALUES ('polygon', '0xerc1', 0, 'acct-1', '50', '0xtok', 'USDT', 'swept');
+                 INSERT INTO erc20_deposits VALUES ('polygon', '0xerc2', 3, 'acct-2', '70', '0xtok', 'USDT', 'failed');
+                 INSERT INTO state VALUES ('next_index', '6');
+                 INSERT INTO state VALUES ('last_block:polygon', '123456');
+                 INSERT INTO sweep_meta VALUES ('polygon', '0xerc1', 0, '0xsweep1', 2);
+                 INSERT INTO token_metadata VALUES ('polygon', '0xtok', 'USDT', 6, 'Tether');
+                 INSERT INTO webhook_deliveries VALUES ('polygon:0xerc1:0', 'deposit_swept', 'acct-1',
+                   'https://hook.example/a', '{\"k\":1}', 'delivered', 1, 200, NULL, NULL, 1700000000);",
+            )
+            .unwrap();
+    }
+
+    // First start: the normal schema bootstrap.
+    let db = connect_pg(&url, None, None);
+    let mut client = raw_pg_client(&url);
+    let after_first = column_snapshot(&mut client);
+    let count = |client: &mut postgres::Client, table: &str| -> i64 {
+        client
+            .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .unwrap()
+            .get(0)
+    };
+    for (table, n) in [
+        ("accounts", 2),
+        ("deposits", 1),
+        ("erc20_deposits", 2),
+        ("state", 2),
+        ("sweep_meta", 1),
+        ("token_metadata", 1),
+        ("webhook_deliveries", 1),
+        // New tables, empty.
+        ("sweeps", 0),
+        ("sweep_intents", 0),
+        ("sweep_alerts", 0),
+    ] {
+        assert_eq!(count(&mut client, table), n, "{table} after the upgrade");
+    }
+
+    // Row values survived exactly; the new columns are NULL.
+    let deposit = client
+        .query_one(
+            "SELECT account_id, amount, status, from_address, review_kind FROM deposits",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(deposit.get::<_, String>(0), "acct-1");
+    assert_eq!(deposit.get::<_, String>(1), "1000");
+    assert_eq!(deposit.get::<_, String>(2), "swept");
+    assert_eq!(deposit.get::<_, Option<String>>(3), None);
+    assert_eq!(deposit.get::<_, Option<String>>(4), None);
+    let erc = client
+        .query(
+            "SELECT tx_hash, amount, status, from_address, review_kind, seq
+             FROM erc20_deposits ORDER BY tx_hash",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(erc[0].get::<_, String>(2), "swept");
+    assert_eq!(erc[1].get::<_, String>(2), "failed");
+    for r in &erc {
+        assert_eq!(r.get::<_, Option<String>>(3), None, "from_address NULL");
+        assert_eq!(r.get::<_, Option<String>>(4), None, "review_kind NULL");
+    }
+    assert_ne!(
+        erc[0].get::<_, i64>(5),
+        erc[1].get::<_, i64>(5),
+        "seq is filled in"
+    );
+    let meta = client
+        .query_one(
+            "SELECT sweep_tx_hash, zero_balance_retry_count FROM sweep_meta",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(meta.get::<_, String>(0), "0xsweep1");
+    assert_eq!(meta.get::<_, i64>(1), 2);
+    let hook = client
+        .query_one(
+            "SELECT status, payload, updated_at FROM webhook_deliveries",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(hook.get::<_, String>(0), "delivered");
+    assert_eq!(hook.get::<_, i64>(2), 1700000000);
+
+    // The store works on it: reads through the API, the counter continues, and a
+    // new deposit records with its sender and the new columns.
+    assert_eq!(db.get_account_by_id("acct-1").unwrap().unwrap().1, "0xa1");
+    assert!(db
+        .get_detected_erc20_deposits("polygon")
+        .unwrap()
+        .is_empty());
+    let (index, _, created) = db
+        .register_account_auto("acct-3", "https://hook.example/c", |i| {
+            Ok(format!("0xnew{i}"))
+        })
+        .unwrap();
+    assert_eq!((index, created), (6, true));
+    db.record_erc20_deposit_atomic(&f002a_token_deposit("0xnew", 1, Some("0xs")), None)
+        .unwrap();
+    assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 1);
+    // The upgraded tables took the unique index on open sweep intents too.
+    let idx: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'uq_sweep_intents_open'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(idx, 1);
+    drop(db);
+
+    // Second start: a no-op (same columns, defaults, and rows).
+    let before_rows: Vec<i64> = [
+        "accounts",
+        "deposits",
+        "erc20_deposits",
+        "state",
+        "webhook_deliveries",
+    ]
+    .iter()
+    .map(|t| count(&mut client, t))
+    .collect();
+    let after_columns_before = column_snapshot(&mut client);
+    assert_eq!(after_first, after_columns_before);
+    let db = connect_pg(&url, None, None);
+    let after_rows: Vec<i64> = [
+        "accounts",
+        "deposits",
+        "erc20_deposits",
+        "state",
+        "webhook_deliveries",
+    ]
+    .iter()
+    .map(|t| count(&mut client, t))
+    .collect();
+    assert_eq!(before_rows, after_rows);
+    assert_eq!(
+        column_snapshot(&mut client),
+        after_first,
+        "a second start changes no column"
+    );
+    drop(db);
+}
