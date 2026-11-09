@@ -86,7 +86,7 @@ pub struct SweepIntentRow {
     pub raw_tx: Option<String>,
     pub txs: String,
     pub passes: i64,
-    pub gone_passes: i64,
+    pub gone_block: i64,
 }
 
 /// One sweep that settled a deposit (REQ-SW-10).
@@ -352,7 +352,7 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
     if table_exists(&conn, "sweep_intents")? {
         let mut stmt = conn.prepare(
             "SELECT id, chain, account_id, token_address, group_key, keys, part_index, amount,
-                    target, state, tx_hash, nonce, raw_tx, passes, address, txs, gone_passes
+                    target, state, tx_hash, nonce, raw_tx, passes, address, txs, gone_block
              FROM sweep_intents ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -373,7 +373,7 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
                 passes: r.get(13)?,
                 address: r.get(14)?,
                 txs: r.get(15)?,
-                gone_passes: r.get(16)?,
+                gone_block: r.get(16)?,
             })
         })?;
         snapshot.sweep_intents = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -581,7 +581,7 @@ fn migrate_after_checks(
         let changes = tx.execute(
             "INSERT INTO sweep_intents
              (id, chain, account_id, token_address, group_key, keys, part_index, amount, target,
-              state, tx_hash, nonce, raw_tx, passes, address, txs, gone_passes)
+              state, tx_hash, nonce, raw_tx, passes, address, txs, gone_block)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
              ON CONFLICT (id) DO NOTHING",
             &[
@@ -601,7 +601,7 @@ fn migrate_after_checks(
                 &row.passes,
                 &row.address,
                 &row.txs,
-                &row.gone_passes,
+                &row.gone_block,
             ],
         )?;
         summary.sweep_intents.1 += changes as usize;

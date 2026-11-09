@@ -736,12 +736,12 @@ impl PostgresBackend {
         let pattern = format!("%\"{tx_hash}\"%");
         if let Some(row) = tx.query_opt(
             "SELECT tx_hash FROM sweep_intents
-             WHERE chain = $1 AND state = 'pending' AND keys LIKE $2 LIMIT 1",
+             WHERE chain = $1 AND state IN ('pending', 'review_gone') AND keys LIKE $2 LIMIT 1",
             &[&chain, &pattern],
         )? {
             let hash: Option<String> = row.get(0);
             return Err(anyhow!(
-                "cannot retry: a sweep is still in flight (tx {})",
+                "cannot retry: a sweep is still in flight or being re-checked (tx {})",
                 hash.as_deref().unwrap_or("not yet signed")
             ));
         }
@@ -775,12 +775,12 @@ impl PostgresBackend {
         // A sweep still in flight could land: it is never abandoned from here.
         if let Some(row) = tx.query_opt(
             "SELECT tx_hash FROM sweep_intents
-             WHERE chain = $1 AND state = 'pending' AND keys LIKE $2 LIMIT 1",
+             WHERE chain = $1 AND state IN ('pending', 'review_gone') AND keys LIKE $2 LIMIT 1",
             &[&chain, &pattern],
         )? {
             let hash: Option<String> = row.get(0);
             return Err(anyhow!(
-                "cannot retry: a sweep is still in flight (tx {})",
+                "cannot retry: a sweep is still in flight or being re-checked (tx {})",
                 hash.as_deref().unwrap_or("not yet signed")
             ));
         }
@@ -1047,7 +1047,7 @@ impl PostgresBackend {
         t.execute(
             "UPDATE sweep_intents
              SET nonce = COALESCE(nonce, $2), tx_hash = $3, raw_tx = $4, txs = $5,
-                 passes = 0, gone_passes = 0
+                 passes = 0, gone_block = 0
              WHERE id = $1",
             &[
                 &id,
@@ -1061,15 +1061,54 @@ impl PostgresBackend {
         Ok(())
     }
 
-    pub fn bump_sweep_intent_gone_passes(&self, id: i64) -> Result<u64> {
+    pub fn note_nonce_used_block(&self, id: i64, block: u64) -> Result<u64> {
         let mut guard = self.conn()?;
         let row = guard.client().query_one(
-            "UPDATE sweep_intents SET gone_passes = gone_passes + 1 WHERE id = $1
-             RETURNING gone_passes",
-            &[&id],
+            "UPDATE sweep_intents
+             SET gone_block = CASE WHEN gone_block = 0 THEN $2 ELSE gone_block END
+             WHERE id = $1 RETURNING gone_block",
+            &[&id, &(block as i64)],
         )?;
-        let n: i64 = row.get(0);
-        Ok(n as u64)
+        let first: i64 = row.get(0);
+        Ok(first as u64)
+    }
+
+    pub fn move_sweep_intent(&self, id: i64, from: &str, to: &str) -> Result<()> {
+        let mut guard = self.conn()?;
+        guard.client().execute(
+            "UPDATE sweep_intents SET state = $3 WHERE id = $1 AND state = $2",
+            &[&id, &from, &to],
+        )?;
+        Ok(())
+    }
+
+    pub fn release_review_deposits_for_keys(
+        &self,
+        chain: &str,
+        keys: &[String],
+        native: bool,
+    ) -> Result<()> {
+        let mut guard = self.conn()?;
+        let mut tx = guard.client().transaction()?;
+        for key in keys {
+            if native {
+                tx.execute(
+                    "UPDATE deposits SET status = 'detected', review_kind = NULL
+                     WHERE chain = $1 AND tx_hash = $2 AND status = 'needs_review'",
+                    &[&chain, key],
+                )?;
+            } else {
+                let (tx_hash, log_index) = parse_local_key(key)?;
+                tx.execute(
+                    "UPDATE erc20_deposits SET status = 'detected', review_kind = NULL
+                     WHERE chain = $1 AND tx_hash = $2 AND log_index = $3
+                       AND status = 'needs_review'",
+                    &[&chain, &tx_hash, &log_index],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn highest_landed_intent_nonce(
@@ -1080,7 +1119,8 @@ impl PostgresBackend {
         let mut guard = self.conn()?;
         let row = guard.client().query_one(
             "SELECT MAX(nonce) FROM sweep_intents
-             WHERE chain = $1 AND account_id = $2 AND state IN ('succeeded', 'failed', 'review')",
+             WHERE chain = $1 AND account_id = $2
+               AND state IN ('succeeded', 'failed', 'review', 'review_gone', 'closed_by_operator')",
             &[&chain, &account_id],
         )?;
         let n: Option<i64> = row.get(0);
@@ -1157,7 +1197,7 @@ impl PostgresBackend {
     pub fn finish_sweep_intent(&self, id: i64, state: &str) -> Result<()> {
         let mut guard = self.conn()?;
         guard.client().execute(
-            "UPDATE sweep_intents SET state = $2 WHERE id = $1 AND state = 'pending'",
+            "UPDATE sweep_intents SET state = $2 WHERE id = $1 AND state IN ('pending', 'review_gone')",
             &[&id, &state],
         )?;
         Ok(())
@@ -1173,16 +1213,15 @@ impl PostgresBackend {
         Ok(passes as u64)
     }
 
-    pub fn all_pending_sweep_intents(&self, chain: &str) -> Result<Vec<SweepIntent>> {
+    pub fn sweep_intents_in_state(&self, chain: &str, state: &str) -> Result<Vec<SweepIntent>> {
         let mut guard = self.conn()?;
         let rows = guard.client().query(
             "SELECT id, group_key, keys, part_index, amount, target, tx_hash, passes, nonce, raw_tx,
-                    account_id, token_address, address, txs, gone_passes
-             FROM sweep_intents WHERE chain = $1 AND state = 'pending' ORDER BY id",
-            &[&chain],
+                    account_id, token_address, address, txs, gone_block
+             FROM sweep_intents WHERE chain = $1 AND state = $2 ORDER BY id",
+            &[&chain, &state],
         )?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(|r| {
                 let keys_json: String = r.get(2);
                 let part_index: i64 = r.get(3);
@@ -1190,15 +1229,19 @@ impl PostgresBackend {
                 let nonce: Option<i64> = r.get(8);
                 let txs_json: String = r.get(13);
                 let gone: i64 = r.get(14);
-                SweepIntent {
+                // A transaction list that does not parse is an error, not an
+                // empty list (which would read as "never signed").
+                Ok(SweepIntent {
                     id: r.get(0),
                     account_id: r.get(10),
                     address: r.get(12),
-                    txs: serde_json::from_str(&txs_json).unwrap_or_default(),
-                    gone_passes: gone as u64,
+                    txs: serde_json::from_str(&txs_json)
+                        .map_err(|e| anyhow!("sweep intent txs: {e}"))?,
+                    gone_block: gone as u64,
                     token_address: r.get(11),
                     group_key: r.get(1),
-                    keys: serde_json::from_str(&keys_json).unwrap_or_default(),
+                    keys: serde_json::from_str(&keys_json)
+                        .map_err(|e| anyhow!("sweep intent keys: {e}"))?,
                     part_index: part_index as u64,
                     amount: r.get(4),
                     target: r.get(5),
@@ -1206,9 +1249,13 @@ impl PostgresBackend {
                     nonce: nonce.map(|n| n as u64),
                     raw_tx: r.get(9),
                     passes: passes as u64,
-                }
+                })
             })
-            .collect())
+            .collect()
+    }
+
+    pub fn all_pending_sweep_intents(&self, chain: &str) -> Result<Vec<SweepIntent>> {
+        self.sweep_intents_in_state(chain, "pending")
     }
 
     pub fn pending_sweep_intents(&self, chain: &str, keys: &[String]) -> Result<Vec<SweepIntent>> {

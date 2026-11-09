@@ -23,7 +23,7 @@ CREATE TABLE sweep_intents (
   raw_tx TEXT,
   txs TEXT NOT NULL DEFAULT '[]',
   passes INTEGER NOT NULL DEFAULT 0,
-  gone_passes INTEGER NOT NULL DEFAULT 0
+  gone_block INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_sweep_intents_state ON sweep_intents (chain, state);
 -- At most one signed, unresolved transaction per deposit address, across tokens and the

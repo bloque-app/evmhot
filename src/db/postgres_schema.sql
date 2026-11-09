@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS sweep_intents (
   raw_tx TEXT,
   txs TEXT NOT NULL DEFAULT '[]',
   passes BIGINT NOT NULL DEFAULT 0,
-  gone_passes BIGINT NOT NULL DEFAULT 0
+  gone_block BIGINT NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sweep_intents_state ON sweep_intents (chain, state);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_sweep_intents_open ON sweep_intents (chain, account_id) WHERE state = 'pending';

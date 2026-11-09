@@ -170,8 +170,9 @@ pub struct SweepIntent {
     /// Every transaction signed for this intent's nonce, oldest first (a
     /// repricing signs another at the same nonce).
     pub txs: Vec<IntentTx>,
-    /// Passes in which the nonce was seen used with no receipt of ours.
-    pub gone_passes: u64,
+    /// Block at which the nonce was first seen used with no receipt of ours
+    /// (0: not seen).
+    pub gone_block: u64,
     pub token_address: String,
     pub group_key: String,
     pub keys: Vec<String>,
@@ -662,10 +663,7 @@ impl Db {
 
     /// Every pending intent on the chain, whatever its deposits' status.
     pub fn all_pending_sweep_intents(&self, chain: &str) -> Result<Vec<SweepIntent>> {
-        match self.inner.as_ref() {
-            DbInner::Sqlite(s) => s.all_pending_sweep_intents(chain),
-            DbInner::Postgres(p) => p.all_pending_sweep_intents(chain),
-        }
+        self.sweep_intents_in_state(chain, "pending")
     }
 
     /// State and newest transaction hash of every intent (any state) that
@@ -731,15 +729,47 @@ impl Db {
             .find(|i| i.account_id == account_id))
     }
 
-    /// Counts one more pass in which the nonce was used with no receipt of ours.
-    pub fn bump_sweep_intent_gone_passes(&self, id: i64) -> Result<u64> {
+    /// Records the block at which an intent's nonce was first seen used with no
+    /// receipt of ours, and returns the first such block (this one if new).
+    pub fn note_nonce_used_block(&self, id: i64, block: u64) -> Result<u64> {
         match self.inner.as_ref() {
-            DbInner::Sqlite(s) => s.bump_sweep_intent_gone_passes(id),
-            DbInner::Postgres(p) => p.bump_sweep_intent_gone_passes(id),
+            DbInner::Sqlite(s) => s.note_nonce_used_block(id, block),
+            DbInner::Postgres(p) => p.note_nonce_used_block(id, block),
         }
     }
 
-    /// Highest nonce of an intent that landed (succeeded, failed or review):
+    /// Intents in the given state (`review_gone` ones are watched for a late receipt).
+    pub fn sweep_intents_in_state(&self, chain: &str, state: &str) -> Result<Vec<SweepIntent>> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.sweep_intents_in_state(chain, state),
+            DbInner::Postgres(p) => p.sweep_intents_in_state(chain, state),
+        }
+    }
+
+    /// Moves an intent from one state to another (no-op if it is elsewhere).
+    pub fn move_sweep_intent(&self, id: i64, from: &str, to: &str) -> Result<()> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.move_sweep_intent(id, from, to),
+            DbInner::Postgres(p) => p.move_sweep_intent(id, from, to),
+        }
+    }
+
+    /// Puts deposits that went to `needs_review` back to `detected` (their
+    /// verdict turned out wrong).
+    pub fn release_review_deposits_for_keys(
+        &self,
+        chain: &str,
+        keys: &[String],
+        native: bool,
+    ) -> Result<()> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.release_review_deposits_for_keys(chain, keys, native),
+            DbInner::Postgres(p) => p.release_review_deposits_for_keys(chain, keys, native),
+        }
+    }
+
+    /// Highest nonce of an intent that landed (succeeded, failed, review,
+    /// review_gone or closed_by_operator):
     /// the next nonce is at least one above it even if a public RPC's pending
     /// count is stale.
     pub fn highest_landed_intent_nonce(

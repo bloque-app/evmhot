@@ -87,8 +87,14 @@ included, goes through a sweep intent:
    good: it is **never dropped** once signed. If it is underpriced (its max fee is below the current estimate) after 10
    waiting passes, it is re-signed **at the same nonce** with both fee fields raised by at least 10% (or to the
    current estimate), the new hash is stored next to the old, and it is broadcast; at most one of them can land. If
-   the nonce is used and none of our hashes has a receipt (seen on two passes, because receipt indexing can lag), something outside evmhot used
-   the key: the deposits go to `needs_review`. Only an intent that was never signed (a crash before signing) is dropped.
+   the nonce is used and none of our hashes has a receipt, it waits: receipt indexing on a public or load-balanced RPC
+   can lag the nonce. Only after 64 blocks past the nonce first being seen used does it conclude that something outside
+   evmhot used the key, and send the deposits to review (`review_gone`). That verdict is still **watched**: every pass
+   reads the receipts of such intents, and if one of our hashes shows up the sweep is recorded through the normal path,
+   the deposits go back to `detected`, and `EVMHOT_ALERT kind=review_self_resolved` is raised once. The operator's retry
+   is refused until the watch ends (5,000 blocks). Only an intent that was never signed (a crash before signing) is
+   dropped. A sweep that sits unmined with its nonce free raises `EVMHOT_ALERT kind=sweep_stuck` once after 30 minutes
+   (it is still rebroadcast and, if underpriced, repriced).
 3. A split sends one part per pass and re-reads the balance for the next; a long split on one token therefore holds
    back the address's other tokens and its native sweep until it ends. With `per_transfer` the parts are
    `ceil(remaining / ceil(remaining / max))`, near equal.
@@ -108,6 +114,11 @@ and it **closes** that deposit's review intents (`closed_by_operator`); it never
 computed from recorded sweeps alone. If the transfer that was reviewed had really moved the funds and no sweep is
 recorded, the address is empty and the zero-balance rule (REQ-SW-3) settles the retried deposit after 10 passes with no
 `deposit_swept`: retrying such a review is the operator's word that the deposit needs nothing more.
+
+**Native sweeps.** The gas for the native sweep is estimated by the node (a contract treasury's receive function can
+cost more than 21,000 gas, or revert). A native sweep that fails to estimate or reverts on chain counts toward
+REQ-SW-4; the fifth sends the native deposits to `needs_review` (`kind=native_sweep_failed`, `EVMHOT_ALERT`) instead of
+retrying forever. A faucet top-up whose receipt times out is a transient funding error, not a sweep failure.
 
 **Limits.** A dust remainder below `min` stays owed (`EVMHOT_ALERT kind=dust`, once): the deposits are not settled and a
 later deposit lifts it. At load, `max = 0` and `min > max` are refused, and for `per_transfer` so is any `max` with

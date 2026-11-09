@@ -1438,14 +1438,14 @@ impl Db {
                 let in_flight: Option<Option<String>> = conn
                     .query_row(
                         "SELECT tx_hash FROM sweep_intents
-                         WHERE chain = ?1 AND state = 'pending' AND keys LIKE ?2 LIMIT 1",
+                         WHERE chain = ?1 AND state IN ('pending', 'review_gone') AND keys LIKE ?2 LIMIT 1",
                         params![chain, pattern],
                         |r| r.get(0),
                     )
                     .optional()?;
                 if let Some(hash) = in_flight {
                     return Err(anyhow!(
-                        "cannot retry: a sweep is still in flight (tx {})",
+                        "cannot retry: a sweep is still in flight or being re-checked (tx {})",
                         hash.as_deref().unwrap_or("not yet signed")
                     ));
                 }
@@ -1483,14 +1483,14 @@ impl Db {
                 let in_flight: Option<Option<String>> = conn
                     .query_row(
                         "SELECT tx_hash FROM sweep_intents
-                         WHERE chain = ?1 AND state = 'pending' AND keys LIKE ?2 LIMIT 1",
+                         WHERE chain = ?1 AND state IN ('pending', 'review_gone') AND keys LIKE ?2 LIMIT 1",
                         params![chain, pattern],
                         |r| r.get(0),
                     )
                     .optional()?;
                 if let Some(hash) = in_flight {
                     return Err(anyhow!(
-                        "cannot retry: a sweep is still in flight (tx {})",
+                        "cannot retry: a sweep is still in flight or being re-checked (tx {})",
                         hash.as_deref().unwrap_or("not yet signed")
                     ));
                 }
@@ -1755,7 +1755,7 @@ impl Db {
                 conn.execute(
                     "UPDATE sweep_intents
                      SET nonce = COALESCE(nonce, ?2), tx_hash = ?3, raw_tx = ?4, txs = ?5,
-                         passes = 0, gone_passes = 0
+                         passes = 0, gone_block = 0
                      WHERE id = ?1",
                     params![
                         id,
@@ -1770,18 +1770,61 @@ impl Db {
         })
     }
 
-    pub fn bump_sweep_intent_gone_passes(&self, id: i64) -> Result<u64> {
+    pub fn note_nonce_used_block(&self, id: i64, block: u64) -> Result<u64> {
         self.with_write(move |conn| {
             conn.execute(
-                "UPDATE sweep_intents SET gone_passes = gone_passes + 1 WHERE id = ?1",
-                params![id],
+                "UPDATE sweep_intents SET gone_block = ?2 WHERE id = ?1 AND gone_block = 0",
+                params![id, block as i64],
             )?;
-            let n: i64 = conn.query_row(
-                "SELECT gone_passes FROM sweep_intents WHERE id = ?1",
+            let first: i64 = conn.query_row(
+                "SELECT gone_block FROM sweep_intents WHERE id = ?1",
                 params![id],
                 |r| r.get(0),
             )?;
-            Ok(n as u64)
+            Ok(first as u64)
+        })
+    }
+
+    pub fn move_sweep_intent(&self, id: i64, from: &str, to: &str) -> Result<()> {
+        let (from, to) = (from.to_string(), to.to_string());
+        self.with_write(move |conn| {
+            conn.execute(
+                "UPDATE sweep_intents SET state = ?3 WHERE id = ?1 AND state = ?2",
+                params![id, from, to],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn release_review_deposits_for_keys(
+        &self,
+        chain: &str,
+        keys: &[String],
+        native: bool,
+    ) -> Result<()> {
+        let chain = chain.to_string();
+        let keys = keys.to_vec();
+        self.with_write(move |conn| {
+            atomically(conn, |conn| {
+                for key in &keys {
+                    if native {
+                        conn.execute(
+                            "UPDATE deposits SET status = 'detected', review_kind = NULL
+                             WHERE chain = ?1 AND tx_hash = ?2 AND status = 'needs_review'",
+                            params![chain, key],
+                        )?;
+                    } else {
+                        let (tx_hash, log_index) = parse_local_key(key)?;
+                        conn.execute(
+                            "UPDATE erc20_deposits SET status = 'detected', review_kind = NULL
+                             WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3
+                               AND status = 'needs_review'",
+                            params![chain, tx_hash, log_index],
+                        )?;
+                    }
+                }
+                Ok(())
+            })
         })
     }
 
@@ -1793,7 +1836,8 @@ impl Db {
         let conn = self.read.get()?;
         let n: Option<i64> = conn.query_row(
             "SELECT MAX(nonce) FROM sweep_intents
-             WHERE chain = ?1 AND account_id = ?2 AND state IN ('succeeded', 'failed', 'review')",
+             WHERE chain = ?1 AND account_id = ?2
+               AND state IN ('succeeded', 'failed', 'review', 'review_gone', 'closed_by_operator')",
             params![chain, account_id],
             |r| r.get(0),
         )?;
@@ -1881,7 +1925,7 @@ impl Db {
         let state = state.to_string();
         self.with_write(move |conn| {
             conn.execute(
-                "UPDATE sweep_intents SET state = ?2 WHERE id = ?1 AND state = 'pending'",
+                "UPDATE sweep_intents SET state = ?2 WHERE id = ?1 AND state IN ('pending', 'review_gone')",
                 params![id, state],
             )?;
             Ok(())
@@ -1903,29 +1947,38 @@ impl Db {
         })
     }
 
-    pub fn all_pending_sweep_intents(&self, chain: &str) -> Result<Vec<SweepIntent>> {
+    pub fn sweep_intents_in_state(&self, chain: &str, state: &str) -> Result<Vec<SweepIntent>> {
         let conn = self.read.get()?;
         let mut stmt = conn.prepare(
             "SELECT id, group_key, keys, part_index, amount, target, tx_hash, passes, nonce, raw_tx,
-                    account_id, token_address, address, txs, gone_passes
-             FROM sweep_intents WHERE chain = ?1 AND state = 'pending' ORDER BY id",
+                    account_id, token_address, address, txs, gone_block
+             FROM sweep_intents WHERE chain = ?1 AND state = ?2 ORDER BY id",
         )?;
-        let rows = stmt.query_map([chain], |r| {
+        let rows = stmt.query_map(params![chain, state], |r| {
             let keys_json: String = r.get(2)?;
             let part_index: i64 = r.get(3)?;
             let passes: i64 = r.get(7)?;
             let nonce: Option<i64> = r.get(8)?;
             let txs_json: String = r.get(13)?;
             let gone: i64 = r.get(14)?;
+            // A stored transaction list that does not parse is an error, not an
+            // empty list: an empty one would read as "never signed".
+            let to_err = |what: &str, e: serde_json::Error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    13,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::other(format!("sweep intent {what}: {e}"))),
+                )
+            };
             Ok(SweepIntent {
                 id: r.get(0)?,
                 account_id: r.get(10)?,
                 address: r.get(12)?,
-                txs: serde_json::from_str(&txs_json).unwrap_or_default(),
-                gone_passes: gone as u64,
+                txs: serde_json::from_str(&txs_json).map_err(|e| to_err("txs", e))?,
+                gone_block: gone as u64,
                 token_address: r.get(11)?,
                 group_key: r.get(1)?,
-                keys: serde_json::from_str(&keys_json).unwrap_or_default(),
+                keys: serde_json::from_str(&keys_json).map_err(|e| to_err("keys", e))?,
                 part_index: part_index as u64,
                 amount: r.get(4)?,
                 target: r.get(5)?,
@@ -1937,6 +1990,10 @@ impl Db {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn all_pending_sweep_intents(&self, chain: &str) -> Result<Vec<SweepIntent>> {
+        self.sweep_intents_in_state(chain, "pending")
     }
 
     pub fn pending_sweep_intents(&self, chain: &str, keys: &[String]) -> Result<Vec<SweepIntent>> {

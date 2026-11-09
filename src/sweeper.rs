@@ -34,6 +34,8 @@ pub struct Sweeper {
     /// process that dies mid-pass (the store is then picked up by a new sweeper).
     #[cfg(test)]
     crash_at: std::sync::Mutex<Option<CrashPoint>>,
+    /// Waiting passes after which an unmined sweep raises `sweep_stuck`.
+    stuck_after_passes: std::sync::atomic::AtomicU64,
 }
 
 /// Where a test may stop a pass, as if the process died there.
@@ -80,9 +82,15 @@ const MAX_ZERO_BALANCE_RETRIES: u64 = 10;
 const MAX_SWEEP_RETRIES: u64 = 5;
 /// Waiting passes before an underpriced sweep is re-signed at its nonce.
 const REPRICE_AFTER_PASSES: u64 = 10;
-/// Passes in which a sweep's nonce is seen used, with no receipt of ours, before
-/// the deposits go to review (receipt indexing can lag the nonce).
-const GONE_PASSES_TO_REVIEW: u64 = 2;
+/// Blocks a sweep's nonce must have been used, with no receipt for any of our
+/// hashes, before the deposits go to review: receipt indexing on a public or
+/// load-balanced RPC can lag the nonce for a while.
+const GONE_BLOCKS_TO_REVIEW: u64 = 64;
+/// How long a `review_gone` intent keeps being watched for a late receipt before
+/// its review is final (and the operator may release the deposits).
+const GONE_WATCH_BLOCKS: u64 = 5_000;
+/// Seconds a sweep may sit unmined with its nonce free before `sweep_stuck`.
+const STUCK_AFTER_SECS: u64 = 30 * 60;
 /// Outbox key (the `event` column) of the copy of `deposit_swept` sent to a
 /// target's `notify_url`. The payload's own `event` is still `deposit_swept`.
 pub(crate) const NOTIFY_EVENT_KEY: &str = "deposit_swept:notify";
@@ -95,11 +103,17 @@ fn is_permanent_sweep_error(err_debug: &str) -> bool {
     s.contains("buffer overrun") || s.contains("deserializ")
 }
 
+#[cfg(test)]
+pub(crate) fn is_transient_funding_error_for_tests(s: &str) -> bool {
+    is_transient_funding_error(s)
+}
+
 fn is_transient_funding_error(err_debug: &str) -> bool {
     let s = err_debug.to_ascii_lowercase();
     s.contains("faucet has insufficient balance")
         || s.contains("insufficient native balance for gas")
         || s.contains("still insufficient balance after faucet")
+        || s.contains("faucet top-up receipt timed out")
 }
 
 impl Sweeper {
@@ -120,7 +134,24 @@ impl Sweeper {
             faucet,
             #[cfg(test)]
             crash_at: std::sync::Mutex::new(None),
+            stuck_after_passes: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    fn stuck_after(&self) -> u64 {
+        let set = self
+            .stuck_after_passes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if set > 0 {
+            return set;
+        }
+        (STUCK_AFTER_SECS / self.chain.poll_interval.max(1)).max(1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_stuck_after_passes(&self, passes: u64) {
+        self.stuck_after_passes
+            .store(passes, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -184,6 +215,7 @@ impl Sweeper {
     }
 
     async fn process_deposits(&self) -> Result<()> {
+        self.recheck_review_gone().await?;
         let chain_name = self.chain.name.clone();
         let (erc20, native, open) = {
             let c = chain_name.clone();
@@ -323,6 +355,57 @@ impl Sweeper {
         Ok(())
     }
 
+    /// Sweeps sent to review because their nonce was used and no receipt showed
+    /// are still watched: a receipt that was only late settles them through the
+    /// normal path, and their deposits go back to `detected` (they were never
+    /// really lost). After `GONE_WATCH_BLOCKS` with nothing, the review is final.
+    async fn recheck_review_gone(&self) -> Result<()> {
+        let intents = {
+            let c = self.chain.name.clone();
+            self.db
+                .blocking(move |db| db.sweep_intents_in_state(&c, "review_gone"))
+                .await?
+        };
+        if intents.is_empty() {
+            return Ok(());
+        }
+        let block = self.provider.get_block_number().await?;
+        for intent in intents {
+            let native = intent.token_address == NATIVE_TOKEN;
+            let Some((tx, receipt)) = self.find_receipt(&intent).await? else {
+                if block.saturating_sub(intent.gone_block) >= GONE_WATCH_BLOCKS {
+                    self.db
+                        .blocking({
+                            let id = intent.id;
+                            move |db| db.move_sweep_intent(id, "review_gone", "review")
+                        })
+                        .await?;
+                }
+                continue;
+            };
+            let address = Address::from_str(&intent.address)?;
+            warn!(
+                "[{}] sweep {} was reviewed as lost but has a receipt: resolving it",
+                self.chain.name, tx.hash
+            );
+            // Deposits first, so settlement sees them detected.
+            {
+                let (c, keys) = (self.chain.name.clone(), intent.keys.clone());
+                self.db
+                    .blocking(move |db| db.release_review_deposits_for_keys(&c, &keys, native))
+                    .await?;
+            }
+            let address_str = intent.address.clone();
+            self.apply_receipt(&intent, &tx, &receipt, &address_str, address)
+                .await?;
+            for key in &intent.keys {
+                self.alert_once_with_tx(key, "review_self_resolved", &tx.hash)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Whether an intent is still open for the address (after an error mid-send).
     async fn address_has_open_intent(&self, reg: &str) -> Result<bool> {
         let (c, r) = (self.chain.name.clone(), reg.to_string());
@@ -342,6 +425,7 @@ impl Sweeper {
         pair: Vec<Erc20Deposit>,
     ) -> Result<Outcome> {
         let first = &pair[0];
+        let first_token = first.token_address.clone();
         let target = self.chain.target_for_token(&first.token_address);
         // per_sender and per_transfer sweep what a group is owed, not the balance.
         let owed_mode = target.per_sender || target.per_transfer;
@@ -349,7 +433,7 @@ impl Sweeper {
 
         // Deposits of this address and token waiting for a person (review or
         // failed). Their tokens are still at the address.
-        let blocked = {
+        let mut blocked = {
             let (c, r, t) = (
                 self.chain.name.clone(),
                 reg.to_string(),
@@ -390,6 +474,17 @@ impl Sweeper {
             }
             if !no_sender.is_empty() {
                 self.send_to_review(&no_sender, "no_sender", None, false)
+                    .await?;
+                // Their amounts are reserved from this very pass: read the
+                // deposits waiting for a person again, now that these are among them.
+                let (c, r, t) = (
+                    self.chain.name.clone(),
+                    reg.to_string(),
+                    first_token.clone(),
+                );
+                blocked = self
+                    .db
+                    .blocking(move |db| db.blocking_erc20_deposits(&c, &r, &t))
                     .await?;
             }
             if subgroups.is_empty() {
@@ -479,6 +574,11 @@ impl Sweeper {
                         "[{}] Failed to sweep native deposits of {reg}: {err_str}",
                         self.chain.name
                     );
+                    // REQ-SW-4 for the native coin: a sweep that keeps failing
+                    // (a treasury that reverts, say) goes to review instead of
+                    // burning gas or faucet funds forever.
+                    let keys: Vec<String> = deposits.iter().map(|(tx, _, _)| tx.clone()).collect();
+                    self.record_native_failure(&keys, &err_str).await?;
                 }
                 if self.address_has_open_intent(reg).await? {
                     return Ok(Outcome::Sent);
@@ -498,7 +598,18 @@ impl Sweeper {
     ) -> Result<()> {
         let to_address = Address::from_str(&self.chain.treasury_address)?;
         let mut balance = self.provider.get_balance(address).await?;
-        let gas_limit: u128 = 21000;
+        // The gas a native transfer needs depends on the treasury (a contract's
+        // receive function can cost more than 21,000, or revert): ask the node.
+        // A revert here costs nothing; the failures are counted instead.
+        let estimated = self
+            .provider
+            .estimate_gas(
+                &TransactionRequest::default()
+                    .with_from(address)
+                    .with_to(to_address),
+            )
+            .await?;
+        let gas_limit: u128 = estimated + estimated / 10;
         let fees = self.provider.estimate_eip1559_fees(None).await?;
         let gas_cost = U256::from(gas_limit) * U256::from(fees.max_fee_per_gas);
         let gas_cost_with_buffer = gas_cost + (gas_cost / U256::from(10));
@@ -684,6 +795,14 @@ impl Sweeper {
         address: Address,
     ) -> Result<Resolution> {
         if intent.txs.is_empty() {
+            if intent.tx_hash.is_some() || intent.raw_tx.is_some() {
+                // A signed intent whose transaction list is missing is damage,
+                // not "never signed": surface it, never drop it.
+                return Err(anyhow::anyhow!(
+                    "sweep intent {} was signed but lists no transactions",
+                    intent.id
+                ));
+            }
             // Stopped between writing the intent and signing: nothing exists on
             // any network, so there is nothing to wait for.
             warn!(
@@ -713,11 +832,14 @@ impl Sweeper {
                     .await?;
                 return Ok(Resolution::Done);
             }
-            let gone = self
+            // Judge by elapsed blocks, not passes: the node that answers for the
+            // nonce can be ahead of the one that answers for receipts.
+            let block = self.provider.get_block_number().await?;
+            let first = self
                 .db
-                .blocking(move |db| db.bump_sweep_intent_gone_passes(id))
+                .blocking(move |db| db.note_nonce_used_block(id, block))
                 .await?;
-            if gone >= GONE_PASSES_TO_REVIEW {
+            if block.saturating_sub(first) >= GONE_BLOCKS_TO_REVIEW {
                 self.send_to_review(
                     &intent.keys,
                     "sweep_review",
@@ -725,7 +847,8 @@ impl Sweeper {
                     intent.token_address == NATIVE_TOKEN,
                 )
                 .await?;
-                self.finish_intent(id, "review").await?;
+                // Watched for a late receipt: this verdict can still be wrong.
+                self.finish_intent(id, "review_gone").await?;
                 return Ok(Resolution::Done);
             }
             return Ok(Resolution::Open);
@@ -738,6 +861,12 @@ impl Sweeper {
             .db
             .blocking(move |db| db.bump_sweep_intent_passes(id))
             .await?;
+        if passes >= self.stuck_after() {
+            if let Some(key) = intent.keys.first() {
+                self.alert_once_with_tx(key, "sweep_stuck", &newest.hash)
+                    .await?;
+            }
+        }
         let estimate = self.provider.estimate_eip1559_fees(None).await?;
         let held_fee: u128 = newest.max_fee.parse().unwrap_or(0);
         if passes >= REPRICE_AFTER_PASSES && held_fee < estimate.max_fee_per_gas {
@@ -843,11 +972,14 @@ impl Sweeper {
         if intent.token_address == NATIVE_TOKEN {
             if !receipt.inner.status() {
                 // Reverted: the deposits stay detected and are planned again.
-                warn!(
-                    "[{}] native sweep {} reverted; planning again",
-                    self.chain.name, tx.hash
-                );
-                return self.finish_intent(intent.id, "failed").await;
+                warn!("[{}] native sweep {} reverted", self.chain.name, tx.hash);
+                self.finish_intent(intent.id, "failed").await?;
+                return self
+                    .record_native_failure(
+                        &intent.keys,
+                        &format!("native sweep reverted: {}", tx.hash),
+                    )
+                    .await;
             }
             return self.settle_native(intent, address_str).await;
         }
@@ -1215,6 +1347,29 @@ impl Sweeper {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Counts a failed native sweep; the fifth sends the deposits to review.
+    async fn record_native_failure(&self, keys: &[String], err_str: &str) -> Result<()> {
+        let Some(first) = keys.first() else {
+            return Ok(());
+        };
+        let counter = format!("native:{first}:0");
+        let failures = {
+            let chain_name = self.chain.name.clone();
+            self.db
+                .blocking(move |db| db.increment_sweep_failure_count(&chain_name, &counter))
+                .await?
+        };
+        if failures >= MAX_SWEEP_RETRIES {
+            warn!(
+                "[{}] native sweep of {first} failed {failures} times: {err_str}",
+                self.chain.name
+            );
+            self.send_to_review(keys, "native_sweep_failed", None, true)
+                .await?;
         }
         Ok(())
     }
