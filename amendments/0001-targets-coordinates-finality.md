@@ -9,7 +9,7 @@ way), and on bezent's form, 2026-11-09, `d-refund-dest-swaps` (a refund goes to 
 numbered in `notes/RULINGS.md`. Also agreed with bezent's maintainers on 2026-11-08 and 2026-11-09 (the coordinate, the bounds, one token per
 reserve target). Engineering changes evmhot owns are marked as such.
 **Rationale in one line:** a consumer that verifies sweeps on chain needs to find each sweep by its coordinate, and must
-never receive a token it does not admit or an amount outside its bounds; and a silent monitor must never happen again.
+never receive a token it does not admit or an amount outside its bounds; and a monitor that stops must say so.
 
 ## A1 — Sweep target kinds
 
@@ -48,7 +48,7 @@ Add `REQ-OB-1` and `REQ-OB-2`. (Ruling `d-rpc`: the alert ships whatever provide
 
 ## A8 — Operator routes
 
-Add `REQ-API-2`: moving a cursor requires the operator's token. Add `REQ-API-1`: a standalone evmhot keeps the `/evm`
+Add `REQ-API-2`: moving a cursor (`POST /evm/block_number`) requires the operator's token. Add `REQ-API-1`: a standalone evmhot keeps the `/evm`
 paths and shapes. (Engineering change, evmhot.)
 
 ## A9 — The symbol-length filter

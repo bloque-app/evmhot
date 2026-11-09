@@ -58,7 +58,7 @@ Identifier families are in `SPEC.md` §0. Never renumber; add. Tasks are `T-<fea
 5. **Never route a token to a target that does not admit it, or outside its bounds** (`REQ-SW-7`, `REQ-SW-8`).
    USDC.e is not USDC.
 6. **Keep the `/evm` HTTP shapes** (`REQ-API-1`). A change to a request or response is an amendment.
-7. **No sender lists and no pushing addresses to other systems** (`SPEC.md` §1.3).
+7. **No list of permitted senders and no pushing addresses to other systems** (`SPEC.md` §1.3, R1).
 
 ## House rules (every agent brief carries these)
 

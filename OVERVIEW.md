@@ -17,10 +17,8 @@ position in the secret phrase made it. Without that table the money in an addres
 tokens wait in their addresses until bezent can take them too. Each move carries the exact on-chain place (block and
 position) where the money arrived, so bezent can check it, and who sent it, so a refund can go back to them.
 
-**What changed from before.** Before, evmhot ran inside another service that has been shut down, and it stopped
-seeing deposits when its data provider's monthly quota ran out, with no alarm. Now it runs on its own, alarms when it
-falls behind or its provider refuses it, checks that each move actually succeeded, and only reads blocks that can no
-longer change.
+**What this version adds.** It alarms when it falls behind or its data provider refuses it, checks that each move
+actually succeeded, and only reads blocks that can no longer change.
 
 **How to read further.** `SPEC.md` is the exact behaviour, `PLAN.md` how it is built and run, `amendments/` every
 change and why, `notes/RULINGS.md` the owner's decisions.

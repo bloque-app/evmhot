@@ -65,7 +65,7 @@ Polygon detects on `finalized` (measured about 4 s behind the newest block). Bas
 Configured per network and token in `chains.toml`. Polygon native USDC goes to bezent's reserve, a `transfer` target
 that admits only that token, needs a refund address per sweep, and has bezent's per-transfer bounds (`REQ-SW-7`,
 `REQ-SW-8`, `REQ-SW-12`). Polygon USDT0 is held in its deposit addresses until bezent admits it into the same reserve.
-Base USDC is held until a bridge leg to Polygon exists (R6). `directed_deposit` (F-004) follows bezent's contract.
+Base USDC is held until it can reach that reserve, which needs a bridge leg to Polygon (R9). `directed_deposit` (F-004) follows bezent's contract.
 
 ### DEC-7 Keys
 

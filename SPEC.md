@@ -62,8 +62,8 @@ a host service.
 
 - What happens to swept funds after they reach the sweep target. A route that turns a sweep into value elsewhere
   belongs to the service that consumes the webhook.
-- Attributing a sweep to a party beyond the registration id. evmhot keeps no sender lists and pushes no addresses
-  to other systems.
+- Attributing a sweep to a party beyond the registration id and the deposit's sender. evmhot pushes no addresses to
+  other systems and keeps no list of permitted senders.
 - Prices, conversions, fees charged to a party, refunds.
 - Custody of the sweep targets.
 
@@ -82,7 +82,7 @@ a host service.
 | **sweep target** | Where a token's sweeps go on a network. Kinds are defined in §6.4 |
 | **faucet** | The address that pays sweep gas, from a second mnemonic |
 | **cursor** | The last block a network's monitor has fully processed |
-| **detection height** | The newest block the monitor may process, per §7.1 |
+| **detection height** | The newest block the monitor may process, per §7 |
 | **sweep coordinate** | The block number, block hash and block-level log index of the token `Transfer` a sweep emitted into its target |
 | **outbox** | The stored queue of webhook deliveries |
 
@@ -92,7 +92,7 @@ a host service.
   ids; it is not trusted with keys.
 - **Verifier.** A service that asks whether a transaction moved funds to an address.
 - **Operator.** A person who sets configuration, retries a stuck sweep or webhook, and moves a cursor.
-- **Network provider.** The RPC endpoint per network. Trusted for reads only up to the finality rule in §7.1.
+- **Network provider.** The RPC endpoint per network. Trusted for reads only up to the finality rule in §7.
 
 ## 4. Architecture
 
@@ -218,11 +218,12 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   `registration_id`, `amount` (minor units, decimal string), `token_type` (`native` or `erc20`), and for tokens
   `token_symbol`, `token_address`, `token_decimals`. The deposit's transaction hash is `tx_hash` in `deposit_detected`
   and `original_tx_hash` in `deposit_swept`.
-- `REQ-WH-4` A token `deposit_swept` adds `sweep_tx_hash`; a native one carries no sweep fields.
+- `REQ-WH-4` A token `deposit_swept` adds `sweep_tx_hash`; a native one carries no sweep fields. **(not built)** A
+  token `deposit_swept` also adds the sweep coordinate of `REQ-SW-10`: `sweep_block_number`, `sweep_block_hash`,
+  `sweep_log_index` and `sweep_amount`. Several deposits settled by one sweep produce one `deposit_swept` each, all
+  naming the same sweep coordinate.
 - `REQ-WH-9` **(not built)** Every deposit records the sender of its inbound transfer, and both events carry it as
-  `from_address`. A consumer uses it as the refund address. **(not built)** It also adds the sweep coordinate of `REQ-SW-10`:
-  `sweep_block_number`, `sweep_block_hash`, `sweep_log_index` and `sweep_amount`. Several deposits settled by one
-  sweep produce one `deposit_swept` each, all naming the same sweep coordinate.
+  `from_address`. A consumer uses it as the refund address.
 - `REQ-WH-5` Once a webhook is in the outbox, delivery is at least once: a worker delivers it, retrying non-2xx answers
   up to a configured number of attempts, and leases each attempt so that two workers never post the same delivery at
   once. In 0.1.0 the outbox write happens after the state change it reports, and a failed write is only logged.
@@ -249,7 +250,8 @@ where it takes no network.
 | `GET /evm/block_number` | | `{block_number}`: the default network's cursor |
 | `POST /evm/block_number` | `{block_number}` | `{block_number}`: moves the default network's cursor. An operator action |
 
-When the wallet is disabled, every route but health answers `503`. Errors are a status code with a plain-text body.
+When the wallet is disabled, `register` and both `block_number` routes answer `503`, and `verify_transfer` answers
+`500`. Errors are a status code with a plain-text body.
 
 ### 9.2 Operator routes
 
@@ -262,7 +264,7 @@ Both require the bearer token. The host service did not serve them in production
 
 - `REQ-API-1` A standalone evmhot MUST serve §9.1 under `/evm` with exactly those shapes, so that existing clients only
   change their base URL. It MAY also serve per-network forms of `block_number` that take a `chain`.
-- `REQ-API-2` **(not built)** `POST /block_number` MUST require the operator's bearer token.
+- `REQ-API-2` **(not built)** `POST /evm/block_number` MUST require the operator's bearer token.
 
 ## 10. Store
 
@@ -309,7 +311,7 @@ The service as it ran differs from this version where a requirement is marked **
 - Detection used the newest block minus an offset on every network (`REQ-DT-8`).
 - There was no lag alert, no back-off on rate limits and no alert on quota exhaustion (`REQ-OB-1`, `REQ-OB-2`).
 - Sweep targets were addresses only, with no bounds or token admission checks (`REQ-SW-6` to `REQ-SW-9`).
-- `POST /block_number` was unauthenticated (`REQ-API-2`).
+- `POST /evm/block_number` was unauthenticated (`REQ-API-2`).
 - Token transfers with a symbol longer than five characters, or with no readable symbol, were dropped (`REQ-DT-10`,
   withdrawn).
 - The outbox write was not atomic with the state change (`REQ-WH-7`).
