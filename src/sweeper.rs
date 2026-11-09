@@ -304,6 +304,28 @@ impl Sweeper {
                 .collect()
         };
 
+        // Deposits of an intent still watched for a late receipt are never
+        // planned, whatever their status says: their sweep may yet turn out to
+        // have landed.
+        let watched: std::collections::HashSet<String> = {
+            let (c, r) = (self.chain.name.clone(), reg.to_string());
+            self.db
+                .blocking(move |db| db.sweep_intents_in_state(&c, "review_gone"))
+                .await?
+                .into_iter()
+                .filter(|i| i.account_id == r)
+                .flat_map(|i| i.keys)
+                .collect()
+        };
+        let erc20: Vec<Erc20Deposit> = erc20
+            .into_iter()
+            .filter(|d| !watched.contains(&d.key))
+            .collect();
+        let native: Vec<(String, String, String)> = native
+            .into_iter()
+            .filter(|(k, _, _)| !watched.contains(k))
+            .collect();
+
         let signer = self.wallet.get_signer(derivation_index)?;
         let wallet = alloy::network::EthereumWallet::from(signer);
 
@@ -369,39 +391,61 @@ impl Sweeper {
         if intents.is_empty() {
             return Ok(());
         }
-        let block = self.provider.get_block_number().await?;
+        // Without the head block the end of the watch cannot be judged this pass;
+        // late receipts are still looked for.
+        let block = match self.provider.get_block_number().await {
+            Ok(b) => Some(b),
+            Err(e) => {
+                warn!(
+                    "[{}] watched sweeps: block number unavailable: {e:?}",
+                    self.chain.name
+                );
+                None
+            }
+        };
+        // Each intent on its own: one RPC error or damaged record must not stop
+        // the others, nor the sweeping that follows.
         for intent in intents {
-            let native = intent.token_address == NATIVE_TOKEN;
-            let Some((tx, receipt)) = self.find_receipt(&intent).await? else {
+            if let Err(e) = self.recheck_one_gone(&intent, block).await {
+                #[cfg(test)]
+                if e.to_string().contains("test crash") {
+                    return Err(e);
+                }
+                warn!(
+                    "[{}] watched sweep {} skipped this pass: {:?}",
+                    self.chain.name, intent.id, e
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn recheck_one_gone(&self, intent: &SweepIntent, block: Option<u64>) -> Result<()> {
+        let Some((tx, receipt)) = self.find_receipt(intent).await? else {
+            // `gone_block` is when the review began (set with the state).
+            if let Some(block) = block {
                 if block.saturating_sub(intent.gone_block) >= GONE_WATCH_BLOCKS {
+                    let id = intent.id;
                     self.db
-                        .blocking({
-                            let id = intent.id;
-                            move |db| db.move_sweep_intent(id, "review_gone", "review")
-                        })
+                        .blocking(move |db| db.move_sweep_intent(id, "review_gone", "review"))
                         .await?;
                 }
-                continue;
-            };
-            let address = Address::from_str(&intent.address)?;
-            warn!(
-                "[{}] sweep {} was reviewed as lost but has a receipt: resolving it",
-                self.chain.name, tx.hash
-            );
-            // Deposits first, so settlement sees them detected.
-            {
-                let (c, keys) = (self.chain.name.clone(), intent.keys.clone());
-                self.db
-                    .blocking(move |db| db.release_review_deposits_for_keys(&c, &keys, native))
-                    .await?;
             }
-            let address_str = intent.address.clone();
-            self.apply_receipt(&intent, &tx, &receipt, &address_str, address)
-                .await?;
-            for key in &intent.keys {
-                self.alert_once_with_tx(key, "review_self_resolved", &tx.hash)
-                    .await?;
-            }
+            return Ok(());
+        };
+        let address = Address::from_str(&intent.address)?;
+        warn!(
+            "[{}] sweep {} was reviewed as lost but has a receipt: resolving it",
+            self.chain.name, tx.hash
+        );
+        // The release of the deposits (and of any `balance_shortfall` that
+        // followed from their reserved amount) is part of the settlement.
+        let address_str = intent.address.clone();
+        let settled = self
+            .apply_receipt(intent, &tx, &receipt, &address_str, address)
+            .await?;
+        if settled {
+            self.alert_self_resolved(intent, &tx.hash).await?;
         }
         Ok(())
     }
@@ -444,8 +488,8 @@ impl Sweeper {
                     }
                     if native {
                         // Native deposits carry no coordinate to check.
-                        self.release_and_alert(&intent, &tx.hash, true).await?;
                         self.settle_native(&intent, &intent.address).await?;
+                        self.alert_self_resolved(&intent, &tx.hash).await?;
                         return Ok(RetryGate::Settled(tx.hash.clone()));
                     }
                     let token = Address::from_str(&intent.token_address)?;
@@ -456,13 +500,17 @@ impl Sweeper {
                             {
                                 let (c, id, ks) =
                                     (self.chain.name.clone(), intent.id, intent.keys.clone());
+                                let (account, token) =
+                                    (intent.account_id.clone(), intent.token_address.clone());
                                 self.db
                                     .blocking(move |db| {
-                                        db.settle_sweep_intent(&c, id, &ks, &record, &[])
+                                        db.settle_reviewed_sweep_intent(
+                                            &c, id, &ks, &record, &account, &token,
+                                        )
                                     })
                                     .await?;
                             }
-                            self.release_and_alert(&intent, &tx.hash, false).await?;
+                            self.alert_self_resolved(&intent, &tx.hash).await?;
                             return Ok(RetryGate::Settled(tx.hash.clone()));
                         }
                         Verdict::Review(why) => {
@@ -479,13 +527,7 @@ impl Sweeper {
         Ok(RetryGate::Clear)
     }
 
-    async fn release_and_alert(&self, intent: &SweepIntent, tx: &str, native: bool) -> Result<()> {
-        {
-            let (c, keys) = (self.chain.name.clone(), intent.keys.clone());
-            self.db
-                .blocking(move |db| db.release_review_deposits_for_keys(&c, &keys, native))
-                .await?;
-        }
+    async fn alert_self_resolved(&self, intent: &SweepIntent, tx: &str) -> Result<()> {
         for key in &intent.keys {
             self.alert_once_with_tx(key, "review_self_resolved", tx)
                 .await?;
@@ -935,7 +977,10 @@ impl Sweeper {
                 )
                 .await?;
                 // Watched for a late receipt: this verdict can still be wrong.
-                self.finish_intent(id, "review_gone").await?;
+                // The watch is measured from here, not from the first sighting.
+                self.db
+                    .blocking(move |db| db.mark_review_gone(id, block))
+                    .await?;
                 return Ok(Resolution::Done);
             }
             return Ok(Resolution::Open);
@@ -1055,20 +1100,21 @@ impl Sweeper {
         receipt: &TransactionReceipt,
         address_str: &str,
         address: Address,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if intent.token_address == NATIVE_TOKEN {
             if !receipt.inner.status() {
                 // Reverted: the deposits stay detected and are planned again.
                 warn!("[{}] native sweep {} reverted", self.chain.name, tx.hash);
                 self.finish_intent(intent.id, "failed").await?;
-                return self
-                    .record_native_failure(
-                        &intent.keys,
-                        &format!("native sweep reverted: {}", tx.hash),
-                    )
-                    .await;
+                self.record_native_failure(
+                    &intent.keys,
+                    &format!("native sweep reverted: {}", tx.hash),
+                )
+                .await?;
+                return Ok(false);
             }
-            return self.settle_native(intent, address_str).await;
+            self.settle_native(intent, address_str).await?;
+            return Ok(true);
         }
         let token = Address::from_str(&intent.token_address)?;
         let to = Address::from_str(&intent.target)?;
@@ -1080,7 +1126,8 @@ impl Sweeper {
                     &intent.keys,
                     &format!("sweep transaction reverted (receipt status 0): {}", tx.hash),
                 )
-                .await
+                .await?;
+                Ok(false)
             }
             Verdict::Review(why) => {
                 warn!(
@@ -1089,18 +1136,38 @@ impl Sweeper {
                 );
                 self.send_to_review(&intent.keys, "sweep_review", Some(&tx.hash), false)
                     .await?;
-                self.finish_intent(intent.id, "review").await
+                self.finish_intent(intent.id, "review").await?;
+                Ok(false)
             }
             Verdict::Success(record) => {
                 let chain_name = self.chain.name.clone();
                 let keys = intent.keys.clone();
                 let id = intent.id;
-                self.db
-                    .blocking(move |db| {
-                        db.settle_sweep_intent(&chain_name, id, &keys, &record, &[])
-                    })
-                    .await?;
-                Ok(())
+                if intent.reviewed {
+                    // A sweep that was given up on: its deposits are released
+                    // in the same transaction.
+                    let (account, token) =
+                        (intent.account_id.clone(), intent.token_address.clone());
+                    self.db
+                        .blocking(move |db| {
+                            db.settle_reviewed_sweep_intent(
+                                &chain_name,
+                                id,
+                                &keys,
+                                &record,
+                                &account,
+                                &token,
+                            )
+                        })
+                        .await?;
+                } else {
+                    self.db
+                        .blocking(move |db| {
+                            db.settle_sweep_intent(&chain_name, id, &keys, &record, &[])
+                        })
+                        .await?;
+                }
+                Ok(true)
             }
         }
     }
@@ -1108,10 +1175,11 @@ impl Sweeper {
     /// A native sweep landed: its deposits are swept, with their webhooks, in
     /// one transaction.
     async fn settle_native(&self, intent: &SweepIntent, address_str: &str) -> Result<()> {
-        let detected = {
-            let c = self.chain.name.clone();
+        // Amounts whatever the status: a reviewed deposit is settled as it is.
+        let amounts = {
+            let (c, keys) = (self.chain.name.clone(), intent.keys.clone());
             self.db
-                .blocking(move |db| db.get_detected_deposits(&c))
+                .blocking(move |db| db.native_deposit_amounts(&c, &keys))
                 .await?
         };
         let webhook_url = {
@@ -1120,10 +1188,10 @@ impl Sweeper {
         };
         let mut settlements = Vec::new();
         for key in &intent.keys {
-            let amount = detected
+            let amount = amounts
                 .iter()
-                .find(|(tx, _, _)| tx == key)
-                .map(|(_, _, a)| a.clone())
+                .find(|(tx, _)| tx == key)
+                .map(|(_, a)| a.clone())
                 .unwrap_or_default();
             let from = {
                 let (c, k) = (self.chain.name.clone(), key.clone());

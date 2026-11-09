@@ -382,7 +382,7 @@ impl PostgresBackend {
     pub fn mark_deposit_swept(&self, chain: &str, tx_hash: &str) -> Result<()> {
         let mut guard = self.conn()?;
         guard.client().execute(
-            "UPDATE deposits SET status = 'swept' WHERE chain = $1 AND tx_hash = $2",
+            "UPDATE deposits SET status = 'swept', review_kind = NULL WHERE chain = $1 AND tx_hash = $2",
             &[&chain, &tx_hash],
         )?;
         Ok(())
@@ -1082,6 +1082,85 @@ impl PostgresBackend {
         Ok(())
     }
 
+    pub fn settle_reviewed_sweep_intent(
+        &self,
+        chain: &str,
+        id: i64,
+        keys: &[String],
+        record: &SweepRecord,
+        account_id: &str,
+        token_address: &str,
+    ) -> Result<usize> {
+        let mut guard = self.conn()?;
+        let mut tx = guard.client().transaction()?;
+        tx.execute(
+            "UPDATE sweep_intents SET state = 'succeeded' WHERE id = $1",
+            &[&id],
+        )?;
+        for key in keys {
+            let (tx_hash, log_index) = parse_local_key(key)?;
+            tx.execute(
+                "INSERT INTO sweeps
+                 (chain, tx_hash, log_index, sweep_tx_hash, sweep_block_number,
+                  sweep_block_hash, sweep_log_index, sweep_amount, sweep_target)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT DO NOTHING",
+                &[
+                    &chain,
+                    &tx_hash,
+                    &log_index,
+                    &record.sweep_tx_hash,
+                    &(record.sweep_block_number as i64),
+                    &record.sweep_block_hash,
+                    &(record.sweep_log_index as i64),
+                    &record.sweep_amount,
+                    &record.sweep_target,
+                ],
+            )?;
+            tx.execute(
+                "UPDATE erc20_deposits SET status = 'detected', review_kind = NULL
+                 WHERE chain = $1 AND tx_hash = $2 AND log_index = $3 AND status = 'needs_review'",
+                &[&chain, &tx_hash, &log_index],
+            )?;
+        }
+        let released = tx.execute(
+            "UPDATE erc20_deposits SET status = 'detected', review_kind = NULL
+             WHERE chain = $1 AND account_id = $2 AND LOWER(token_address) = LOWER($3)
+               AND status = 'needs_review' AND review_kind = 'balance_shortfall'",
+            &[&chain, &account_id, &token_address],
+        )?;
+        tx.commit()?;
+        Ok(released as usize)
+    }
+
+    pub fn mark_review_gone(&self, id: i64, block: u64) -> Result<()> {
+        let mut guard = self.conn()?;
+        guard.client().execute(
+            "UPDATE sweep_intents SET state = 'review_gone', gone_block = $2
+             WHERE id = $1 AND state IN ('pending', 'review_gone')",
+            &[&id, &(block as i64)],
+        )?;
+        Ok(())
+    }
+
+    pub fn native_deposit_amounts(
+        &self,
+        chain: &str,
+        keys: &[String],
+    ) -> Result<Vec<(String, String)>> {
+        let mut guard = self.conn()?;
+        let mut out = Vec::new();
+        for key in keys {
+            if let Some(row) = guard.client().query_opt(
+                "SELECT amount FROM deposits WHERE chain = $1 AND tx_hash = $2",
+                &[&chain, key],
+            )? {
+                out.push((key.clone(), row.get::<_, String>(0)));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn release_review_deposits_for_keys(
         &self,
         chain: &str,
@@ -1249,6 +1328,7 @@ impl PostgresBackend {
                     nonce: nonce.map(|n| n as u64),
                     raw_tx: r.get(9),
                     passes: passes as u64,
+                    reviewed: state != "pending",
                 })
             })
             .collect()

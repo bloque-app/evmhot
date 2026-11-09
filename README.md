@@ -91,8 +91,12 @@ included, goes through a sweep intent:
    can lag the nonce. Only after 64 blocks past the nonce first being seen used does it conclude that something outside
    evmhot used the key, and send the deposits to review (`review_gone`). That verdict is still **watched**: every pass
    reads the receipts of such intents, and if one of our hashes shows up the sweep is recorded through the normal path,
-   the deposits go back to `detected`, and `EVMHOT_ALERT kind=review_self_resolved` is raised once. The operator's retry
-   is refused until the watch ends (5,000 blocks). Only an intent that was never signed (a crash before signing) is
+   the deposits go back to `detected` in the same transaction (as do the address's deposits of that token that went to
+   `balance_shortfall` while the sweep's amount was reserved), and `EVMHOT_ALERT kind=review_self_resolved` is raised
+   once, only when the receipt really matches the plan. The deposits of a watched intent are never planned, whatever
+   their status. A watched intent that cannot be read this pass (an RPC error, a damaged stored hash) is logged and
+   skipped; it does not stop the rest. The operator's retry is refused until the watch ends: 5,000 blocks counted from
+   when the review began (the "nonce used" verdict), not from the nonce first being seen used. Only an intent that was never signed (a crash before signing) is
    dropped. A sweep that sits unmined with its nonce free raises `EVMHOT_ALERT kind=sweep_stuck` once after 30 minutes
    (it is still rebroadcast and, if underpriced, repriced).
 3. A split sends one part per pass and re-reads the balance for the next; a long split on one token therefore holds

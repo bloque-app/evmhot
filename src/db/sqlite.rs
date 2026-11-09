@@ -1036,7 +1036,7 @@ impl Db {
         let tx_hash = tx_hash.to_string();
         self.with_write(move |conn| {
             conn.execute(
-                "UPDATE deposits SET status = 'swept' WHERE chain = ?1 AND tx_hash = ?2",
+                "UPDATE deposits SET status = 'swept', review_kind = NULL WHERE chain = ?1 AND tx_hash = ?2",
                 params![chain, tx_hash],
             )?;
             Ok(())
@@ -1796,6 +1796,96 @@ impl Db {
         })
     }
 
+    pub fn settle_reviewed_sweep_intent(
+        &self,
+        chain: &str,
+        id: i64,
+        keys: &[String],
+        record: &SweepRecord,
+        account_id: &str,
+        token_address: &str,
+    ) -> Result<usize> {
+        let chain = chain.to_string();
+        let keys = keys.to_vec();
+        let record = record.clone();
+        let account_id = account_id.to_string();
+        let token_address = token_address.to_string();
+        self.with_write(move |conn| {
+            atomically(conn, |conn| {
+                conn.execute(
+                    "UPDATE sweep_intents SET state = 'succeeded' WHERE id = ?1",
+                    params![id],
+                )?;
+                for key in &keys {
+                    let (tx_hash, log_index) = parse_local_key(key)?;
+                    conn.execute(
+                        "INSERT OR IGNORE INTO sweeps
+                         (chain, tx_hash, log_index, sweep_tx_hash, sweep_block_number,
+                          sweep_block_hash, sweep_log_index, sweep_amount, sweep_target)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            chain,
+                            tx_hash,
+                            log_index,
+                            record.sweep_tx_hash,
+                            record.sweep_block_number as i64,
+                            record.sweep_block_hash,
+                            record.sweep_log_index as i64,
+                            record.sweep_amount,
+                            record.sweep_target
+                        ],
+                    )?;
+                    conn.execute(
+                        "UPDATE erc20_deposits SET status = 'detected', review_kind = NULL
+                         WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3
+                           AND status = 'needs_review'",
+                        params![chain, tx_hash, log_index],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE erc20_deposits SET status = 'detected', review_kind = NULL
+                     WHERE chain = ?1 AND account_id = ?2 AND LOWER(token_address) = LOWER(?3)
+                       AND status = 'needs_review' AND review_kind = 'balance_shortfall'",
+                    params![chain, account_id, token_address],
+                )?;
+                Ok(conn.changes() as usize)
+            })
+        })
+    }
+
+    pub fn mark_review_gone(&self, id: i64, block: u64) -> Result<()> {
+        self.with_write(move |conn| {
+            conn.execute(
+                "UPDATE sweep_intents SET state = 'review_gone', gone_block = ?2
+                 WHERE id = ?1 AND state IN ('pending', 'review_gone')",
+                params![id, block as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn native_deposit_amounts(
+        &self,
+        chain: &str,
+        keys: &[String],
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.read.get()?;
+        let mut out = Vec::new();
+        for key in keys {
+            if let Some(amount) = conn
+                .query_row(
+                    "SELECT amount FROM deposits WHERE chain = ?1 AND tx_hash = ?2",
+                    params![chain, key],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                out.push((key.clone(), amount));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn release_review_deposits_for_keys(
         &self,
         chain: &str,
@@ -1986,6 +2076,7 @@ impl Db {
                 nonce: nonce.map(|n| n as u64),
                 raw_tx: r.get(9)?,
                 passes: passes as u64,
+                reviewed: state != "pending",
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()

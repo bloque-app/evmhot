@@ -185,6 +185,9 @@ pub struct SweepIntent {
     /// Hex of the signed raw transaction, kept so it can be rebroadcast.
     pub raw_tx: Option<String>,
     pub passes: u64,
+    /// The intent had been given up on (review, watched, or closed by an
+    /// operator): settling it releases its deposits instead of finishing a group.
+    pub reviewed: bool,
 }
 
 /// A token deposit to mark swept, with the `deposit_swept` outbox row that
@@ -751,6 +754,50 @@ impl Db {
         match self.inner.as_ref() {
             DbInner::Sqlite(s) => s.move_sweep_intent(id, from, to),
             DbInner::Postgres(p) => p.move_sweep_intent(id, from, to),
+        }
+    }
+
+    /// A reviewed ("nonce used") sweep turned out to have landed. One transaction:
+    /// the intent succeeds, the sweep is recorded against its deposits, those
+    /// deposits go back to `detected`, and the address's deposits of that token that
+    /// were reviewed as `balance_shortfall` while the sweep's amount was wrongly
+    /// still reserved are released too. Returns how many of those were released.
+    pub fn settle_reviewed_sweep_intent(
+        &self,
+        chain: &str,
+        id: i64,
+        keys: &[String],
+        record: &SweepRecord,
+        account_id: &str,
+        token_address: &str,
+    ) -> Result<usize> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => {
+                s.settle_reviewed_sweep_intent(chain, id, keys, record, account_id, token_address)
+            }
+            DbInner::Postgres(p) => {
+                p.settle_reviewed_sweep_intent(chain, id, keys, record, account_id, token_address)
+            }
+        }
+    }
+
+    /// Starts the watch on a "nonce used" verdict at `block`.
+    pub fn mark_review_gone(&self, id: i64, block: u64) -> Result<()> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.mark_review_gone(id, block),
+            DbInner::Postgres(p) => p.mark_review_gone(id, block),
+        }
+    }
+
+    /// `(tx hash, amount)` of native deposits, whatever their status.
+    pub fn native_deposit_amounts(
+        &self,
+        chain: &str,
+        keys: &[String],
+    ) -> Result<Vec<(String, String)>> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.native_deposit_amounts(chain, keys),
+            DbInner::Postgres(p) => p.native_deposit_amounts(chain, keys),
         }
     }
 

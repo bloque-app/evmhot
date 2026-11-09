@@ -3741,3 +3741,178 @@ fn unknown_keys_in_a_chains_table_fail_at_load_and_the_example_has_none() {
         );
     }
 }
+
+// ------------------------------------------------------------ watched sweeps
+
+/// A per_transfer sweep whose receipt is hidden, whose nonce was used, and whose
+/// "nonce used" verdict has been reached: the intent is `review_gone` (watched).
+async fn watched_sweep(fx: &Fixture, txs: &[String], receipt_amount: u128) -> (Rpc, Sweeper) {
+    let rpc = Rpc::start(
+        200,
+        txs.to_vec(),
+        vec![(
+            txs[0].clone(),
+            ok_receipt(&txs[0], 140, 2, TOKEN, &fx.addr, TARGET_A, receipt_amount),
+        )],
+    )
+    .await;
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |t| t.per_transfer = true));
+    rpc.hide_receipts(true);
+    sweeper.process_deposits_once().await.unwrap(); // sent
+    rpc.set_latest_nonce(1);
+    rpc.set_balance(0);
+    sweeper.process_deposits_once().await.unwrap(); // nonce seen used
+    rpc.set_block(1000 + 70);
+    sweeper.process_deposits_once().await.unwrap(); // review_gone
+    assert_eq!(
+        fx.db
+            .sweep_intents_in_state(TEST_CHAIN, "review_gone")
+            .unwrap()
+            .len(),
+        1
+    );
+    (rpc, sweeper)
+}
+
+#[tokio::test]
+async fn the_watch_is_measured_from_when_review_began() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let (rpc, sweeper) = watched_sweep(&fx, &[sweep_tx(1201)], 100).await;
+    let watched = fx
+        .db
+        .sweep_intents_in_state(TEST_CHAIN, "review_gone")
+        .unwrap();
+    assert_eq!(watched[0].gone_block, 1070, "the block of the verdict");
+    // 5000 blocks after the first sighting is not yet 5000 after the verdict.
+    rpc.set_block(1000 + 5000);
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(
+        fx.db
+            .sweep_intents_in_state(TEST_CHAIN, "review_gone")
+            .unwrap()
+            .len(),
+        1
+    );
+    rpc.set_block(1070 + 5000);
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(
+        fx.db
+            .sweep_intents_in_state(TEST_CHAIN, "review")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_late_receipt_that_does_not_match_is_not_reported_as_self_resolved() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let (rpc, sweeper) = watched_sweep(&fx, &[sweep_tx(1202)], 90).await; // moved 90, not 100
+    rpc.hide_receipts(false);
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(
+        fx.db
+            .sweep_intents_in_state(TEST_CHAIN, "review")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(fx.db.get_sweeps(TEST_CHAIN, "0xaaa:1").unwrap().is_empty());
+    assert_eq!(fx.detected(), 0, "still waiting for a person");
+    assert!(
+        fx.db
+            .alert_once(TEST_CHAIN, "0xaaa:1", "review_self_resolved")
+            .unwrap(),
+        "the alert had not been raised"
+    );
+}
+
+#[tokio::test]
+async fn a_late_receipt_releases_the_shortfalls_that_followed_from_its_reserved_amount() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    fx.token_deposit("0xbbb", 2, "100", Some(SENDER_A));
+    let (rpc, sweeper) = watched_sweep(&fx, &[sweep_tx(1203), sweep_tx(1204)], 100).await;
+    // While the first sweep is reserved, the address (empty) cannot cover the second.
+    assert_eq!(
+        fx.db
+            .get_review_kind(TEST_CHAIN, "0xbbb:2")
+            .unwrap()
+            .as_deref(),
+        Some("balance_shortfall")
+    );
+    // Its receipt shows up, and the second deposit is funded again.
+    rpc.set_balance(100);
+    rpc.hide_receipts(false);
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(fx.db.get_sweeps(TEST_CHAIN, "0xaaa:1").unwrap().len(), 1);
+    assert_eq!(fx.db.get_review_kind(TEST_CHAIN, "0xbbb:2").unwrap(), None);
+    assert_eq!(
+        rpc.sent(),
+        2,
+        "the released deposit was planned in the pass"
+    );
+}
+
+#[tokio::test]
+async fn deposits_of_a_watched_intent_are_never_planned_whatever_their_status() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let (rpc, sweeper) = watched_sweep(&fx, &[sweep_tx(1205), sweep_tx(1206)], 100).await;
+    // Something put the deposit back to detected without the sweep settling.
+    fx.db
+        .release_review_deposits_for_keys(TEST_CHAIN, &["0xaaa:1".to_string()], false)
+        .unwrap();
+    rpc.set_balance(100);
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(rpc.sent(), 1, "no second sweep while the first is watched");
+}
+
+#[tokio::test]
+async fn a_damaged_watched_intent_does_not_stop_the_chain() {
+    let fx = fixture();
+    // A watched intent of another address whose stored hash cannot be read.
+    let id = fx
+        .db
+        .create_sweep_intent(&crate::db::NewSweepIntent {
+            chain: TEST_CHAIN.into(),
+            account_id: "user_9".into(),
+            address: fx.addr.to_lowercase(),
+            token_address: checksum(TOKEN),
+            group_key: "gk9".into(),
+            keys: vec!["0xdead:1".to_string()],
+            part_index: 0,
+            amount: "5".into(),
+            target: checksum(TARGET_A),
+        })
+        .unwrap();
+    fx.db
+        .set_sweep_intent_signed(
+            id,
+            0,
+            &crate::db::IntentTx {
+                hash: "not-a-hash".into(),
+                raw: "0x".into(),
+                max_fee: "1".into(),
+                max_priority: "1".into(),
+            },
+        )
+        .unwrap();
+    fx.db.mark_review_gone(id, 10).unwrap();
+
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let rpc = Rpc::start(100, vec![sweep_tx(1207)], vec![]).await;
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |_| {}));
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(rpc.sent(), 1, "the healthy address was swept");
+    assert_eq!(
+        fx.db
+            .sweep_intents_in_state(TEST_CHAIN, "review_gone")
+            .unwrap()
+            .len(),
+        1,
+        "the damaged one is left as it was"
+    );
+}

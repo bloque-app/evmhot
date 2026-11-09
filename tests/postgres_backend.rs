@@ -1461,6 +1461,61 @@ fn assert_order_intents_and_review(db: &Db) {
         .unwrap()
         .is_empty());
 
+    // A watched sweep whose receipt turns up late: one transaction records it,
+    // releases its deposit, and releases the address's balance_shortfall deposits
+    // of the same token. The block of the verdict is where the watch starts.
+    let wid = db
+        .create_sweep_intent(&evmhot::db::NewSweepIntent {
+            chain: "base".to_string(),
+            account_id: "acct-a".to_string(),
+            address: "0xaddr-a".to_string(),
+            token_address: "0xtoken1".to_string(),
+            group_key: "g3".to_string(),
+            keys: vec!["0xddd:4".to_string()],
+            part_index: 0,
+            amount: "10".to_string(),
+            target: "0xtarget".to_string(),
+        })
+        .unwrap();
+    db.mark_review_gone(wid, 777).unwrap();
+    let watched = db.sweep_intents_in_state("base", "review_gone").unwrap();
+    assert_eq!((watched[0].gone_block, watched[0].reviewed), (777, true));
+    db.mark_erc20_deposits_needs_review_for_keys("base", &["0xddd:4".to_string()], "sweep_review")
+        .unwrap();
+    db.mark_erc20_deposits_needs_review_for_keys(
+        "base",
+        &["0xfff:0".to_string()],
+        "balance_shortfall",
+    )
+    .unwrap();
+    let late = evmhot::db::SweepRecord {
+        sweep_tx_hash: "0xlate".to_string(),
+        sweep_block_number: 4,
+        sweep_block_hash: "0xb2".to_string(),
+        sweep_log_index: 1,
+        sweep_amount: "10".to_string(),
+        sweep_target: Some("0xtarget".to_string()),
+    };
+    let released = db
+        .settle_reviewed_sweep_intent(
+            "base",
+            wid,
+            &["0xddd:4".to_string()],
+            &late,
+            "acct-a",
+            "0xtoken1",
+        )
+        .unwrap();
+    assert_eq!(released, 1, "the shortfall deposit");
+    assert!(db
+        .sweep_intents_in_state("base", "review_gone")
+        .unwrap()
+        .is_empty());
+    assert_eq!(db.get_review_kind("base", "0xddd:4").unwrap(), None);
+    assert_eq!(db.get_review_kind("base", "0xfff:0").unwrap(), None);
+    assert_eq!(db.get_sweeps("base", "0xddd:4").unwrap(), vec![late]);
+    assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 5);
+
     // needs_review is out of the detected queue, counted, and retried only by
     // the retry call.
     let review = vec!["0xaaa:3".to_string()];
