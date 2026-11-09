@@ -7,709 +7,121 @@
 
 # evmhot
 
-evmhot administers EVM hot wallets for deposits: a deposit address per user, monitoring of every
-arrival, gas from a faucet, and sweeps to the treasury. It is part of Bloque's open-source tech
+evmhot administers EVM hot wallets for deposits: a deposit address per registered party, monitoring of
+every arrival, gas from a faucet, and sweeps to a configured target. It is part of Bloque's open-source tech
 family.
 
-A Rust-based hot wallet service for EVM-compatible blockchains that monitors deposits and automatically sweeps funds to a treasury address. Built with performance, safety, and reliability in mind.
+It runs as one self-contained service for **several networks at once** (for example Polygon and Base): one
+process, one store, one HTTP API. The same deposit address works on every configured network. The crate is also a
+library (`evmhot`) that another program can embed; the HTTP surface lives in the binary only.
 
-## Features
+[`WEBHOOK_SPEC.md`](WEBHOOK_SPEC.md) describes the webhook payloads.
 
-- 🔍 **Real-time Monitoring**: Dual-mode blockchain monitoring with WebSocket subscriptions and HTTP polling fallback
-- 💸 **Automatic Sweeping**: Automatically sweeps detected deposits to a configured treasury address
-- 🚰 **Faucet Integration**: Built-in faucet for funding new addresses with existential deposits
-- 🔐 **HD Wallet Support**: BIP-39 mnemonic-based hierarchical deterministic wallet for generating unique addresses
-- 📡 **REST API**: Simple API for registering users and generating deposit addresses
-- 🪝 **Per-Account Webhooks**: Custom webhook URLs per user for deposit detection and sweep notifications
-- 🗄️ **Embedded Database**: Uses `redb` for efficient, embedded storage
-- 🪙 **ERC-20 Support**: Monitors and sweeps both native ETH and ERC-20 token deposits
-- 🧪 **Well-Tested**: Comprehensive unit and E2E tests with mocked providers
-- 🚀 **CI/CD Ready**: GitHub Actions workflow for formatting, linting, and testing
+## How it works
 
-## Architecture
-
-The service consists of four main components:
-
-### 1. Monitor
-Monitors the blockchain for incoming transactions to registered addresses:
-- **WebSocket Mode**: Real-time block subscriptions for instant deposit detection
-- **HTTP Polling Mode**: Fallback polling mechanism with configurable intervals
-- **Native ETH & ERC-20**: Detects both native token and ERC-20 token transfers
-- **Smart Filtering**: Automatically ignores deposits from the faucet address to prevent sweeping existential deposits
-- Tracks last processed block to handle restarts gracefully
-- Records detected deposits in the database with token metadata
-
-### 2. Sweeper
-Processes detected deposits and transfers funds to the treasury:
-- Retrieves pending deposits from the database
-- Derives private keys for each deposit address
-- **Native ETH**: Calculates gas costs and transfers maximum available balance
-- **ERC-20 Tokens**: Sweeps ERC-20 tokens (requires native balance for gas)
-- Sends webhook notifications on successful sweeps
-- Marks deposits as swept in the database
-
-### 3. Faucet
-Automatically funds newly registered addresses with an existential deposit:
-- Uses a separate mnemonic for security isolation
-- Sends configurable amount to new addresses upon registration
-- Ensures addresses have sufficient balance for future transactions
-- Faucet deposits are automatically excluded from sweeping
-
-### 4. API Server
-HTTP API for user management and address generation:
-- `POST /register` - Register a new user with a webhook URL and receive a unique deposit address
-- Deterministic address derivation using hash-based indexing
-- Automatic funding via faucet upon registration
-- Per-account webhook configuration for custom notification endpoints
-- Thread-safe database access
-
-## Installation
-
-### Prerequisites
-
-- Rust 1.70+ (install via [rustup](https://rustup.rs/))
-- Access to an EVM-compatible blockchain node (HTTP or WebSocket)
-
-### Building from Source
-
-```bash
-# Clone the repository
-git clone <repository-url>
-cd emvhot
-
-# Build the project
-cargo build --release
-
-# Run tests
-cargo test
-```
+Per network, a **monitor** reads blocks and logs, stores deposits of admitted tokens (and native coin) to
+registered addresses and enqueues a `deposit_detected` webhook. A **sweeper** funds gas from the **faucet** just in
+time, moves the address's balance to the network's sweep target and enqueues `deposit_swept`. A shared **webhook
+worker** delivers the outbox at least once. Keys come from two mnemonics held only in memory.
 
 ## Configuration
 
-The service is configured via environment variables. Create a `.env` file or set these variables:
+Secrets and process settings come from the environment; per-network settings come from `chains.toml`.
 
-### Required Variables
+| Variable | Required | Meaning | Default |
+|---|---|---|---|
+| `MNEMONIC` | yes | Deposit mnemonic; derives every deposit address | |
+| `FAUCET_MNEMONIC` | yes | Faucet mnemonic; pays sweep gas | |
+| `CHAINS_CONFIG` | no | Path to `chains.toml` | `chains.toml` |
+| `DATABASE_URL` | no | `postgres://...` URL, or a SQLite file (`sqlite:wallet.db`) for a quick local run | `sqlite:wallet.db` |
+| `DB_TLS_MODE` | no | Postgres TLS: `verify-ca` (default) or `disable` for a local server | `verify-ca` |
+| `DB_POOL_SIZE` / `DB_READ_POOL_SIZE` | no | Postgres pool size / SQLite read-pool size | |
+| `PORT` | no | HTTP port | `3000` |
+| `DEFAULT_CHAIN` | no | Network the default `/evm/block_number` routes act on; unset or unknown falls back to the first `[[chains]]` entry | first chain |
+| `WEBHOOK_JWT_TOKEN` | no | Bearer token sent to webhook URLs and required by `/admin/*` | |
+| `WEBHOOK_MAX_RETRIES`, `WEBHOOK_RETRY_DELAY_MS`, `WEBHOOK_RETRY_POLL_INTERVAL`, `WEBHOOK_RETRY_BATCH_SIZE`, `WEBHOOK_LEASE_SECONDS` | no | Webhook delivery tuning | `5`, `1000`, `30`, `50`, `60` |
+| `RUST_LOG` | no | Log filter | `evmhot=info` |
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `MNEMONIC` | BIP-39 mnemonic phrase for HD wallet (used to derive user deposit addresses) | `test test test test test test test test test test test junk` |
-| `FAUCET_MNEMONIC` | BIP-39 mnemonic phrase for faucet wallet (used to fund new addresses) | `another twelve word phrase for faucet` |
-| `FAUCET_ADDRESS` | Ethereum address of the faucet (derived from `FAUCET_MNEMONIC` at index 0) | `0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266` |
-| `TREASURY_ADDRESS` | Ethereum address where funds will be swept | `0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb` |
-| `RPC_URL` or `WS_URL` | Blockchain node endpoint (use WS for real-time, RPC for polling) | `https://eth-mainnet.g.alchemy.com/v2/...` or `wss://eth-mainnet.g.alchemy.com/v2/...` |
+`LEGACY_CHAIN` and the `migrate_*` binaries only serve the one-off redb/SQLite to Postgres imports.
 
-### Optional Variables
+### `chains.toml`
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | Path to the database file | `sqlite:wallet.db` |
-| `PORT` | API server port | `3000` |
-| `POLL_INTERVAL` | Block polling interval in seconds (HTTP mode only) | `10` |
-| `BLOCK_OFFSET_FROM_HEAD` | Number of blocks to stay behind chain head for confirmation safety | `20` |
-| `EXISTENTIAL_DEPOSIT` | Amount in wei to fund new addresses with | `10000000000000000` (0.01 ETH) |
+Copy [`chains.toml.example`](chains.toml.example). Each `[[chains]]` block configures one network: `name`,
+`chain_id`, `rpc_url` (HTTP polling only), `treasury_address` (the default sweep target), `faucet_address`,
+`existential_deposit`, a non-empty `allowed_token_addresses`, and optionally `token_treasuries` (a per-token sweep
+target), `min_deposits`, `min_deposit_default`, `min_deposit_native`, `poll_interval` and `block_offset_from_head`.
+Use a separate RPC key per network in production so one busy network cannot exhaust another's quota.
 
-### Example `.env` File
+## HTTP API
 
-```env
-# Database
-DATABASE_URL=sqlite:wallet.db
+Bodies are JSON; errors are a status code with a plain-text body. The surface is meant for an internal network:
+`/evm/register` and `/evm/verify_transfer` are unauthenticated.
 
-# Blockchain Connection (choose one)
-RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
-# For WebSocket (comment out RPC_URL if using WS):
-# WS_URL=wss://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
+| Route | Request | Response |
+|---|---|---|
+| `GET /evm/health` | | `200 {"status": "OK (chains: ...)", "enabled": true}`; `status` is `"error"` when the store's writer is down |
+| `POST /evm/register` | `{"id", "webhook_url"}` | `{"address"}` (same address for the same `id`); `503` while the store's write queue is full |
+| `POST /evm/verify_transfer` | `{"chain", "tx_hash", "to_address", "amount", "token_type", "token_address"?, "token_symbol"?}` | `{"status": "success", "actual_to", "actual_amount", "token_type", ...}` or `{"status": "error", "message", ...}`; reads the chain, writes nothing |
+| `GET /evm/block_number` | | `{"block_number"}`: the default network's cursor |
+| `POST /evm/block_number` | `{"block_number"}` | `{"block_number"}`: moves the default network's cursor |
+| `GET /evm/chains/{chain}/block_number` | | `{"chain", "block_number"}` |
+| `POST /evm/chains/{chain}/block_number` | `{"block_number"}` | `{"chain", "block_number"}` |
+| `POST /admin/retry_sweeps` | `{"chain", "tx_hash", "log_index"?}` | `{"retried", "token_type"}` |
+| `POST /admin/retry_webhooks` | `{"id", "event"}` | `{"retried", "status"}` |
 
-# Hot Wallet Configuration
-# This mnemonic is used to derive deposit addresses for users
-MNEMONIC=your twelve word mnemonic phrase goes here for hot wallet
+`/admin/*` needs `Authorization: Bearer <WEBHOOK_JWT_TOKEN>`. Moving a cursor backwards replays detection; deposits
+are recorded at most once, and webhooks already delivered are not sent again.
 
-# Faucet Configuration
-# This mnemonic is for the faucet that funds new addresses with existential deposit
-FAUCET_MNEMONIC=another twelve word mnemonic phrase for faucet wallet funding
+## Run it locally with public RPCs
 
-# Faucet Address (derived from FAUCET_MNEMONIC at index 0)
-# This address is used to identify and skip faucet deposits from being swept
-# To get this address: derive it from your FAUCET_MNEMONIC using BIP39/BIP44 at path m/44'/60'/0'/0/0
-FAUCET_ADDRESS=0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
+The development mnemonics in `env.docker.example` are the well-known anvil/hardhat ones. They are public; never
+send real funds to their addresses.
 
-# Existential Deposit (in wei)
-# Default: 10000000000000000 (0.01 ETH on Ethereum)
-# Adjust based on network: lower for testnets, consider gas costs
-EXISTENTIAL_DEPOSIT=10000000000000000
+```sh
+cp env.docker.example .env
+cat > chains.toml <<'TOML'
+[[chains]]
+name = "polygon"
+chain_id = 137
+rpc_url = "https://polygon-bor-rpc.publicnode.com"
+treasury_address = "0x2222222222222222222222222222222222222222"   # placeholder
+faucet_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"      # address of the dev faucet mnemonic
+existential_deposit = "10000000000000000"
+allowed_token_addresses = ["0xc2132D05D31c914a87C6611C10748AEb04B58e8f"]   # USDT on Polygon
 
-# Treasury address where funds are swept to
-TREASURY_ADDRESS=0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
-
-# API Server Port
-PORT=3000
-
-# Polling interval in seconds (for monitoring new blocks)
-POLL_INTERVAL=10
-
-# Block Offset from Head (number of blocks behind current head for confirmation safety)
-BLOCK_OFFSET_FROM_HEAD=20
+[[chains]]
+name = "base"
+chain_id = 8453
+rpc_url = "https://mainnet.base.org"
+treasury_address = "0x1111111111111111111111111111111111111111"   # placeholder
+faucet_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+existential_deposit = "10000000000000000"
+allowed_token_addresses = ["0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"]   # USDC on Base
+TOML
+docker compose up --build        # evmhot + Postgres on http://localhost:3000
+curl -s localhost:3000/evm/health
+curl -s -X POST localhost:3000/evm/register -H 'content-type: application/json' \
+  -d '{"id":"party-1","webhook_url":"https://example.com/hook"}'
 ```
 
-## Usage
+Or without Docker: `cp .env.example .env`, put the same `chains.toml` in place, and `cargo run --bin evmhot` (SQLite
+file by default).
 
-### Running the Service
+Public RPC endpoints are rate limited; they are for trying the service out, not for production.
 
-```bash
-# With .env file
-cargo run --release
+## Container image
 
-# Or with environment variables
-MNEMONIC="..." \
-TREASURY_ADDRESS="0x..." \
-WEBHOOK_URL="https://..." \
-RPC_URL="https://..." \
-cargo run --release
-```
-
-### Registering Users
-
-Use the API to register users with their webhook URL and get unique deposit addresses:
-
-```bash
-curl -X POST http://localhost:3000/register \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "user_123",
-    "webhook_url": "https://api.example.com/webhooks/user_123"
-  }'
-```
-
-Response:
-```json
-{
-  "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
-  "funding_tx": "0xabc123..." // Optional: transaction hash of faucet funding
-}
-```
-
-**Note**: Upon registration, the address is automatically funded with the configured existential deposit from the faucet. This ensures the address has enough balance for gas fees when sweeping deposits.
-
-**Important**: Each user registers with their own `webhook_url`. This allows per-user notification endpoints for deposit detection and sweep events.
-
-### Webhook Notifications
-
-The service sends webhook notifications to the per-account `webhook_url` for deposit events. Each webhook includes a unique `id` field for idempotency and deduplication.
-
-#### Unique Identifier (`id` field)
-- **Native ETH deposits**: `id` = transaction hash (e.g., `"0xabc123..."`)
-- **ERC20 deposits**: `id` = transaction hash + log index (e.g., `"0xabc123...:0"`)
-
-This ensures unique identification even when multiple ERC20 transfers occur in the same transaction.
-
-#### 1. Deposit Detection
-When a deposit is first detected on the blockchain, a POST request is sent to the account's webhook URL:
-
-**Native ETH Deposit Detected:**
-```json
-{
-  "id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-  "event": "deposit_detected",
-  "account_id": "user_123",
-  "tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-  "amount": "1000000000000000000",
-  "token_type": "native"
-}
-```
-
-**ERC-20 Token Deposit Detected:**
-```json
-{
-  "id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef:0",
-  "event": "deposit_detected",
-  "account_id": "user_123",
-  "tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-  "amount": "1000000",
-  "token_type": "erc20",
-  "token_symbol": "USDC",
-  "token_address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-  "token_decimals": 6
-}
-```
-
-**Converting ERC-20 amounts to human-readable format:**
-```javascript
-// For USDC with 6 decimals and amount "1000000"
-const humanReadable = amount / Math.pow(10, token_decimals);
-// Result: 1.0 USDC
-```
-
-#### 2. Deposit Swept
-When a deposit is successfully swept to the treasury, a POST request is sent to the account's webhook URL:
-
-**Native ETH Deposit Swept:**
-```json
-{
-  "id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-  "event": "deposit_swept",
-  "account_id": "user_123",
-  "original_tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-  "amount": "1000000000000000000",
-  "token_type": "native"
-}
-```
-
-**ERC-20 Token Deposit Swept:**
-```json
-{
-  "id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef:0",
-  "event": "deposit_swept",
-  "account_id": "user_123",
-  "original_tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef:0",
-  "amount": "1000000",
-  "token_type": "erc20",
-  "token_symbol": "USDC",
-  "token_address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-  "token_decimals": 6
-}
-```
-
-#### 3. Faucet Funding
-When a newly registered address is funded with an existential deposit:
-
-**Faucet Funding Success:**
-```json
-{
-  "event": "faucet_funding",
-  "account_id": "user_123",
-  "address": "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb",
-  "success": true,
-  "tx_hash": "0xabc..."
-}
-```
-
-**Faucet Funding Failure:**
-```json
-{
-  "event": "faucet_funding",
-  "account_id": "user_123",
-  "address": "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb",
-  "success": false,
-  "error": "Insufficient faucet balance"
-}
-```
-
-#### Webhook Best Practices
-
-1. **Idempotency**: Use the `id` field as an idempotency key to prevent duplicate processing
-2. **Deduplication**: Store processed webhook IDs to avoid reprocessing the same event
-3. **Validation**: Verify `account_id` belongs to your system
-4. **Acknowledgment**: Return HTTP 2xx status code to confirm receipt
-5. **Async Processing**: Process webhooks asynchronously to avoid timeouts
-
-**Example Webhook Handler (Node.js/Express):**
-```javascript
-app.post('/webhook', async (req, res) => {
-  const { id, event, account_id, token_type } = req.body;
-  
-  // Check for duplicate using id as idempotency key
-  const exists = await db.findWebhookById(id);
-  if (exists) {
-    console.log(`Duplicate webhook ignored: ${id}`);
-    return res.status(200).send('OK');
-  }
-  
-  // Store and process webhook
-  await db.storeWebhook({ id, ...req.body });
-  
-  switch (event) {
-    case 'deposit_detected':
-      await handleDepositDetected(req.body);
-      break;
-    case 'deposit_swept':
-      await handleDepositSwept(req.body);
-      break;
-    case 'faucet_funding':
-      await handleFaucetFunding(req.body);
-      break;
-  }
-  
-  res.status(200).send('OK');
-});
-```
-
-For complete webhook specifications, see [WEBHOOK_SPEC.md](./WEBHOOK_SPEC.md).
-
-## Troubleshooting
-
-### How to Derive Your Faucet Address
-
-The `FAUCET_ADDRESS` must match the address derived from your `FAUCET_MNEMONIC` at index 0. Here's how to get it:
-
-**Using a tool like `cast` (from Foundry):**
-```bash
-cast wallet address --mnemonic "your faucet mnemonic phrase here" --mnemonic-index 0
-```
-
-**Using ethers.js:**
-```javascript
-const { Wallet } = require('ethers');
-const mnemonic = "your faucet mnemonic phrase here";
-const wallet = Wallet.fromMnemonic(mnemonic, "m/44'/60'/0'/0/0");
-console.log(wallet.address);
-```
-
-**Using a BIP39 tool:**
-- Path: `m/44'/60'/0'/0/0` (Ethereum standard)
-- Index: 0
-
-### Common Issues
-
-**"Deposit from faucet is being swept"**
-- Verify that `FAUCET_ADDRESS` matches the actual address derived from `FAUCET_MNEMONIC` at index 0
-- Check logs to see which address the faucet is using
-- Addresses are case-insensitive but should be in checksummed format
-
-**"Faucet has insufficient balance"**
-- Ensure the faucet address has enough native currency to fund new addresses
-- Each registration requires at least `EXISTENTIAL_DEPOSIT` amount
-
-**"ERC-20 sweep fails with insufficient gas"**
-- Addresses need native balance (ETH/MATIC/etc.) to pay for ERC-20 transfer gas
-- Consider increasing `EXISTENTIAL_DEPOSIT` if you expect ERC-20 deposits
-
-## Debugging
-
-### RPC Request/Response Debugging
-
-This project includes comprehensive RPC debugging capabilities to help you troubleshoot blockchain interactions.
-
-#### Quick Start: Enable RPC Debugging
-
-Use the provided helper scripts:
-
-```bash
-# Standard debugging (recommended for most cases)
-./run-debug.sh
-
-# Maximum verbosity (shows full request/response bodies)
-./run-debug-verbose.sh
-
-# Run the debugging example
-RUST_LOG=alloy=debug cargo run --example rpc_debug_example
-```
-
-#### Manual Debugging with RUST_LOG
-
-Set the `RUST_LOG` environment variable to control logging verbosity:
-
-```bash
-# See all RPC calls with detailed timing
-RUST_LOG=alloy_transport_http=debug,alloy_rpc_client=debug cargo run
-
-# Maximum verbosity (includes request/response bodies)
-RUST_LOG=alloy=trace cargo run
-
-# Debug specific components
-RUST_LOG=evm_hot_wallet::monitor=debug,alloy=debug cargo run
-```
-
-#### What You'll See
-
-When RPC debugging is enabled, you'll see output like:
-
-```
-[DEBUG alloy_transport_http] sending request: method=eth_getBlockNumber
-[TRACE alloy_transport_http] request body: {"jsonrpc":"2.0","method":"eth_getBlockNumber","params":[],"id":1}
-[TRACE alloy_transport_http] response body: {"jsonrlog_rpc_call":"2.0","id":1,"result":"0x1234567"}
-[DEBUG alloy_transport_http] received response: status=200 duration=45ms
-```
-
-#### Log Levels
-
-- `error` - Only errors
-- `warn` - Warnings and errors
-- `info` - General information (default)
-- `debug` - Detailed debugging information, RPC method names and timing
-- `trace` - Maximum verbosity (includes full request/response JSON bodies)
-
-#### Common Debugging Scenarios
-
-**Debug block monitoring issues:**
-```bash
-RUST_LOG=evm_hot_wallet::monitor=debug,alloy_provider=debug cargo run
-```
-
-**Debug transaction issues:**
-```bash
-RUST_LOG=evm_hot_wallet::sweeper=debug,alloy_transport_http=trace cargo run
-```
-
-**Debug token transfer detection:**
-```bash
-RUST_LOG=evm_hot_wallet::monitor=debug,alloy_rpc_client=debug cargo run
-```
-
-**Save logs to a file:**
-```bash
-RUST_LOG=alloy=debug cargo run 2>&1 | tee debug.log
-```
-
-For more detailed information, see [DEBUG_RPC.md](./DEBUG_RPC.md).
+CI publishes `ghcr.io/bloque-app/evmhot` on every push to `main` (tags `main` and `sha-<commit>`) and on `v*` tags.
+The image runs as a non-root user and holds only the `evmhot` binary; migrations and the CA bundle are compiled in.
+Mount your `chains.toml` at `/etc/evmhot/chains.toml` (or set `CHAINS_CONFIG`) and pass the secrets as environment.
 
 ## Development
 
-### Running Tests
-
-```bash
-# Run all tests
-cargo test
-
-# Run with output
-cargo test -- --nocapture
-
-# Run specific test
-cargo test test_monitor_db_operations
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test        # the Postgres backend tests need Docker; they skip when it is not available
 ```
 
-### Code Quality
-
-The project uses standard Rust tooling:
-
-```bash
-# Format code
-cargo fmt
-
-# Run linter
-cargo clippy -- -D warnings
-
-# Check compilation
-cargo check
-```
-
-### CI/CD
-
-GitHub Actions automatically runs on every push/PR:
-- ✅ Format check (`cargo fmt --check`)
-- ✅ Compilation check (`cargo check`)
-- ✅ Linting (`cargo clippy`)
-- ✅ Tests (`cargo test`)
-
-## Project Structure
-
-```
-emvhot/
-├── src/
-│   ├── main.rs          # Entry point, service orchestration
-│   ├── api.rs           # REST API server
-│   ├── config.rs        # Configuration management
-│   ├── db.rs            # Database layer (redb)
-│   ├── monitor.rs       # Blockchain monitoring service
-│   ├── sweeper.rs       # Fund sweeping service
-│   ├── wallet.rs        # HD wallet implementation
-│   ├── traits.rs        # Shared service trait
-│   ├── tests.rs         # Unit tests
-│   └── e2e_tests.rs     # End-to-end tests
-├── .github/
-│   └── workflows/
-│       └── ci.yml       # CI/CD pipeline
-├── Cargo.toml           # Dependencies
-└── README.md
-```
-
-## Dependencies
-
-Key dependencies:
-- **alloy**: Ethereum library for transaction handling and providers
-- **axum**: Web framework for the REST API
-- **redb**: Embedded key-value database
-- **tokio**: Async runtime
-- **tracing**: Logging and diagnostics
-
-See [`Cargo.toml`](./Cargo.toml) for the complete list.
-
-## Security Considerations
-
-⚠️ **Important Security Notes**:
-
-1. **Never commit your `.env` file** - It contains sensitive mnemonic phrases
-2. **Separate mnemonics for security** - Use different mnemonics for the hot wallet and faucet
-3. **Use environment-specific mnemonics** - Don't use production mnemonics in development
-4. **Secure your webhook endpoint** - Validate webhook signatures in production
-5. **Monitor gas prices** - The sweeper uses on-chain gas prices which may be high during congestion
-6. **Database backups** - Regularly backup your database to prevent data loss
-7. **Hot wallet risks** - This is a hot wallet service; funds are only as secure as the server
-8. **Faucet funding** - Ensure the faucet address is properly funded to support new user registrations
-9. **Correct FAUCET_ADDRESS** - Double-check that `FAUCET_ADDRESS` matches the address derived from `FAUCET_MNEMONIC` at index 0
-
-## How It Works
-
-### Registration Flow
-1. User calls `POST /register` with their account ID and webhook URL
-2. System derives a deterministic address using hash-based indexing
-3. Faucet automatically sends existential deposit to the new address
-4. Address and webhook URL are registered in the database
-5. Address is ready to receive deposits with custom webhook notifications
-
-### Deposit Detection & Sweeping Flow
-1. **Monitor** watches the blockchain for transactions to registered addresses
-2. When a deposit is detected, **Monitor checks if it's from the faucet**:
-   - If yes: Skip recording (prevents sweeping existential deposits)
-   - If no: 
-     - Record the deposit in the database
-     - Send "deposit_detected" webhook to the account's webhook URL
-3. **Sweeper** processes recorded deposits:
-   - Derives the private key for the deposit address
-   - Calculates gas costs
-   - Transfers funds to the treasury address
-   - Sends "deposit_swept" webhook to the account's webhook URL
-4. Deposit is marked as "swept" in the database
-
-### ERC-20 Token Support
-- Monitor detects ERC-20 `Transfer` events to registered addresses
-- Automatically fetches and caches token metadata (symbol, decimals, name)
-- Webhooks include `token_decimals` for easy amount conversion
-- Sweeper transfers ERC-20 tokens using the native balance for gas
-- Unique identification with `tx_hash:log_index` format for multiple transfers in same transaction
-
-## Docker Deployment
-
-### Quick Start with Docker Compose
-
-1. **Copy the environment template:**
-```bash
-cp env.docker.example .env
-# Or use: make setup
-```
-
-2. **Edit `.env` with your configuration:**
-```bash
-# Set your RPC endpoint, mnemonics, addresses, etc.
-nano .env
-```
-
-3. **Build and start the service:**
-```bash
-docker-compose up -d
-# Or use: make up
-```
-
-4. **View logs:**
-```bash
-docker-compose logs -f evm-hot-wallet
-# Or use: make logs
-```
-
-5. **Check health:**
-```bash
-curl http://localhost:3000/health
-# Or use: make health
-```
-
-6. **Stop the service:**
-```bash
-docker-compose down
-# Or use: make down
-```
-
-### Using the Makefile
-
-A Makefile is provided for convenience:
-
-```bash
-make help          # Show all available commands
-make setup         # Create .env from template
-make up            # Start the service
-make logs          # View logs
-make health        # Check service health
-make backup        # Backup database
-make restart       # Restart service
-make down          # Stop service
-make rebuild       # Rebuild and restart
-make prod-check    # Verify production configuration
-```
-
-### Docker Commands
-
-**Build the image manually:**
-```bash
-docker build -t evm-hot-wallet .
-```
-
-**Run the container:**
-```bash
-docker run -d \
-  --name evm-hot-wallet \
-  -p 3000:3000 \
-  -v wallet-data:/app/data \
-  --env-file .env \
-  evm-hot-wallet
-```
-
-**Check container health:**
-```bash
-docker ps
-docker logs evm-hot-wallet
-```
-
-**Backup the database:**
-```bash
-docker cp evm-hot-wallet:/app/data/wallet.db ./backup-wallet.db
-```
-
-### Production Deployment Notes
-
-1. **Persistent Storage**: Database is stored in a Docker volume (`wallet-data`) to persist across container restarts
-2. **Environment Variables**: All configuration is loaded from `.env` file
-3. **Network**: Service runs on port 3000 by default (configurable)
-4. **Security**: 
-   - Never commit `.env` file with real secrets
-   - Use Docker secrets or environment variable injection for production
-   - Consider using a secrets management service (HashiCorp Vault, AWS Secrets Manager, etc.)
-5. **Monitoring**: Add health checks and monitoring solutions (Prometheus, Grafana)
-6. **Scaling**: For high availability, consider running multiple instances with a shared database
-
-### Health Check
-
-The docker-compose.yml includes a health check. You can also manually check:
-
-```bash
-curl http://localhost:3000/health
-```
-
-Note: You may need to implement a `/health` endpoint in the API if it doesn't exist.
-
-## Roadmap
-
-- [x] Support for ERC-20 token sweeping
-- [x] Faucet integration for funding new addresses
-- [x] Smart filtering to prevent sweeping existential deposits
-- [x] Docker deployment
-- [x] Per-account webhook URLs
-- [x] Unique webhook identifiers (`id` field)
-- [x] Token decimals in ERC-20 webhooks
-- [x] Automatic token metadata caching
-- [ ] Webhook signature verification (HMAC)
-- [ ] Configurable gas price strategies
-- [ ] Multi-chain support
-- [ ] Admin dashboard
-- [ ] Prometheus metrics
-- [ ] Health check endpoint
-
-## Contributing
-
-Contributions are welcome! Please ensure:
-1. All tests pass: `cargo test`
-2. Code is formatted: `cargo fmt`
-3. No clippy warnings: `cargo clippy -- -D warnings`
-4. Add tests for new features
-
-## License
-
-[Your License Here]
-
-## Support
-
-For issues and questions, please open an issue on GitHub.
-
-## Brand
-
-The evmhot mark and lockups are in [`docs/brand/`](docs/brand/): `symbol.svg`, one-colour versions,
-horizontal and stacked lockups for light and dark grounds, and 16 and 32 px favicons. Keep one grid
-module (a block plus a gap) clear around the symbol and two around a lockup; use the full symbol from
-24 px and the favicons below that. Don't recolour, stretch or put the mark in a tile, except as an app
-icon. The name and the marks belong to Pagos Cube LLC (Bloque) and are not licensed with the code.
+As a library: `HotWalletService::new(config)`, `start_background_services()`, `register`, `verify_transfer`,
+`get_block_number_async`, `set_block_number`, `retry_sweep`, `retry_webhook`.

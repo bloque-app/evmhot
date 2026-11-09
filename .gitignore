@@ -2,15 +2,24 @@
 .env
 .env.*
 !env.*.example
+!.env.example
+
+# Local configuration (copy from chains.toml.example)
+chains.toml
+.envrc
 
 # Database files
 *.db
 *.db-shm
-*.db-wal# Docker
+*.db-wal
+*.db.bak
+
+# Docker
 docker-compose.override.yml
 
 # Backups
 backups/
+*.bak
 
 # Logs
 *.log

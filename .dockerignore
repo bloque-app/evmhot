@@ -1,42 +1,17 @@
-# Git
 .git
-.gitignore
-
-# Rust build artifacts
+.github
 target/
-**/*.rs.bk
-*.pdb
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Environment files
+docs/
+tests/
+examples/
+*.md
 .env
 .env.*
-
-# Documentation
-*.md
-LICENSE
-
-# CI/CD
-.github/
-
-# Docker
-Dockerfile
-docker-compose.yml
-.dockerignore
-
-# Database files
+!env.*.example
 *.db
 *.db-shm
 *.db-wal
-
-# Logs
 *.log
-
-
-
+chains.toml
+docker-compose*.yml
+Dockerfile

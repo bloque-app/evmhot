@@ -1,48 +1,34 @@
-# Build stage
-FROM rust:1.75-slim as builder
+# syntax=docker/dockerfile:1
 
+# ---- build ----
+FROM rust:1.99.0-bookworm AS builder
 WORKDIR /app
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests
 COPY Cargo.toml Cargo.lock ./
-
-# Copy source code
 COPY src ./src
+# Migrations, the schema SQL and the CA bundle are embedded at compile time
+# (include_str!), so they are needed here and not in the runtime image.
+COPY migrations ./migrations
+COPY certs ./certs
 
-# Build the application in release mode
-RUN cargo build --release
+RUN cargo build --release --locked --bin evmhot
 
-# Runtime stage
+# ---- runtime ----
 FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin evmhot
 
-WORKDIR /app
+COPY --from=builder /app/target/release/evmhot /usr/local/bin/evmhot
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy the built binary from the builder stage
-COPY --from=builder /app/target/release/evm_hot_wallet /usr/local/bin/evm_hot_wallet
-
-# Create a directory for the database
-RUN mkdir -p /app/data
-
-# Set environment variables for database location
-ENV DATABASE_URL=/app/data/wallet.db
-
-# Expose the API port
+USER 10001
+# chains.toml is mounted or baked into a derived image; see CHAINS_CONFIG.
+ENV PORT=3000 \
+    CHAINS_CONFIG=/etc/evmhot/chains.toml
 EXPOSE 3000
-
-# Run the binary
-CMD ["evm_hot_wallet"]
-
-
-
+ENTRYPOINT ["/usr/local/bin/evmhot"]

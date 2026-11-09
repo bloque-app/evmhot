@@ -1,0 +1,5 @@
+# Pinned toolchain. Bump deliberately, in its own PR; CI, the Dockerfile and local builds all use it.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
