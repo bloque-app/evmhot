@@ -1,0 +1,26 @@
+{
+  "id": "polygon:0x1111111111111111111111111111111111111111111111111111111111111111:42",
+  "chain": "polygon",
+  "chain_id": 137,
+  "event": "deposit_swept",
+  "account_id": "0x742d35cc6634c0532925a3b844bc454e4438f44e",
+  "registration_id": "user_123",
+  "original_tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+  "from_address": "0x00000000000000000000000000000000000a11ce",
+  "amount": "25000000",
+  "token_type": "erc20",
+  "token_symbol": "USDC",
+  "token_address": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
+  "token_decimals": 6,
+  "sweep_tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+  "sweeps": [
+    {
+      "sweep_tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+      "sweep_block_number": 64000123,
+      "sweep_block_hash": "0x3333333333333333333333333333333333333333333333333333333333333333",
+      "sweep_log_index": 17,
+      "sweep_amount": "25000000",
+      "sweep_target": "0x584a9e72ebc1cdba2f20233764eef08d528792ca"
+    }
+  ]
+}
