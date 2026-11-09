@@ -1814,14 +1814,16 @@ fn req_sw_10_store_records_sweeps_idempotently_and_in_order() {
 fn pending_intent(fx: &Fixture, key: &str, amount: &str, tx: Option<&str>) -> i64 {
     let id = fx
         .db
-        .create_sweep_intent(
-            TEST_CHAIN,
-            "gk",
-            &[key.to_string()],
-            0,
-            amount,
-            &checksum(TARGET_A),
-        )
+        .create_sweep_intent(&crate::db::NewSweepIntent {
+            chain: TEST_CHAIN.into(),
+            account_id: "user_1".into(),
+            token_address: checksum(TOKEN),
+            group_key: "gk".into(),
+            keys: vec![key.to_string()],
+            part_index: 0,
+            amount: amount.into(),
+            target: checksum(TARGET_A),
+        })
         .unwrap();
     if let Some(tx) = tx {
         fx.db.set_sweep_intent_tx(id, tx).unwrap();
@@ -2032,6 +2034,8 @@ async fn dust_after_a_split_stays_owed_and_is_lifted_by_a_later_deposit() {
     sweeper.process_deposits_once().await.unwrap();
     assert_eq!(rpc.sent(), 1);
     assert_eq!(fx.detected(), 1);
+    // The dust alert was raised once and recorded, not on every pass.
+    assert!(!fx.db.alert_once(TEST_CHAIN, "0xaaa:1", "dust").unwrap());
     // A later deposit lifts the dust over the minimum; both are settled.
     fx.token_deposit("0xbbb", 2, "90", Some(SENDER_B));
     rpc.set_balance(100);
@@ -2408,4 +2412,201 @@ min = "1500"
         TEST_TREASURY,
     );
     assert!(parse_chains_toml(&both).is_err());
+}
+
+// ------------------------------------------------ second review's findings
+
+#[tokio::test]
+async fn failed_deposit_with_a_pending_intent_still_has_it_resolved() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let tx = sweep_tx(701);
+    pending_intent(&fx, "0xaaa:1", "100", Some(&tx));
+    // The deposit went failed (say, a "deserializ" error) with the sweep in flight.
+    fx.db
+        .mark_erc20_deposits_failed_for_keys(TEST_CHAIN, &["0xaaa:1".to_string()])
+        .unwrap();
+    assert!(fx.db.retry_erc20_deposit(TEST_CHAIN, "0xaaa", 1).is_err());
+    let rpc = Rpc::start(
+        0,
+        vec![sweep_tx(702)],
+        vec![(
+            tx.clone(),
+            ok_receipt(&tx, 90, 3, TOKEN, &fx.addr, TARGET_A, 100),
+        )],
+    )
+    .await;
+    fx.sweeper(&rpc, target_for(TOKEN, |_| {}))
+        .process_deposits_once()
+        .await
+        .unwrap();
+    // Resolved although its deposit is not detected: the sweep is recorded and
+    // the retry is no longer refused.
+    assert_eq!(fx.db.get_sweeps(TEST_CHAIN, "0xaaa:1").unwrap().len(), 1);
+    assert!(fx.db.retry_erc20_deposit(TEST_CHAIN, "0xaaa", 1).unwrap());
+    fx.sweeper(&rpc, target_for(TOKEN, |_| {}))
+        .process_deposits_once()
+        .await
+        .unwrap();
+    assert!(
+        fx.swept_webhook("0xaaa:1").is_some(),
+        "settled by its recorded sweep"
+    );
+}
+
+#[tokio::test]
+async fn a_deposit_with_a_sweep_in_flight_is_not_failed_out_from_under_it() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let tx = sweep_tx(703);
+    // In flight: hash but no receipt, and nothing to rebroadcast.
+    pending_intent(&fx, "0xaaa:1", "100", Some(&tx));
+    let rpc = Rpc::start(100, vec![sweep_tx(704)], vec![]).await;
+    // The token is not on the allowlist, which would fail the deposit.
+    let sweeper = fx.sweeper(&rpc, |c| {
+        c.allowed_token_addresses.insert(OTHER_TOKEN.to_lowercase());
+    });
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(
+        fx.detected(),
+        1,
+        "left alone while its sweep may still land"
+    );
+}
+
+#[tokio::test]
+async fn whole_balance_pair_is_blocked_while_a_deposit_is_in_review() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    fx.db
+        .mark_erc20_deposits_needs_review_for_keys(
+            TEST_CHAIN,
+            &["0xaaa:1".to_string()],
+            "sweep_review",
+        )
+        .unwrap();
+    // D1's tokens are still at the address when D3 arrives.
+    fx.token_deposit("0xccc", 3, "50", Some(SENDER_B));
+    let t = sweep_tx(711);
+    let rpc = Rpc::start(
+        150,
+        vec![t.clone()],
+        vec![(
+            t.clone(),
+            ok_receipt(&t, 91, 1, TOKEN, &fx.addr, TARGET_A, 150),
+        )],
+    )
+    .await;
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |_| {}));
+    sweeper.process_deposits_once().await.unwrap();
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(
+        rpc.sent(),
+        0,
+        "nothing is swept on a pair with a deposit in review"
+    );
+    assert_eq!(fx.detected(), 1);
+    // The alert naming the blocker was raised once.
+    assert!(!fx
+        .db
+        .alert_once(TEST_CHAIN, "0xaaa:1", "pair_blocked")
+        .unwrap());
+    // After the operator's retry both are swept together.
+    assert!(fx.db.retry_erc20_deposit(TEST_CHAIN, "0xaaa", 1).unwrap());
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(rpc.sent(), 1);
+    assert!(fx.swept_webhook("0xaaa:1").is_some());
+    assert!(fx.swept_webhook("0xccc:3").is_some());
+}
+
+#[tokio::test]
+async fn per_transfer_pair_is_blocked_while_a_deposit_is_failed_or_in_review() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    fx.token_deposit("0xbbb", 2, "200", Some(SENDER_A));
+    fx.db
+        .mark_erc20_deposits_failed_for_keys(TEST_CHAIN, &["0xaaa:1".to_string()])
+        .unwrap();
+    // The balance covers only the live deposit's 200, not the failed one's 100.
+    let rpc = Rpc::start(200, vec![sweep_tx(721)], vec![]).await;
+    fx.sweeper(&rpc, target_for(TOKEN, |t| t.per_transfer = true))
+        .process_deposits_once()
+        .await
+        .unwrap();
+    assert_eq!(rpc.sent(), 0);
+    assert_eq!(fx.detected(), 1);
+}
+
+#[tokio::test]
+async fn retried_review_whose_transfer_landed_is_checked_again_not_zero_balance_settled() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let tx = sweep_tx(731);
+    let id = pending_intent(&fx, "0xaaa:1", "100", Some(&tx));
+    fx.db.finish_sweep_intent(id, "review").unwrap();
+    fx.db
+        .mark_erc20_deposits_needs_review_for_keys(
+            TEST_CHAIN,
+            &["0xaaa:1".to_string()],
+            "sweep_review",
+        )
+        .unwrap();
+    // The operator retries; the transfer really did move the funds.
+    assert!(fx.db.retry_erc20_deposit(TEST_CHAIN, "0xaaa", 1).unwrap());
+    assert_eq!(
+        fx.db
+            .pending_sweep_intents(TEST_CHAIN, &["0xaaa:1".to_string()])
+            .unwrap()
+            .len(),
+        1,
+        "the review intent is pending again, so its receipt is re-checked"
+    );
+    let rpc = Rpc::start(
+        0,
+        vec![sweep_tx(732)],
+        vec![(
+            tx.clone(),
+            ok_receipt(&tx, 92, 2, TOKEN, &fx.addr, TARGET_A, 100),
+        )],
+    )
+    .await;
+    fx.sweeper(&rpc, target_for(TOKEN, |_| {}))
+        .process_deposits_once()
+        .await
+        .unwrap();
+    assert_eq!(fx.db.get_sweeps(TEST_CHAIN, "0xaaa:1").unwrap().len(), 1);
+    assert!(fx.swept_webhook("0xaaa:1").is_some());
+}
+
+#[tokio::test]
+async fn zero_balance_rule_never_fires_when_an_intent_could_have_moved_funds() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    // A review intent without a hash (so retry could not re-check it): the
+    // deposit is detected again, the address is empty, and 10+ passes must not
+    // mark it swept.
+    let id = pending_intent(&fx, "0xaaa:1", "100", None);
+    fx.db.finish_sweep_intent(id, "review").unwrap();
+    let rpc = Rpc::start(0, vec![sweep_tx(741)], vec![]).await;
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |_| {}));
+    for _ in 0..12 {
+        sweeper.process_deposits_once().await.unwrap();
+    }
+    assert_eq!(fx.detected(), 1);
+    assert!(fx.swept_webhook("0xaaa:1").is_none());
+}
+
+#[test]
+fn split_plan_leaves_no_permanent_dust_at_the_part_limit() {
+    let u = |n: u64| U256::from(n);
+    // max=100, min=10, amount=1005: nine full parts now, then 105 -> 95 + 10.
+    let first = plan_sweep_parts(u(1005), Some(u(10)), Some(u(100)), 10);
+    assert_eq!(first, vec![u(100); 9]);
+    let next = plan_sweep_parts(u(105), Some(u(10)), Some(u(100)), 10);
+    assert_eq!(next, vec![u(95), u(10)]);
+    let total = first
+        .iter()
+        .chain(next.iter())
+        .fold(U256::ZERO, |a, p| a + *p);
+    assert_eq!(total, u(1005), "everything is swept across the two passes");
 }

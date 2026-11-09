@@ -156,6 +156,15 @@ fn seed_sqlite_source(next_index: i64, block_cursor: (&str, i64)) -> NamedTempFi
     )
     .unwrap();
     conn.execute(
+        "INSERT INTO sweep_intents
+         (chain, account_id, token_address, group_key, keys, part_index, amount, target, state,
+          tx_hash, nonce, raw_tx, passes)
+         VALUES ('base', 'seed-user', '0xtoken1', 'g', '[\"0xerc1:0\"]', 0, '50', '0xtarget',
+                 'succeeded', '0xsweepA', 5, '0xraw', 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
         "INSERT INTO token_metadata (chain, token_address, symbol, decimals, name)
          VALUES ('base', '0xtoken1', 'USDC', 6, 'USD Coin')",
         [],
@@ -299,6 +308,27 @@ fn assert_all_migrated_tables(url: &str, context: &str) {
         sweep.get::<_, String>(4),
         "50",
         "{context}: sweeps.sweep_amount"
+    );
+    let intent = client
+        .query_one(
+            "SELECT state, tx_hash, nonce, raw_tx FROM sweep_intents WHERE chain = 'base'",
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("{context}: sweep_intents row missing: {e}"));
+    assert_eq!(
+        intent.get::<_, String>(0),
+        "succeeded",
+        "{context}: intent state"
+    );
+    assert_eq!(
+        intent.get::<_, Option<i64>>(2),
+        Some(5),
+        "{context}: intent nonce"
+    );
+    assert_eq!(
+        intent.get::<_, Option<String>>(3).as_deref(),
+        Some("0xraw"),
+        "{context}: raw_tx"
     );
     let sweep_count: i64 = client
         .query_one("SELECT COUNT(*) FROM sweeps", &[])
@@ -1344,7 +1374,16 @@ fn assert_order_intents_and_review(db: &Db) {
 
     let group = vec!["0xfff:0".to_string(), "0xccc:1".to_string()];
     let id = db
-        .create_sweep_intent("base", "gk", &group, 0, "20", "0xtarget")
+        .create_sweep_intent(&evmhot::db::NewSweepIntent {
+            chain: "base".to_string(),
+            account_id: "acct-a".to_string(),
+            token_address: "0xtoken1".to_string(),
+            group_key: "gk".to_string(),
+            keys: group.clone(),
+            part_index: 0,
+            amount: "20".to_string(),
+            target: "0xtarget".to_string(),
+        })
         .unwrap();
     assert!(db.pending_sweep_intents("base", &group).unwrap().len() == 1);
     assert!(db

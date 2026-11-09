@@ -124,6 +124,8 @@ ALTER TABLE erc20_deposits ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
 CREATE TABLE IF NOT EXISTS sweep_intents (
   id BIGSERIAL PRIMARY KEY,
   chain TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  token_address TEXT NOT NULL,
   group_key TEXT NOT NULL,
   keys TEXT NOT NULL,
   part_index BIGINT NOT NULL,
@@ -136,3 +138,10 @@ CREATE TABLE IF NOT EXISTS sweep_intents (
   passes BIGINT NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sweep_intents_state ON sweep_intents (chain, state);
+
+CREATE TABLE IF NOT EXISTS sweep_alerts (
+  chain TEXT NOT NULL,
+  deposit_key TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  PRIMARY KEY (chain, deposit_key, kind)
+);

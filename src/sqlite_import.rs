@@ -61,6 +61,27 @@ pub struct Erc20DepositRow {
     pub status: String,
     /// Sender (REQ-WH-9). `None` for rows written before it was stored.
     pub from_address: Option<String>,
+    /// Why it needs an operator (`needs_review` deposits).
+    pub review_kind: Option<String>,
+}
+
+/// A sweep part's intent (sent or about to be).
+#[derive(Debug, Default, Clone)]
+pub struct SweepIntentRow {
+    pub id: i64,
+    pub chain: String,
+    pub account_id: String,
+    pub token_address: String,
+    pub group_key: String,
+    pub keys: String,
+    pub part_index: i64,
+    pub amount: String,
+    pub target: String,
+    pub state: String,
+    pub tx_hash: Option<String>,
+    pub nonce: Option<i64>,
+    pub raw_tx: Option<String>,
+    pub passes: i64,
 }
 
 /// One sweep that settled a deposit (REQ-SW-10).
@@ -132,6 +153,7 @@ pub struct SqliteSnapshot {
     pub sweep_failures: Vec<SweepFailureRow>,
     pub webhook_deliveries: Vec<WebhookDeliveryRow>,
     pub sweeps: Vec<SweepRow>,
+    pub sweep_intents: Vec<SweepIntentRow>,
     /// Raw `state` table key/value pairs, including `next_index` and every
     /// `last_block:<chain>` cursor.
     pub state: Vec<(String, String)>,
@@ -186,7 +208,7 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
     };
 
     let mut stmt = conn.prepare(&format!(
-        "SELECT chain, tx_hash, account_id, amount, status, {} FROM deposits",
+        "SELECT chain, tx_hash, account_id, amount, status, {} FROM deposits ORDER BY rowid",
         from_expr("deposits")?
     ))?;
     let rows = stmt.query_map([], |r| {
@@ -202,9 +224,14 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
     snapshot.deposits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut stmt = conn.prepare(&format!(
-        "SELECT chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status, {}
-         FROM erc20_deposits",
-        from_expr("erc20_deposits")?
+        "SELECT chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status, {}, {}
+         FROM erc20_deposits ORDER BY rowid",
+        from_expr("erc20_deposits")?,
+        if table_has_column(&conn, "erc20_deposits", "review_kind")? {
+            "review_kind"
+        } else {
+            "NULL"
+        }
     ))?;
     let rows = stmt.query_map([], |r| {
         Ok(Erc20DepositRow {
@@ -217,6 +244,7 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
             token_symbol: r.get(6)?,
             status: r.get(7)?,
             from_address: r.get(8)?,
+            review_kind: r.get(9)?,
         })
     })?;
     snapshot.erc20_deposits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -310,6 +338,33 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
         snapshot.sweeps = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     }
 
+    if table_exists(&conn, "sweep_intents")? {
+        let mut stmt = conn.prepare(
+            "SELECT id, chain, account_id, token_address, group_key, keys, part_index, amount,
+                    target, state, tx_hash, nonce, raw_tx, passes
+             FROM sweep_intents ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SweepIntentRow {
+                id: r.get(0)?,
+                chain: r.get(1)?,
+                account_id: r.get(2)?,
+                token_address: r.get(3)?,
+                group_key: r.get(4)?,
+                keys: r.get(5)?,
+                part_index: r.get(6)?,
+                amount: r.get(7)?,
+                target: r.get(8)?,
+                state: r.get(9)?,
+                tx_hash: r.get(10)?,
+                nonce: r.get(11)?,
+                raw_tx: r.get(12)?,
+                passes: r.get(13)?,
+            })
+        })?;
+        snapshot.sweep_intents = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    }
+
     let mut stmt = conn.prepare("SELECT key, value FROM state")?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     snapshot.state = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -348,6 +403,7 @@ pub struct MigrationSummary {
     pub sweep_failures: (usize, usize),
     pub webhook_deliveries: (usize, usize),
     pub sweeps: (usize, usize),
+    pub sweep_intents: (usize, usize),
     pub next_index: Option<i64>,
     pub block_cursors: Vec<(String, i64)>,
 }
@@ -398,7 +454,29 @@ pub fn migrate_snapshot_to_postgres(
     client: &mut Client,
 ) -> Result<MigrationSummary> {
     assert_source_is_non_empty(snapshot)?;
+    assert_no_pending_intents(snapshot)?;
+    migrate_after_checks(snapshot, client)
+}
 
+/// A sweep still in flight must be resolved before the store moves.
+fn assert_no_pending_intents(snapshot: &SqliteSnapshot) -> Result<()> {
+    if let Some(intent) = snapshot.sweep_intents.iter().find(|i| i.state == "pending") {
+        bail!(
+            "refusing to migrate: sweep intent {} ({}) is still pending (tx {}). A sweep in \
+             flight must be resolved (let the sweeper settle it, or review it) before the store \
+             moves, or the destination would not know to check it",
+            intent.id,
+            intent.chain,
+            intent.tx_hash.as_deref().unwrap_or("not yet signed")
+        );
+    }
+    Ok(())
+}
+
+fn migrate_after_checks(
+    snapshot: &SqliteSnapshot,
+    client: &mut Client,
+) -> Result<MigrationSummary> {
     let mut summary = MigrationSummary::default();
     let mut tx = client.transaction()?;
 
@@ -441,8 +519,8 @@ pub fn migrate_snapshot_to_postgres(
         let changes = tx.execute(
             "INSERT INTO erc20_deposits
              (chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status,
-              from_address)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+              from_address, review_kind)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (chain, tx_hash, log_index) DO NOTHING",
             &[
                 &row.chain,
@@ -454,6 +532,7 @@ pub fn migrate_snapshot_to_postgres(
                 &row.token_symbol,
                 &row.status,
                 &row.from_address,
+                &row.review_kind,
             ],
         )?;
         summary.erc20_deposits.1 += changes as usize;
@@ -481,6 +560,41 @@ pub fn migrate_snapshot_to_postgres(
         )?;
         summary.sweeps.1 += changes as usize;
     }
+
+    summary.sweep_intents.0 = snapshot.sweep_intents.len();
+    for row in &snapshot.sweep_intents {
+        let changes = tx.execute(
+            "INSERT INTO sweep_intents
+             (id, chain, account_id, token_address, group_key, keys, part_index, amount, target,
+              state, tx_hash, nonce, raw_tx, passes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+             ON CONFLICT (id) DO NOTHING",
+            &[
+                &row.id,
+                &row.chain,
+                &row.account_id,
+                &row.token_address,
+                &row.group_key,
+                &row.keys,
+                &row.part_index,
+                &row.amount,
+                &row.target,
+                &row.state,
+                &row.tx_hash,
+                &row.nonce,
+                &row.raw_tx,
+                &row.passes,
+            ],
+        )?;
+        summary.sweep_intents.1 += changes as usize;
+    }
+    // New intents continue after the copied ones.
+    tx.execute(
+        "SELECT setval(pg_get_serial_sequence('sweep_intents', 'id'),
+                       COALESCE((SELECT MAX(id) FROM sweep_intents), 1),
+                       (SELECT COUNT(*) FROM sweep_intents) > 0)",
+        &[],
+    )?;
 
     summary.token_metadata.0 = snapshot.token_metadata.len();
     for row in &snapshot.token_metadata {
@@ -677,6 +791,11 @@ pub fn verify_migration(snapshot: &SqliteSnapshot, client: &mut Client) -> Resul
         pg_count(client, "sweep_failures")?,
     );
     report.check(
+        "sweep_intents.count",
+        snapshot.sweep_intents.len() as i64,
+        pg_count(client, "sweep_intents")?,
+    );
+    report.check(
         "sweeps.count",
         snapshot.sweeps.len() as i64,
         pg_count(client, "sweeps")?,
@@ -780,6 +899,62 @@ mod tests {
             .unwrap();
         drop(conn);
         tmp
+    }
+
+    #[test]
+    fn migration_refuses_a_pending_sweep_intent() {
+        let mut snapshot = SqliteSnapshot::default();
+        snapshot.sweep_intents.push(SweepIntentRow {
+            id: 7,
+            chain: "base".into(),
+            state: "pending".into(),
+            tx_hash: Some("0xabc".into()),
+            ..Default::default()
+        });
+        let err = assert_no_pending_intents(&snapshot)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pending") && err.contains("0xabc"), "{err}");
+        snapshot.sweep_intents[0].state = "succeeded".into();
+        assert!(assert_no_pending_intents(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn snapshot_reads_deposits_in_insertion_order_and_carries_intents_and_review_kind() {
+        let tmp = seed_sqlite_file();
+        let conn = RusqliteConnection::open(tmp.path()).unwrap();
+        for (i, tx) in ["0xfff", "0xaaa", "0xccc"].iter().enumerate() {
+            conn.execute(
+                "INSERT INTO erc20_deposits
+                 (chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status, review_kind)
+                 VALUES ('base', ?1, ?2, 'u1', '1', '0xt', 'T', 'needs_review', 'no_sender')",
+                rusqlite::params![tx, i as i64],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sweep_intents
+             (chain, account_id, token_address, group_key, keys, part_index, amount, target, state,
+              tx_hash, nonce, raw_tx, passes)
+             VALUES ('base', 'u1', '0xt', 'g', '[]', 0, '1', '0xtarget', 'succeeded', '0xh', 4, '0xraw', 2)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let snapshot = read_sqlite_snapshot(tmp.path()).unwrap();
+        let order: Vec<&str> = snapshot
+            .erc20_deposits
+            .iter()
+            .map(|d| d.tx_hash.as_str())
+            .collect();
+        assert_eq!(order, ["0xfff", "0xaaa", "0xccc"]);
+        assert_eq!(
+            snapshot.erc20_deposits[0].review_kind.as_deref(),
+            Some("no_sender")
+        );
+        assert_eq!(snapshot.sweep_intents.len(), 1);
+        assert_eq!(snapshot.sweep_intents[0].nonce, Some(4));
+        assert_eq!(snapshot.sweep_intents[0].raw_tx.as_deref(), Some("0xraw"));
     }
 
     #[test]

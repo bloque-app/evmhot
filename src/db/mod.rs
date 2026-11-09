@@ -124,11 +124,26 @@ pub struct SweepRecord {
     pub sweep_target: Option<String>,
 }
 
+/// What is stored before a sweep part is signed.
+#[derive(Clone, Debug)]
+pub struct NewSweepIntent {
+    pub chain: String,
+    pub account_id: String,
+    pub token_address: String,
+    pub group_key: String,
+    pub keys: Vec<String>,
+    pub part_index: u64,
+    pub amount: String,
+    pub target: String,
+}
+
 /// A sweep part that is about to be, or has been, sent. Persisted before the
 /// transaction is signed so a part that lands unrecorded is found again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SweepIntent {
     pub id: i64,
+    pub account_id: String,
+    pub token_address: String,
     pub group_key: String,
     pub keys: Vec<String>,
     pub part_index: u64,
@@ -606,22 +621,51 @@ impl Db {
     }
 
     /// Persists a pending sweep intent before the transaction is signed.
-    pub fn create_sweep_intent(
+    pub fn create_sweep_intent(&self, new: &NewSweepIntent) -> Result<i64> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.create_sweep_intent(new),
+            DbInner::Postgres(p) => p.create_sweep_intent(new),
+        }
+    }
+
+    /// Every pending intent on the chain, whatever its deposits' status.
+    pub fn all_pending_sweep_intents(&self, chain: &str) -> Result<Vec<SweepIntent>> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.all_pending_sweep_intents(chain),
+            DbInner::Postgres(p) => p.all_pending_sweep_intents(chain),
+        }
+    }
+
+    /// States of every intent (any state) that touches any of the keys.
+    pub fn sweep_intent_states_for_keys(
         &self,
         chain: &str,
-        group_key: &str,
         keys: &[String],
-        part_index: u64,
-        amount: &str,
-        target: &str,
-    ) -> Result<i64> {
+    ) -> Result<Vec<String>> {
         match self.inner.as_ref() {
-            DbInner::Sqlite(s) => {
-                s.create_sweep_intent(chain, group_key, keys, part_index, amount, target)
-            }
-            DbInner::Postgres(p) => {
-                p.create_sweep_intent(chain, group_key, keys, part_index, amount, target)
-            }
+            DbInner::Sqlite(s) => s.sweep_intent_states_for_keys(chain, keys),
+            DbInner::Postgres(p) => p.sweep_intent_states_for_keys(chain, keys),
+        }
+    }
+
+    /// Keys of deposits of this address and token that are `needs_review` or `failed`.
+    pub fn blocking_erc20_deposits(
+        &self,
+        chain: &str,
+        account_id: &str,
+        token_address: &str,
+    ) -> Result<Vec<String>> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.blocking_erc20_deposits(chain, account_id, token_address),
+            DbInner::Postgres(p) => p.blocking_erc20_deposits(chain, account_id, token_address),
+        }
+    }
+
+    /// Records that an alert marker was raised; true the first time only.
+    pub fn alert_once(&self, chain: &str, deposit_key: &str, kind: &str) -> Result<bool> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.alert_once(chain, deposit_key, kind),
+            DbInner::Postgres(p) => p.alert_once(chain, deposit_key, kind),
         }
     }
 

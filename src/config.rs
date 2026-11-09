@@ -123,6 +123,12 @@ pub fn plan_sweep_parts(
         return vec![max; limit];
     }
     let full = full.to::<usize>();
+    // A full pass of full parts with a remainder under the minimum: send one
+    // fewer, so the next pass splits `max + rem` and can top the tail up
+    // instead of leaving the remainder as permanent dust.
+    if full == limit && !rem.is_zero() && rem < min && limit > 1 {
+        return vec![max; limit - 1];
+    }
     let mut parts: Vec<U256> = vec![max; full];
     if !rem.is_zero() {
         if rem >= min {
