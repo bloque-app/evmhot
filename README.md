@@ -72,23 +72,45 @@ block hash, block-level log index of the `Transfer` into the target, amount) fro
 `deposit_swept` ([`WEBHOOK_SPEC.md`](WEBHOOK_SPEC.md)). A sweep whose receipt shows a revert is a failure and is never
 reported.
 
-**Sweep intents and `needs_review`.** Before a sweep is signed, evmhot stores an intent (deposits, part, amount,
-target); it then signs the transaction locally with an explicit nonce and stores the nonce, hash and raw bytes before
-broadcasting, so a failed broadcast (a rate-limited public RPC, say) is not operator work. On each pass, a pending
-intent is resolved before anything is planned: a receipt settles it; no receipt and the nonce still free means the same
-bytes are rebroadcast, and after 10 such passes the intent is dropped and the group re-plans (a new sweep at that nonce
-replaces it); no receipt and the nonce used by another transaction sends the deposits to `needs_review`. An intent
-that was never signed (a crash before signing) is dropped. A deposit is also moved to `needs_review` (never auto-settled or auto-retried, no `deposit_swept`,
-`EVMHOT_ALERT kind=... network=... deposit=... tx=...` logged at ERROR, counted in the sweeper's queue log) when:
-`sweep_review` the receipt succeeded but has no matching `Transfer` or its value differs from the planned amount;
-`balance_shortfall` a `per_sender` pair holds less than every sender is still owed (so one sender's sweep can never
-spend another's funds); `no_sender` a deposit with no recorded sender sits on a `per_sender` target. `POST
-/admin/retry_sweeps` (with the operator token) is the only route that moves a `needs_review` or `failed` deposit back to
-`detected`, and it refuses, naming the transaction, while any sweep intent of that deposit is still in flight.
+**Sweep sending: one signed transaction per deposit address.** Nonces belong to an address, so evmhot keeps at most one
+signed, unresolved transaction per deposit address, across every token and the native coin. Every sweep, native
+included, goes through a sweep intent:
 
-**Limits.** A split sends at most 10 parts per pass; the balance is re-read on the next pass. A dust remainder below
-`min` stays owed (`EVMHOT_ALERT kind=dust` warning): the deposits are not settled and a later deposit lifts it. At load,
-`max = 0` and `min > max` are refused.
+1. The intent is stored first (deposits, part, amount, target). The transaction is then signed locally with an explicit
+   nonce, its nonce, hash and signed bytes are stored on the intent, and it is broadcast. A broadcast error (a
+   rate-limited public RPC, a lost answer) is not an error: the intent is open with its bytes, and no receipt is ever
+   waited for inside a pass. The pass for that address ends at its first send.
+2. At the start of each pass the address's open intent is resolved before anything else is planned. A receipt settles
+   it (a revert fails it; the failure is counted, REQ-SW-4). With no receipt and the nonce still free, the same bytes
+   are broadcast again (an evicted transaction comes back; a known one is a no-op). An intent keeps its nonce for
+   good: it is **never dropped** once signed. If it is underpriced (its max fee is below the current estimate) after 10
+   waiting passes, it is re-signed **at the same nonce** with both fee fields raised by at least 10% (or to the
+   current estimate), the new hash is stored next to the old, and it is broadcast; at most one of them can land. If
+   the nonce is used and none of our hashes has a receipt (seen on two passes, because receipt indexing can lag), something outside evmhot used
+   the key: the deposits go to `needs_review`. Only an intent that was never signed (a crash before signing) is dropped.
+3. A split sends one part per pass and re-reads the balance for the next; a long split on one token therefore holds
+   back the address's other tokens and its native sweep until it ends. With `per_transfer` the parts are
+   `ceil(remaining / ceil(remaining / max))`, near equal.
+
+A deposit is moved to `needs_review` (never auto-settled or auto-retried, no `deposit_swept`,
+`EVMHOT_ALERT kind=... network=... deposit=... tx=...` logged at ERROR, counted in the sweeper's queue log; native
+deposits too) when:
+`sweep_review` the receipt succeeded but has no matching `Transfer` or its value differs from the planned amount, or
+the nonce was used by another transaction; `balance_shortfall` a `per_sender` or `per_transfer` pair holds less than is
+owed on it (the live deposits plus those waiting for a person, whose amounts are **reserved**; nothing is ever swept
+with a capped amount); `no_sender` a deposit with no recorded sender sits on a `per_sender`/`per_transfer` target.
+Whole-balance targets cannot reserve, so on them any `needs_review` or `failed` deposit blocks the pair
+(`EVMHOT_ALERT kind=pair_blocked`, once, naming it); `per_sender` and `per_transfer` pairs keep sweeping what they can
+account for. `POST /admin/retry_sweeps` (with the operator token) is the only route that moves a `needs_review` or
+`failed` deposit back to `detected`. It refuses, naming the transaction, while an intent of that deposit is unresolved,
+and it **closes** that deposit's review intents (`closed_by_operator`); it never re-opens them. What is owed is then
+computed from recorded sweeps alone. If the transfer that was reviewed had really moved the funds and no sweep is
+recorded, the address is empty and the zero-balance rule (REQ-SW-3) settles the retried deposit after 10 passes with no
+`deposit_swept`: retrying such a review is the operator's word that the deposit needs nothing more.
+
+**Limits.** A dust remainder below `min` stays owed (`EVMHOT_ALERT kind=dust`, once): the deposits are not settled and a
+later deposit lifts it. At load, `max = 0` and `min > max` are refused, and for `per_transfer` so is any `max` with
+`2 * min > max + 1` (the even split of a deposit above `max` has parts of at least `(max + 1) / 2`).
 
 ## HTTP API
 

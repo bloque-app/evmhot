@@ -70,14 +70,14 @@ native deposit carries no sweep fields. A token deposit adds:
   that sweep moved, and `sweep_target`, the address the `Transfer` went to (`null` for sweeps recorded before the
   target was stored).
 - The top-level `sweep_tx_hash` is the first entry's, so clients that read only it keep working.
-- `deposit_swept` is sent once, after the deposit's last sweep succeeded and was verified on its receipt; until then
+- `deposit_swept` is sent once, after the deposit's last sweep succeeded and was verified on its receipt (a sweep is signed and broadcast in one pass and its receipt read in a later one, one transaction per deposit address at a time, so a long split delivers its event after all its parts); until then
   only `deposit_detected` has been sent. A reverted sweep produces no event.
 - Several deposits settled by one sweep (a whole-balance sweep) each get their own event, all naming the same entry. With
   `per_sender` a sweep covers one sender's deposits only; with `per_transfer`, one deposit only.
 - A deposit whose sweep cannot be shown (its receipt has no `Transfer` from the deposit address to the target, or the
   value differs from the planned amount) is moved to `needs_review` and gets **no** `deposit_swept`; evmhot logs
   `EVMHOT_ALERT kind=sweep_review network=<n> deposit=<id> tx=<hash>` and an operator decides
-  (`POST /admin/retry_sweeps` moves it back to `detected`). Other review kinds: `balance_shortfall`, `no_sender`.
+  (`POST /admin/retry_sweeps` moves it back to `detected`, and closes its review intents). Other review kinds: `balance_shortfall`, `no_sender`. `sweep_review` also covers a sweep whose nonce was used by a transaction outside evmhot.
 - `(id, event)` stays the receiver's idempotency key.
 
 ## Lazy faucet
