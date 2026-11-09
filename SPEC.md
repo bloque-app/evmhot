@@ -126,7 +126,7 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
 - `REQ-RG-2` A new registration takes the next derivation index from a stored counter, allocated atomically with
   the registration, so two registrations never share an index.
 - `REQ-RG-3` The counter MUST start above every derivation index already in the store. Indices are not contiguous:
-  older registrations used hashed indices up to 2^31.
+  older registrations used hashed indices, some at or above 2^31 (`REQ-KY-1`).
 - `REQ-RG-4` Registration funds nothing. Gas is funded at sweep time (§6.3).
 - `REQ-RG-5` **(not built)** Derivation indices are 32-bit. When the counter reaches 2^32, registration MUST be refused
   with an error; it MUST NOT wrap or overflow. (Revised by amendment 0002.)

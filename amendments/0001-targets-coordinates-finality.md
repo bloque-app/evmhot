@@ -59,7 +59,8 @@ change, evmhot.)
 
 ## A10 — The derivation counter's ceiling
 
-Add `REQ-RG-5`: registration is refused at 2^31, never wrapped. (Engineering change, evmhot.)
+Add `REQ-RG-5`: registration is refused at 2^31, never wrapped. (Engineering change, evmhot. Revised by amendment
+0002: the ceiling is 2^32.)
 
 ## A11 — Atomic outbox
 
