@@ -353,6 +353,21 @@ impl PostgresBackend {
         }))
     }
 
+    pub fn list_registrations(&self) -> Result<Vec<(String, u32, String)>> {
+        let mut guard = self.conn()?;
+        let rows = guard.client().query(
+            "SELECT id, derivation_index, address FROM accounts ORDER BY derivation_index",
+            &[],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let index: i64 = r.get(1);
+                (r.get(0), index as u32, r.get(2))
+            })
+            .collect())
+    }
+
     pub fn get_webhook_url(&self, account_id: &str) -> Result<Option<String>> {
         let mut guard = self.conn()?;
         let row = guard.client().query_opt(

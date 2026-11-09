@@ -346,13 +346,30 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        Self::load_env(true)
+    }
+
+    /// Like `from_env`, but for offline tools that never sign (the gap scan):
+    /// `MNEMONIC` and `FAUCET_MNEMONIC` are not read, and are left empty. The
+    /// faucet address comes from each chain's `faucet_address` in chains.toml.
+    pub fn from_env_without_mnemonics() -> Result<Self> {
+        Self::load_env(false)
+    }
+
+    fn load_env(require_mnemonics: bool) -> Result<Self> {
         dotenv().ok();
 
         let database_url =
             env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:wallet.db".to_string());
 
-        let mnemonic = env::var("MNEMONIC").context("MNEMONIC must be set")?;
-        let faucet_mnemonic = env::var("FAUCET_MNEMONIC").context("FAUCET_MNEMONIC must be set")?;
+        let (mnemonic, faucet_mnemonic) = if require_mnemonics {
+            (
+                env::var("MNEMONIC").context("MNEMONIC must be set")?,
+                env::var("FAUCET_MNEMONIC").context("FAUCET_MNEMONIC must be set")?,
+            )
+        } else {
+            (String::new(), String::new())
+        };
         let port = env::var("PORT")
             .unwrap_or_else(|_| "3000".to_string())
             .parse()?;
