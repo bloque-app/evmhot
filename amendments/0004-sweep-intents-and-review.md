@@ -1,8 +1,7 @@
 # Amendment 0004 — sweep intents, review, one sweep per transfer
 
-**Status:** ruled. Applied to `SPEC.md` 0.2.3, and revised by the sweep-sending redesign (PR #17): `A1`, `A2`, `A4`
-and `A5` below now state the never-drop, same-nonce rule and the reservation rule. `SPEC.md` still carries the earlier
-wording of `REQ-SW-13`, `REQ-SW-14`, `REQ-SW-15`, `REQ-SW-7`, §9.2 and `INV-7` until it is brought in line.
+**Status:** ruled. Applied to `SPEC.md` 0.2.3, including the sweep-sending redesign (PR #17): the never-drop,
+same-nonce rule and the reservation rule.
 **Target:** `SPEC.md` 0.2.2
 **Date:** 2026-11-09
 **Rulings applied:** R13 (one sweep per inbound transfer). The rest is an engineering change, evmhot, found by the
@@ -90,13 +89,14 @@ transaction, for token and native deposits. It refuses while an intent covering 
 transaction. It **closes** the deposit's `review` intents (`closed_by_operator`); it never re-opens one. From then on
 what is owed is computed from the recorded sweeps alone. If the reviewed sweep had in fact moved the funds and no sweep
 is recorded, the address is empty and `REQ-SW-3` settles the deposit after its 10 passes with no `deposit_swept`;
-retrying such a review is the operator's word that nothing more is owed.
+retrying such a review is the operator's word that nothing more is owed. That settlement raises
+`kind=settled_without_sweep` once, so it is never silent.
 
 ## A6 — Alerts
 
 New `REQ-OB-4`: an alert is a log line that starts with `EVMHOT_ALERT kind=<kind> network=<network>` and carries the
 deposit's identity and transaction where there are some. Kinds: `sweep_review`, `balance_shortfall`, `no_sender`,
-`pair_blocked` (review or failed blockers only) and `dust`; `lag` and `provider` come with F-002b. `dust` and `pair_blocked` are raised once per
+`pair_blocked` (review or failed blockers only), `dust` and `settled_without_sweep`; `lag` and `provider` come with F-002b. `dust` and `pair_blocked` are raised once per
 deposit and blocking state; later passes log quietly. Metric filters match the marker and the kind.
 
 ## A7 — Where the target is recorded
@@ -108,17 +108,17 @@ as `sweep_target`.
 
 | Action | Identifiers |
 |---|---|
-| New | `REQ-SW-13`, `REQ-SW-14`, `REQ-SW-15`, `REQ-OB-4`, `INV-7` |
+| New | `REQ-SW-13`, `REQ-SW-14`, `REQ-SW-15`, `REQ-OB-4`, `INV-7`, `INV-8` |
 | Revised | `REQ-SW-3`, `REQ-SW-7`, `REQ-SW-10`, §9.2 |
 | Withdrawn | none |
 
 ## What this costs, stated plainly
 
-- A deposit in review, and every other deposit on its address and token, waits for a person. Until then the funds
+- A deposit in review waits for a person; on a whole-balance target so does every other deposit on its address and
+  token. Until then the funds
   sit in the deposit address and no `deposit_swept` is sent.
-- Every row detected before 0.2.2 that routes to bezent's Safe enters review on its first pass, because it has no
-  sender. The importer copies senders where the source has them; rows from before 0.2.2 have none, so each needs an
-  operator, or a sender backfill from the chain, which is not built.
+- A row detected before 0.2.2 that routes to bezent's Safe has no sender and enters review. On 2026-11-09 production
+  held none: every Polygon native USDC deposit in the store was already swept.
 - Two more tables (intents, alert markers) and one more write before each broadcast. Sweeps wait for the earlier one on
   the same address: a long split, or a held transaction, delays the address's other tokens and its native sweep.
 - A transaction held for a lower fee is repriced at its nonce; both versions can be mined, only one can land.

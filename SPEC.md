@@ -164,7 +164,8 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   network's default target. The native coin always uses the default target.
 - `REQ-SW-3` A token deposit whose address holds a zero balance of the token is retried for 10 passes and then marked
   swept with no sweep transaction. Native deposits have no such rule. It applies only to a group with no recorded sweep
-  and no intent other than failed or dropped ones (amendment 0004).
+  and no intent other than a failed, dropped or closed-by-operator one; when it settles a deposit whose keys have any
+  intent history it raises `settled_without_sweep` (amendment 0004).
 - `REQ-SW-4` A sweep that fails with a funding error waits for the faucet and is retried. A token sweep that fails
   otherwise counts the failure; after 5 consecutive failures, or at once on a decoding error, the deposit is recorded as
   failed and can be retried by an operator. A native sweep that fails is retried on every pass.
@@ -192,9 +193,10 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
 - `REQ-SW-7` A target MAY declare a minimum and a maximum per sweep, in the token's minor units:
   - A balance below the minimum MUST NOT be swept to that target. It stays in the deposit address until later
     deposits bring it to the minimum.
-  - A balance above the maximum MUST be swept in several sweeps, each at most the maximum. A pass plans at most 10
-    of them and reads the balance again on the next pass. When the last part would be below the minimum, the pass
-    sends one full part fewer (amendment 0004).
+  - A balance above the maximum MUST be swept in several sweeps, each at most the maximum. An address sends one part per
+    pass (`REQ-SW-13`) and the balance is read again each pass. When the last part would be below the minimum, the
+    part before it is cut so the tail is exactly the minimum, if both fit; otherwise the tail stays owed as dust
+    (amendment 0004).
 - `REQ-SW-8` A target MAY declare that it admits only one token. Configuration that routes any other
   token to it MUST be refused at load time, and the process MUST NOT start.
 - `REQ-SW-9` Each sweep into a target emits exactly one token `Transfer` into it.
@@ -203,24 +205,30 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   sweep MUST NOT combine deposits from different senders: each sweep covers one inbound transfer, or several from the
   same sender. Deposits from one sender below the target's minimum MAY accumulate until together they reach it.
 - `REQ-SW-15` A target MAY declare `per_transfer`: each inbound deposit is swept on its own, never with another, even
-  from the same sender. A sweep sends the lesser of what that deposit is still owed and the address's balance. A
-  deposit above the target's maximum is swept in parts, all for that deposit. A `per_transfer` target whose minimum is
-  above the token's detection minimum, or that also declares `per_sender`, MUST be refused at load. bezent's Safe is a
+  from the same sender. A sweep sends what that deposit is still owed, never capped to the balance (`REQ-SW-14`). A
+  deposit above the target's maximum is split evenly into parts of `ceil(remaining / ceil(remaining / max))`, all for
+  that deposit. A `per_transfer` target MUST be refused at load if its minimum is above the token's detection minimum,
+  if `2 * min > max + 1` (a part could fall below the minimum), or if it also declares `per_sender`. bezent's Safe is a
   `per_transfer` target (R13). (Amendment 0004.)
 
 ### 6.6 Sweep intents and review (amendment 0004)
 
-- `REQ-SW-13` Before a sweep transaction is broadcast, evmhot MUST sign it and record a sweep intent: the deposits it
-  covers, the target, the part, the amount, the nonce, the transaction hash and the signed bytes. At the start of every
-  pass every pending intent on the network is resolved, whatever its deposits' status: a receipt settles or fails it;
-  with no receipt and the nonce unused, the same bytes are broadcast again, and after 10 passes the intent is dropped
-  and the deposits planned again; with the nonce used by another transaction, the deposits go to review; an intent
-  never signed is dropped.
-- `REQ-SW-14` A token deposit enters `needs_review`, and is not swept until an operator releases it, when its sweep's
+- `REQ-SW-13` An address MUST have at most one signed, unresolved sweep transaction at a time, across every token and
+  the native coin, because nonces belong to the address; the store refuses a second open intent. Before signing,
+  evmhot records a sweep intent (deposits covered, target, part, amount), then signs locally at an explicit nonce,
+  stores the nonce, hash and signed bytes, and broadcasts. No receipt is awaited inside a pass. At the start of every
+  pass the address's open intent is resolved first. A signed intent is never dropped and keeps its nonce: a receipt for
+  any of its hashes settles or fails it; with no receipt and the nonce unused, the newest bytes are broadcast again, and
+  an underpriced transaction that waited 10 passes is re-signed at the same nonce with both fee fields raised by at
+  least 10% (or to the estimate); with the nonce used and no receipt of ours on two passes, the deposits go to review.
+  Only an intent never signed is dropped.
+- `REQ-SW-14` A deposit enters `needs_review`, and is not swept until an operator releases it, when its sweep's
   receipt holds no matching `Transfer` or a different amount, or its nonce was used by another transaction
-  (`sweep_review`); when, for a `REQ-SW-12` or `REQ-SW-15` target, the address holds less than is owed on it
-  (`balance_shortfall`) or the deposit has no recorded sender (`no_sender`). While any deposit on an (address, token)
-  pair is in `needs_review` or `failed`, or has a pending intent, nothing on that pair is swept (`pair_blocked`).
+  (`sweep_review`); when, for a `REQ-SW-12` or `REQ-SW-15` target, the address holds less than the live deposits owe
+  plus what deposits in review or failed on the pair are still owed (`balance_shortfall`; a sweep is never capped); or
+  when such a deposit has no recorded sender (`no_sender`). For a whole-balance target, any deposit on the
+  (address, token) pair in `needs_review` or `failed` blocks the pair (`pair_blocked`); for `REQ-SW-12` and
+  `REQ-SW-15` targets their amounts are reserved instead.
 
 ### 6.5 The sweep coordinate (amendment 0001)
 
@@ -292,9 +300,11 @@ When the wallet is disabled, `register` and both `block_number` routes answer `5
 | `POST /admin/retry_sweeps` | `{chain, tx_hash, log_index?}` | `{retried, token_type}` |
 | `POST /admin/retry_webhooks` | `{id, event}` | `{retried, status}` |
 
-Both require the bearer token. The host service did not serve them in production. `retry_sweeps` moves a deposit in
-`needs_review` or `failed` back to `detected` in one transaction, refuses while an intent covering it is pending, and
-returns a `review` intent with a hash to pending so its receipt is read again (amendment 0004).
+Both require the bearer token. The host service did not serve them in production. `retry_sweeps` moves a token or native
+deposit in `needs_review` or `failed` back to `detected` in one transaction, refuses while an intent covering it is
+pending, and closes its `review` intents (`closed_by_operator`), never re-opening one. What is owed is then computed
+from recorded sweeps alone; retrying a review whose sweep in fact moved the funds is the operator's word that nothing
+more is owed (amendment 0004).
 
 - `REQ-API-1` A standalone evmhot MUST serve §9.1 under `/evm` with exactly those shapes, so that existing clients only
   change their base URL. It MAY also serve per-network forms of `block_number` that take a `chain`.
@@ -316,8 +326,8 @@ returns a `review` intent with a hash to pending so its receipt is read again (a
 - `REQ-OB-2` **(not built)** A provider answer that says the caller is rate-limited or over quota MUST be retried with
   growing back-off, and MUST raise an alert when it persists.
 - `REQ-OB-4` An alert is a log line starting `EVMHOT_ALERT kind=<kind> network=<network>`, with the deposit's identity
-  and transaction where there are some. Kinds: `sweep_review`, `balance_shortfall`, `no_sender`, `pair_blocked`,
-  `dust`, and with `REQ-OB-1`/`REQ-OB-2` `lag` and `provider`. `dust` and `pair_blocked` are raised once per deposit
+  and transaction where there are some. Kinds: `sweep_review`, `balance_shortfall`, `no_sender`, `pair_blocked`
+  (review or failed blockers only), `dust`, `settled_without_sweep`, and with `REQ-OB-1`/`REQ-OB-2` `lag` and `provider`. `dust` and `pair_blocked` are raised once per deposit
   and blocking state. (Amendment 0004.)
 - `REQ-OB-3` Health reports the store's writer and lists the networks. **(not built)** It also reports whether each
   network's provider answers.
@@ -332,7 +342,10 @@ returns a `review` intent with a hash to pending so its receipt is read again (a
   transaction (`REQ-SW-5`).
 - `INV-6` No sweep sends a token to a target that does not admit it (`REQ-SW-8`).
 - `INV-7` No deposit is marked swept (by a receipt or by `REQ-SW-3`) or released by an operator while a sweep intent
-  covering it is pending (`REQ-SW-13`).
+  covering it is pending, and a deposit is settled only by its recorded sweeps once nothing is left owed
+  (`REQ-SW-13`).
+- `INV-8` Every transaction mined from a deposit address is a recorded sweep or belongs to an open intent
+  (`REQ-SW-13`).
 
 What this version does not protect, stated plainly:
 
