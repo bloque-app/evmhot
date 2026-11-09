@@ -21,5 +21,6 @@ form lives outside this repository). Amendments cite these numbers.
 | R14 | 2026-11-09 | bUSDC is the only route; DUSD "no longer exists, and never will again" | relayed by the Standup Agent |
 | R15 | 2026-11-09 | bezent's DirectedDeposit is the on-chain router on Polygon; other networks don't use it | `d-router-directed` |
 | R16 | 2026-11-09 | Production runs on public RPC endpoints; safety comes from two independent nodes agreeing on one outcome | `a-rpc-keys` |
-| R17 | 2026-11-09 | Base USDC goes through Swaps: evmhot sweeps it to a Swaps holder on Base, and Swaps bridges it over CCTP to the Polygon Safe. The holder's address comes from Swaps; Base stays on hold until then | `d-cctp-who`; bezent's form, 20:20Z |
+| R17 | 2026-11-09 | Base USDC goes through Swaps: evmhot sweeps it with a plain transfer to a keyless forwarder contract on Base, and Swaps burns it over CCTP to the Polygon Safe and registers the mint. The forwarder's address comes when it is deployed; Base stays on hold until then | `d-cctp-who`; Swaps' `d-base-option`, 22:10Z |
 | R18 | 2026-11-09 | Deposit addresses stay key-derived, so each is the same address on every network; on-chain sweeping uses EIP-7702 delegation, not contract addresses | chat |
+| R19 | 2026-11-09 | Polygon USDT0 is held; it returns later as a route that extends the USDC route with a USDT0 → USDC swap | Swaps' `d-usdt0` |

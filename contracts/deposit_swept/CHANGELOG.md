@@ -12,7 +12,6 @@ split in two.
 
 ## Planned, not built
 
-- **1.1.0, Base USDC by CCTP (`cctp_burn`)**, if the owner rules for it: a Base deposit's `sweeps[]` entry carries the
-  Polygon mint's coordinate (the `Transfer` from 0x0 to the Safe), plus new optional fields for the Base burn
-  transaction hash and the network the deposit arrived on. `from_address` stays the Base sender. Field names are fixed
-  in the amendment that builds it.
+- Nothing for Base. Pablo chose a keyless forwarder contract on Base as the holder (Swaps' `d-base-option`, 9 Nov):
+  evmhot sweeps Base USDC to it with a plain transfer, so a Base `deposit_swept` is this same 1.0.0 shape with
+  `chain: "base"`, and Swaps registers the Polygon mint itself. The earlier `cctp_burn` fields are dropped.
