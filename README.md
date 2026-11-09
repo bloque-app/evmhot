@@ -83,7 +83,7 @@ cat > chains.toml <<'TOML'
 [[chains]]
 name = "polygon"
 chain_id = 137
-rpc_url = "https://polygon-rpc.com"
+rpc_url = "https://polygon-bor-rpc.publicnode.com"
 treasury_address = "0x2222222222222222222222222222222222222222"   # placeholder
 faucet_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"      # address of the dev faucet mnemonic
 existential_deposit = "10000000000000000"
