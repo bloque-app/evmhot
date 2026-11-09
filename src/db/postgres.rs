@@ -277,9 +277,8 @@ impl PostgresBackend {
     /// `UPDATE` serializes concurrent registrations correctly, entirely
     /// within RDS (no NFS/network-filesystem latency involved).
     ///
-    /// The counter is already near `2^31` in production — see
-    /// `evmhot/TODOS.md` for the follow-up BIP44 hardened-derivation ceiling
-    /// guard, orthogonal to this migration.
+    /// Indices are 32-bit raw child numbers (SPEC REQ-KY-1); the ceiling
+    /// check at 2^32 is REQ-RG-5 (F-002).
     pub fn register_account_auto(
         &self,
         id: &str,
@@ -313,7 +312,7 @@ impl PostgresBackend {
         )?;
         let next_index: i64 = next_index_row.get(0);
         let next_index_u32 = u32::try_from(next_index)
-            .map_err(|_| anyhow!("next_index counter overflowed u32 (near BIP44 2^31 boundary)"))?;
+            .map_err(|_| anyhow!("next_index counter overflowed u32 (REQ-RG-5)"))?;
 
         let address = derive_address(next_index_u32)?;
 

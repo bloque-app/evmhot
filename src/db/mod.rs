@@ -10,7 +10,7 @@
 //! - [`postgres`]: a `postgres` + `r2d2_postgres` backed implementation with
 //!   no writer actor — Postgres handles concurrent writers natively via
 //!   MVCC/row locking, which is the whole point of this migration (SQLite's
-//!   WAL mode over EFS/NFS has multi-second per-commit lock latency; Postgres
+//!   WAL mode over a network filesystem has multi-second per-commit lock latency; Postgres
 //!   does not).
 //!
 //! Every public method on `Db` is a two-armed `match` that delegates to

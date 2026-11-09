@@ -6,12 +6,9 @@
 --
 -- Notes on type choices vs. the SQLite schema:
 --   * INTEGER counters that participate in derivation-index arithmetic
---     (derivation_index, log_index) use BIGINT rather than INTEGER: the
---     production next_index counter is already within ~42k of 2^31, which
---     is exactly one past Postgres INTEGER's signed range boundary
---     (2147483647) games with i32 overflow right at the danger zone we're
---     trying to guard against, so BIGINT gives headroom instead of adding
---     to the risk.
+--     (derivation_index, log_index) use BIGINT rather than INTEGER:
+--     derivation indices are 32-bit unsigned (SPEC REQ-KY-1) and can exceed
+--     Postgres INTEGER's signed range (2147483647).
 --   * decimals uses SMALLINT (u8 always fits).
 --   * All amounts/hashes/ids stay TEXT, exactly like SQLite (arbitrary
 --     precision amounts are handled as decimal strings by callers, not by

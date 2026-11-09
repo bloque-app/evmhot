@@ -278,7 +278,13 @@ impl IntoResponse for ApiError {
             ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
         };
 
-        (status, message).into_response()
+        // The host service's error body (SPEC section 9.1): JSON with the
+        // message and the numeric status.
+        let body = axum::Json(serde_json::json!({
+            "error": message,
+            "status": status.as_u16(),
+        }));
+        (status, body).into_response()
     }
 }
 
@@ -435,7 +441,7 @@ allowed_token_addresses = ["0x1111111111111111111111111111111111111111"]
     }
 
     #[test]
-    fn write_queue_errors_map_to_503_and_others_to_500_with_plain_text() {
+    fn write_queue_errors_map_to_503_and_others_to_500() {
         use axum::response::IntoResponse;
         let busy: anyhow::Error = WriteQueueError::QueueFull.into();
         let res = map_write_error(busy, "Failed to register EVM account").into_response();
@@ -539,7 +545,7 @@ allowed_token_addresses = ["0x1111111111111111111111111111111111111111"]
     }
 
     #[tokio::test]
-    async fn verify_transfer_unknown_chain_is_500_with_plain_text() {
+    async fn verify_transfer_unknown_chain_is_500_with_json_error() {
         let h = harness(None).await;
         let req = json!({
             "chain": "nowhere", "tx_hash": TX_HASH, "to_address": TO,
@@ -554,8 +560,16 @@ allowed_token_addresses = ["0x1111111111111111111111111111111111111111"]
         )
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(body.starts_with("Failed to verify transfer: "), "{body}");
-        assert!(serde_json::from_str::<Value>(&body).is_err());
+        let v = json_body(&body);
+        assert_eq!(keys(&v), ["error", "status"]);
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("Failed to verify transfer: "),
+            "{body}"
+        );
+        assert_eq!(v["status"], json!(500));
     }
 
     #[tokio::test]

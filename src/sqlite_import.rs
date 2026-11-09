@@ -102,7 +102,7 @@ pub struct WebhookDeliveryRow {
 
 /// Full in-memory copy of a source SQLite database. Read once, up front, so
 /// the destination-side transaction never blocks on the (potentially
-/// slow/EFS-mounted) SQLite source.
+/// slow, network-mounted) SQLite source.
 #[derive(Debug, Default, Clone)]
 pub struct SqliteSnapshot {
     pub accounts: Vec<AccountRow>,
@@ -136,10 +136,8 @@ impl SqliteSnapshot {
     }
 }
 
-/// Opens `path` read-only (never mutates the source — critical for both the
-/// production bootstrap migration, which runs against the live EFS file, and
-/// laptop dry runs against a copied production snapshot) and reads every
-/// table into memory.
+/// Opens `path` read-only (it never mutates the source, which may be a live
+/// store or a copy of one) and reads every table into memory.
 pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("failed to open SQLite source read-only: {}", path.display()))?;

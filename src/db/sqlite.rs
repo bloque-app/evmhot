@@ -304,7 +304,7 @@ fn now_unix_secs() -> i64 {
 
 fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     // synchronous=NORMAL: in WAL mode this skips the per-commit fsync (only
-    // checkpoints sync). On EFS every fsync is a network round-trip, so this
+    // checkpoints sync). On network storage every fsync is a round-trip, so this
     // is the single biggest write-latency lever. Tradeoff: on power loss /
     // hard crash the last few commits may roll back, but the DB stays
     // consistent and all affected data is recoverable (registers are retried
@@ -358,8 +358,8 @@ fn wal_file_size_bytes(db_path: &str) -> Option<u64> {
 /// every restart begins from a small WAL regardless of how large it grew in
 /// the previous run. Without this, restarting alone does not help: SQLite
 /// simply reopens the same oversized `-wal` file and resumes fighting
-/// auto-checkpoint attempts against it on every commit (the root cause of the
-/// 2026-07 write-queue-saturation incident — see docs/fix-p0-* history).
+/// auto-checkpoint attempts against it on every commit, which saturates the
+/// write queue.
 fn checkpoint_startup(conn: &Connection, db_path: &str) -> Result<()> {
     let before_bytes = wal_file_size_bytes(db_path);
     let result = run_wal_checkpoint(conn, "TRUNCATE")?;
@@ -506,7 +506,7 @@ fn spawn_writer(conn: Connection, db_path: String, cfg: WriterConfig) -> WriterH
 
 /// Core loop of the writer thread. Interactive commands always jump ahead;
 /// background commands are grouped into batched transactions (fewer commits
-/// means fewer WAL appends, which matters on EFS where each fsync is a
+/// means fewer WAL appends, which matters on network storage where each fsync is a
 /// network round-trip).
 fn writer_loop(
     conn: &Connection,
@@ -1844,7 +1844,7 @@ mod tests {
         assert_eq!(db.read.max_size(), 3);
     }
 
-    /// Regression test for the pool-exhaustion incident: a hardcoded pool size
+    /// Regression test for pool exhaustion: a hardcoded pool size
     /// (previously r2d2's implicit default of 10, with no way to raise it) is
     /// shared by every chain's monitor/sweeper/webhook loops plus inbound
     /// registrations. This proves `with_pool_size` actually bounds concurrent
@@ -1959,7 +1959,7 @@ mod tests {
         }
     }
 
-    /// Regression for the 2026-07 write-queue-saturation incident: a
+    /// Regression for write-queue saturation: a
     /// restart alone did nothing because SQLite just reopened the same
     /// oversized WAL. `checkpoint_startup` must actually shrink it.
     #[test]
@@ -1999,10 +1999,9 @@ mod tests {
         // Deliberately leak rather than drop: closing the last connection to
         // a WAL database triggers SQLite's own checkpoint-on-close, which
         // would clean up the WAL before `Db::with_options` ever gets a
-        // chance to and defeat the point of this test. A real incident looks
-        // like this too — the previous process's connection never got a
-        // clean close (killed, or the close-time checkpoint itself stalled
-        // on EFS), leaving an oversized WAL for the next process to inherit.
+        // chance to and defeat the point of this test. A killed process, or a
+        // close-time checkpoint that stalls on slow storage, leaves the same
+        // oversized WAL for the next process to inherit.
         std::mem::forget(conn);
 
         let wal_before = wal_file_size_bytes(path).unwrap_or(0);

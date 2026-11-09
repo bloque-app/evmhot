@@ -120,9 +120,7 @@ fn connect_pg(url: &str, pool_size: Option<u32>, migrate_from_sqlite: Option<&st
 /// end-to-end correctness for `deposits`, `erc20_deposits`,
 /// `token_metadata`, `sweep_meta`, `sweep_failures`, and
 /// `webhook_deliveries` too -- previously only `accounts`/`state` were
-/// exercised through the real migration path in an automated test; the
-/// other six tables were only proven by the one-off manual production dry
-/// run.
+/// exercised through the real migration path in an automated test.
 fn seed_sqlite_source(next_index: i64, block_cursor: (&str, i64)) -> NamedTempFile {
     let tmp = NamedTempFile::new().unwrap();
     let mut conn = RusqliteConnection::open(tmp.path()).unwrap();
@@ -879,7 +877,7 @@ fn postgres_bootstrap_migration_rolls_back_on_empty_source_guard() {
 
 /// REQ-RG-3: on an existing store with accounts but no counter row, the
 /// counter is seeded above the highest stored derivation index (hashed
-/// indices from older registrations can sit near 2^31), never at 0.
+/// indices from older registrations can be large, even above 2^31), never at 0.
 #[test]
 fn postgres_counter_seed_starts_above_existing_hashed_index() {
     if !docker_available() {
@@ -891,7 +889,7 @@ fn postgres_counter_seed_starts_above_existing_hashed_index() {
     let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let (_container, url) = start_postgres();
 
-    const HASHED_INDEX: i64 = 2_147_494_397;
+    const HASHED_INDEX: i64 = 2_147_500_000; // synthetic, above 2^31
 
     // First connect creates the schema (and seeds an empty store at 0).
     drop(connect_pg(&url, None, None));
