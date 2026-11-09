@@ -1,6 +1,6 @@
 # evmhot — System Specification
 
-**Version:** 0.2.0 · **Status:** draft for review · **Owner:** @pandres95
+**Version:** 0.2.1 · **Status:** draft for review · **Owner:** @pandres95
 
 ## 0. How to read this document
 
@@ -16,6 +16,7 @@ yet are marked **(not built)**, and `PLAN.md` §4 names the feature that builds 
 | Version | Date | Change |
 |---|---|---|
 | 0.1.0 | 2026-11-09 | The service as it ran: registration, detection, sweeps, faucet, webhooks, store, API |
+| 0.2.1 | 2026-11-09 | Amendment 0002: derivation indices are 32-bit raw child numbers; `register`'s response shape; JSON error bodies |
 | 0.2.0 | 2026-11-09 | Amendment 0001: sweep target kinds and bounds, the sweep coordinate, finality per network, sweep outcome check, lag and provider alerts, atomic outbox, separate tokens, counter ceiling; withdraws the symbol filter |
 
 ### Normative language
@@ -110,7 +111,8 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
 ### 5.1 Keys
 
 - `REQ-KY-1` Deposit addresses MUST be derived from one deposit mnemonic by the standard EVM derivation path,
-  `m/44'/60'/0'/0/<derivation index>`.
+  `m/44'/60'/0'/0/<derivation index>`, the index taken as a raw 32-bit child number: an index at or above 2^31 is a
+  hardened child at that number, as in 0.1.0. Existing addresses use both ranges.
 - `REQ-KY-2` The faucet MUST use a separate mnemonic.
 - `REQ-KY-3` Neither mnemonic, nor any key derived from them, MAY be logged, returned by the API, written to the
   store, or included in a webhook.
@@ -124,10 +126,10 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
 - `REQ-RG-2` A new registration takes the next derivation index from a stored counter, allocated atomically with
   the registration, so two registrations never share an index.
 - `REQ-RG-3` The counter MUST start above every derivation index already in the store. Indices are not contiguous:
-  older registrations used hashed indices up to 2^31.
+  older registrations used hashed indices, some at or above 2^31 (`REQ-KY-1`).
 - `REQ-RG-4` Registration funds nothing. Gas is funded at sweep time (§6.3).
-- `REQ-RG-5` **(not built)** Derivation indices are non-hardened, so below 2^31. When the counter reaches 2^31,
-  registration MUST be refused with an error; it MUST NOT wrap or overflow.
+- `REQ-RG-5` **(not built)** Derivation indices are 32-bit. When the counter reaches 2^32, registration MUST be refused
+  with an error; it MUST NOT wrap or overflow. (Revised by amendment 0002.)
 
 ## 6. Deposits and sweeps
 
@@ -245,13 +247,13 @@ where it takes no network.
 | Method and path | Request | Response |
 |---|---|---|
 | `GET /evm/health` | | `200 {status, enabled}`; `status` is `"error"` when the check fails, `"disabled"` when the wallet is off |
-| `POST /evm/register` | `{id, webhook_url}` | `{address, funding_tx}`; `funding_tx` is always null (`REQ-RG-4`). `503` while the store's write queue is full |
+| `POST /evm/register` | `{id, webhook_url}` | `{address}`; the `funding_tx` key is never present (`REQ-RG-4`). `503` while the store's write queue is full |
 | `POST /evm/verify_transfer` | `{chain, tx_hash, to_address, amount, token_type, token_address?, token_symbol?}` | `{status: "success", actual_to, actual_amount, token_type, token_symbol?, block_number?}` or `{status: "error", message, token_type?, block_number?}`. Reads the chain; writes nothing |
 | `GET /evm/block_number` | | `{block_number}`: the default network's cursor |
 | `POST /evm/block_number` | `{block_number}` | `{block_number}`: moves the default network's cursor. An operator action |
 
 When the wallet is disabled, `register` and both `block_number` routes answer `503`, and `verify_transfer` answers
-`500`. Errors are a status code with a plain-text body.
+`500`. Errors are the status code with a JSON body `{error, status}`: the message and the numeric status.
 
 ### 9.2 Operator routes
 
