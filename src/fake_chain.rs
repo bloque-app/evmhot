@@ -87,6 +87,7 @@ struct Held {
     to: Address,
     value: u128,
     input: Vec<u8>,
+    gas_limit: u128,
     land_at_step: u64,
 }
 
@@ -161,7 +162,6 @@ impl Chain {
         n
     }
 
-    #[allow(dead_code)]
     /// Hashes of transactions currently held (not mined, not evicted).
     pub fn held_hashes(&self) -> Vec<String> {
         self.mempool
@@ -179,6 +179,15 @@ impl Chain {
         let mut held = held;
         if held.from == self.faucet {
             held.land_at_step = 0; // the faucet's top-ups are mined at once
+            if std::env::var("PROP_TRACE").is_ok() {
+                eprintln!(
+                    "faucet tx nonce {} latest {} fee {} base {}",
+                    held.nonce,
+                    self.latest_nonce(held.from),
+                    held.max_fee,
+                    self.base_fee
+                );
+            }
             self.mempool.push(held);
             self.mine_ready();
             return;
@@ -220,6 +229,7 @@ impl Chain {
             to,
             value: u128::try_from(tx.value).unwrap_or(u128::MAX),
             input: tx.input.to_vec(),
+            gas_limit: tx.gas_limit,
             land_at_step: self.step,
         };
 
@@ -266,8 +276,10 @@ impl Chain {
         // Enough native balance for the value and the worst-case fee.
         let bal = *self.native_bal.get(&from).unwrap_or(&0);
         let is_token = to == self.token && !held.input.is_empty();
-        let gas = if is_token { 150_000u128 } else { 21_000 };
-        let need = held.value.saturating_add(gas * held.max_fee);
+        let _ = is_token;
+        let need = held
+            .value
+            .saturating_add(held.gas_limit.saturating_mul(held.max_fee));
         if bal < need {
             return Err((-32000, "insufficient funds for gas * price + value".into()));
         }
@@ -324,6 +336,9 @@ impl Chain {
     }
 
     fn execute(&mut self, h: Held) {
+        if std::env::var("PROP_TRACE").is_ok() {
+            eprintln!("execute {} from {} nonce {}", h.hash, h.from, h.nonce);
+        }
         *self.mined_nonce.entry(h.from).or_insert(0) += 1;
         let is_token = h.to == self.token && h.input.len() == 4 + 64;
         let mut logs = Vec::new();
@@ -379,7 +394,7 @@ impl Chain {
             success,
             logs,
         );
-        let visible = if self.receipt_lag {
+        let visible = if self.receipt_lag && h.from != self.faucet {
             self.step + 1
         } else {
             self.step
@@ -421,7 +436,16 @@ impl Chain {
     fn receipt(&self, hash: B256) -> Value {
         match self.receipts.get(&hash) {
             Some((r, visible)) if *visible <= self.step => r.clone(),
-            _ => Value::Null,
+            other => {
+                if std::env::var("PROP_TRACE").is_ok() {
+                    eprintln!(
+                        "receipt lookup {hash}: {:?} step {}",
+                        other.map(|o| o.1),
+                        self.step
+                    );
+                }
+                Value::Null
+            }
         }
     }
 
@@ -509,6 +533,15 @@ pub async fn serve(chain: SharedChain) -> MockServer {
             let respond = |item: &Value| -> Value {
                 let method = item["method"].as_str().unwrap_or("");
                 let result = chain.lock().unwrap().handle(method, &item["params"]);
+                if std::env::var("PROP_TRACE").is_ok() {
+                    eprintln!(
+                        "rpc {method} {} -> {:?}",
+                        item["params"],
+                        result
+                            .as_ref()
+                            .map(|v| v.to_string().chars().take(80).collect::<String>())
+                    );
+                }
                 match result {
                     Ok(v) => json!({"jsonrpc": "2.0", "id": item["id"], "result": v}),
                     Err((code, message)) => json!({

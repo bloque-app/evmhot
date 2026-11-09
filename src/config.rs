@@ -90,59 +90,42 @@ impl SweepTarget {
     }
 }
 
-/// Splits `amount` into sweeps that respect a target's bounds (REQ-SW-7), at
-/// most `limit` parts per call so a tiny `max` can never make one pass unbounded;
-/// the rest is planned on a later pass from the then-current balance.
+/// The next sweep for an amount still to be swept (REQ-SW-7). One part is sent
+/// at a time (each needs its own receipt before the address signs again), and
+/// the amount is planned again after each.
 ///
-/// - Below `min`: no sweep (the amount waits).
-/// - Above `max`: parts of `max`, then the remainder.
-/// - A remainder under `min` is topped up from the previous part when both can
-///   stay within bounds; otherwise it is left owed, because no sweep may fall
-///   outside the target's bounds.
-pub fn plan_sweep_parts(
-    amount: U256,
+/// - Nothing, if the amount is zero or below `min` (it waits).
+/// - All of it, when there is no `max` or it fits.
+/// - `even` (per_transfer): `ceil(amount / ceil(amount / max))`, so a deposit's
+///   parts are near equal and the last is never a stub.
+/// - Otherwise `max`; when the tail would fall below `min`, the part is cut so the
+///   tail is exactly `min` (if both can stay in bounds; if not, the tail is dust
+///   that waits for later deposits).
+pub fn next_sweep_part(
+    remaining: U256,
     min: Option<U256>,
     max: Option<U256>,
-    limit: usize,
-) -> Vec<U256> {
+    even: bool,
+) -> Option<U256> {
     let min = min.unwrap_or(U256::ZERO);
-    if amount.is_zero() || amount < min || limit == 0 {
-        return Vec::new();
+    if remaining.is_zero() || remaining < min {
+        return None;
     }
     let Some(max) = max.filter(|m| !m.is_zero()) else {
-        return vec![amount];
+        return Some(remaining);
     };
-    if amount <= max {
-        return vec![amount];
+    if remaining <= max {
+        return Some(remaining);
     }
-    let full = amount / max;
-    let rem = amount % max;
-    // More full parts than this pass may send: send `limit` of them and plan the
-    // rest next pass (no tail rebalancing needed, the tail is not in this plan).
-    if full > U256::from(limit) {
-        return vec![max; limit];
+    if even {
+        let parts = remaining.div_ceil(max);
+        return Some(remaining.div_ceil(parts));
     }
-    let full = full.to::<usize>();
-    // A full pass of full parts with a remainder under the minimum: send one
-    // fewer, so the next pass splits `max + rem` and can top the tail up
-    // instead of leaving the remainder as permanent dust.
-    if full == limit && !rem.is_zero() && rem < min && limit > 1 {
-        return vec![max; limit - 1];
+    let tail = remaining - max;
+    if tail < min && remaining >= min + min {
+        return Some(remaining - min);
     }
-    let mut parts: Vec<U256> = vec![max; full];
-    if !rem.is_zero() {
-        if rem >= min {
-            if parts.len() < limit {
-                parts.push(rem);
-            }
-        } else if max + rem >= min + min && parts.len() < limit {
-            // Both parts stay within [min, max]: rem < min gives prev < max.
-            let last = parts.len() - 1;
-            parts[last] = max + rem - min;
-            parts.push(min);
-        }
-    }
-    parts
+    Some(max)
 }
 
 /// Per-chain configuration loaded from `chains.toml`.
@@ -506,6 +489,16 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
                     .get(&token_norm)
                     .copied()
                     .unwrap_or(min_deposit_default);
+                // The even split of a deposit above `max` has parts of at least
+                // (max + 1) / 2, so none falls below `min` only if 2 * min <= max + 1.
+                if let (Some(min), Some(max)) = (min, max) {
+                    if min + min > max + U256::from(1u8) {
+                        bail!(
+                            "{field}: per_transfer splits a deposit above max ({max}) evenly, so \
+                             min ({min}) must be at most (max + 1) / 2, or a part could fall below it"
+                        );
+                    }
+                }
                 if let Some(min) = min {
                     if min > detection_min {
                         bail!(

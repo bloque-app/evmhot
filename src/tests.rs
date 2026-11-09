@@ -1152,12 +1152,23 @@ async fn test_erc20_sweep_emits_per_deposit_webhooks() {
         .await;
 
     // balanceOf -> 3000000006 (aggregate on-chain balance, the planned sweep)
+    let swept_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_for_balance = std::sync::Arc::clone(&swept_flag);
+    let flag_for_send = std::sync::Arc::clone(&swept_flag);
     Mock::given(method("POST"))
         .and(body_json_contains("eth_call"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "result": "0x00000000000000000000000000000000000000000000000000000000b2d05e06"
-        })))
+        .respond_with(move |_: &wiremock::Request| {
+            // The tokens leave the address once the sweep was broadcast.
+            let left = flag_for_balance.load(std::sync::atomic::Ordering::SeqCst);
+            let balance = if left {
+                "0x0000000000000000000000000000000000000000000000000000000000000000"
+            } else {
+                "0x00000000000000000000000000000000000000000000000000000000b2d05e06"
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "result": balance
+            }))
+        })
         .mount(&rpc_server)
         .await;
 
@@ -1210,9 +1221,11 @@ async fn test_erc20_sweep_emits_per_deposit_webhooks() {
     let sweep_tx_hash = "0x00000000000000000000000000000000000000000000000000000000000000f1";
     Mock::given(method("POST"))
         .and(body_json_contains("eth_sendRawTransaction"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0", "id": 1, "result": sweep_tx_hash
-        })))
+        .respond_with(move |_: &wiremock::Request| {
+            flag_for_send.store(true, std::sync::atomic::Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": sweep_tx_hash}))
+        })
         .mount(&rpc_server)
         .await;
 
@@ -1375,12 +1388,23 @@ async fn test_erc20_sweep_uses_token_treasury_override() {
     )
     .unwrap();
 
+    let swept_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_for_balance = std::sync::Arc::clone(&swept_flag);
+    let flag_for_send = std::sync::Arc::clone(&swept_flag);
     Mock::given(method("POST"))
         .and(body_json_contains("eth_call"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "result": "0x00000000000000000000000000000000000000000000000000000000b2d05e06"
-        })))
+        .respond_with(move |_: &wiremock::Request| {
+            // The tokens leave the address once the sweep was broadcast.
+            let left = flag_for_balance.load(std::sync::atomic::Ordering::SeqCst);
+            let balance = if left {
+                "0x0000000000000000000000000000000000000000000000000000000000000000"
+            } else {
+                "0x00000000000000000000000000000000000000000000000000000000b2d05e06"
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "result": balance
+            }))
+        })
         .mount(&rpc_server)
         .await;
 
@@ -1433,9 +1457,11 @@ async fn test_erc20_sweep_uses_token_treasury_override() {
     let sweep_tx_hash = "0x00000000000000000000000000000000000000000000000000000000000000f2";
     Mock::given(method("POST"))
         .and(body_json_contains("eth_sendRawTransaction"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0", "id": 1, "result": sweep_tx_hash
-        })))
+        .respond_with(move |_: &wiremock::Request| {
+            flag_for_send.store(true, std::sync::atomic::Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": sweep_tx_hash}))
+        })
         .mount(&rpc_server)
         .await;
 
@@ -1587,12 +1613,23 @@ async fn test_erc20_sweep_webhook_best_effort_on_failure() {
         .mount(&webhook_server)
         .await;
 
+    let swept_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_for_balance = std::sync::Arc::clone(&swept_flag);
+    let flag_for_send = std::sync::Arc::clone(&swept_flag);
     Mock::given(method("POST"))
         .and(body_json_contains("eth_call"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "result": "0x00000000000000000000000000000000000000000000000000000000b2d05e06"
-        })))
+        .respond_with(move |_: &wiremock::Request| {
+            // The tokens leave the address once the sweep was broadcast.
+            let left = flag_for_balance.load(std::sync::atomic::Ordering::SeqCst);
+            let balance = if left {
+                "0x0000000000000000000000000000000000000000000000000000000000000000"
+            } else {
+                "0x00000000000000000000000000000000000000000000000000000000b2d05e06"
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "result": balance
+            }))
+        })
         .mount(&rpc_server)
         .await;
     Mock::given(method("POST"))
@@ -1640,9 +1677,11 @@ async fn test_erc20_sweep_webhook_best_effort_on_failure() {
     let sweep_tx_hash = "0x00000000000000000000000000000000000000000000000000000000000000f2";
     Mock::given(method("POST"))
         .and(body_json_contains("eth_sendRawTransaction"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0", "id": 1, "result": sweep_tx_hash
-        })))
+        .respond_with(move |_: &wiremock::Request| {
+            flag_for_send.store(true, std::sync::atomic::Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": sweep_tx_hash}))
+        })
         .mount(&rpc_server)
         .await;
     Mock::given(method("POST"))

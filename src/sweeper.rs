@@ -1,7 +1,8 @@
 use crate::{
-    config::{plan_sweep_parts, ChainConfig, SweepTarget, TargetKind},
+    config::{next_sweep_part, ChainConfig, SweepTarget, TargetKind},
     db::{
-        Db, Erc20Deposit, Erc20Settlement, NewSweepIntent, OutboxEntry, SweepIntent, SweepRecord,
+        Db, Erc20Deposit, Erc20Settlement, IntentTx, NativeSettlement, NewSweepIntent, OutboxEntry,
+        SweepIntent, SweepRecord,
     },
     faucet::Faucet,
     wallet::Wallet,
@@ -77,10 +78,13 @@ impl Service for Sweeper {
 
 const MAX_ZERO_BALANCE_RETRIES: u64 = 10;
 const MAX_SWEEP_RETRIES: u64 = 5;
-/// Most parts of a split sent in one pass; the balance is re-read on the next.
-const MAX_PARTS_PER_PASS: usize = 10;
-/// Passes a sent sweep may go without a receipt before it is sent to review.
-const MAX_INTENT_WAIT_PASSES: u64 = 10;
+/// Waiting passes before an underpriced sweep is re-signed at its nonce.
+const REPRICE_AFTER_PASSES: u64 = 10;
+/// Passes in which a sweep's nonce is seen used, with no receipt of ours, before
+/// the deposits go to review (receipt indexing can lag the nonce).
+const GONE_PASSES_TO_REVIEW: u64 = 2;
+/// An intent's `token_address` for the native coin.
+const NATIVE_TOKEN: &str = "native";
 const QUEUE_LOG_INTERVAL_CYCLES: u64 = 60;
 
 fn is_permanent_sweep_error(err_debug: &str) -> bool {
@@ -137,6 +141,16 @@ impl Sweeper {
         self.process_deposits().await
     }
 
+    /// Test helper: several passes in a row (a sweep is sent in one pass and its
+    /// receipt read in the next).
+    #[cfg(test)]
+    pub(crate) async fn process_deposits_n(&self, n: usize) -> Result<()> {
+        for _ in 0..n {
+            self.process_deposits().await?;
+        }
+        Ok(())
+    }
+
     async fn log_deposit_queue(&self, reason: &str) {
         let chain_name = self.chain.name.clone();
         match self
@@ -167,91 +181,99 @@ impl Sweeper {
     }
 
     async fn process_deposits(&self) -> Result<()> {
-        self.process_native_deposits().await?;
-        self.process_erc20_deposits().await
-    }
-
-    async fn process_native_deposits(&self) -> Result<()> {
         let chain_name = self.chain.name.clone();
-        let deposits = self
-            .db
-            .blocking(move |db| db.get_detected_deposits(&chain_name))
-            .await?;
-
-        for (tx_hash, registration_id, amount_str) in deposits {
-            info!(
-                "[{}] Processing native deposit: tx_hash={}, registration_id={}, amount={}",
-                self.chain.name, tx_hash, registration_id, amount_str
-            );
-
-            let (derivation_index, address_str, _webhook_url) = {
-                let reg_id = registration_id.clone();
-                self.db
-                    .blocking(move |db| db.get_account_by_id(&reg_id))
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("Account not found"))?
-            };
-
-            let signer = self.wallet.get_signer(derivation_index)?;
-            let wallet = alloy::network::EthereumWallet::from(signer);
-
-            let sweep_provider = alloy::providers::ProviderBuilder::new()
-                .with_recommended_fillers()
-                .wallet(wallet)
-                .on_provider(&self.provider);
-
-            match self
-                .sweep_deposit(
-                    &sweep_provider,
-                    &address_str,
-                    &tx_hash,
-                    &registration_id,
-                    &amount_str,
-                )
-                .await
-            {
-                Ok(_) => info!(
-                    "[{}] Successfully swept native deposit: {}",
-                    self.chain.name, tx_hash
-                ),
-                Err(e) => {
-                    let err_str = format!("{:?}", e);
-                    if is_transient_funding_error(&err_str) {
-                        warn!(
-                            "[{}] Native deposit {} waiting for faucet funding: {}",
-                            self.chain.name, tx_hash, err_str
-                        );
-                    } else {
-                        error!(
-                            "[{}] Failed to sweep native deposit {}: {}",
-                            self.chain.name, tx_hash, err_str
-                        );
-                    }
+        let (erc20, native, open) = {
+            let c = chain_name.clone();
+            let erc20 = self
+                .db
+                .blocking(move |db| db.get_detected_erc20_deposits(&c))
+                .await?;
+            let c = chain_name.clone();
+            let native = self
+                .db
+                .blocking(move |db| db.get_detected_deposits(&c))
+                .await?;
+            let c = chain_name.clone();
+            let open = self
+                .db
+                .blocking(move |db| db.all_pending_sweep_intents(&c))
+                .await?;
+            (erc20, native, open)
+        };
+        // Everything is planned per deposit address: nonces are per address, so
+        // is the rule of one open intent. Addresses with only an open intent (its
+        // deposits failed, say) are included so that intent still gets resolved.
+        let mut regs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        regs.extend(erc20.iter().map(|d| d.account_id.clone()));
+        regs.extend(native.iter().map(|(_, reg, _)| reg.clone()));
+        regs.extend(open.iter().map(|i| i.account_id.clone()));
+        for reg in regs {
+            if let Err(e) = self.process_address(&reg).await {
+                #[cfg(test)]
+                if e.to_string().contains("test crash") {
+                    return Err(e);
                 }
+                warn!(
+                    "[{}] address {reg} skipped this pass: {:?}",
+                    self.chain.name, e
+                );
             }
         }
         Ok(())
     }
 
-    /// Token sweeps. Detected deposits are grouped by deposit address and token
-    /// (and by sender when the token's target says `per_sender`, REQ-SW-12).
-    /// Pending sweep intents are resolved first; a pair with an intent still
-    /// waiting for its receipt is left alone this pass.
-    async fn process_erc20_deposits(&self) -> Result<()> {
-        self.resolve_all_pending().await?;
+    /// One address, one pass: resolve its open intent, and only if there is none
+    /// left plan at most one new send (an ERC-20 part or the native coin).
+    async fn process_address(&self, reg: &str) -> Result<()> {
+        let (derivation_index, address_str, _webhook_url) = {
+            let r = reg.to_string();
+            self.db
+                .blocking(move |db| db.get_account_by_id(&r))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Account not found"))?
+        };
+        let address = Address::from_str(&address_str)?;
+
+        // 1. An open intent owns the address (and its nonce) until resolved.
+        let open = {
+            let (c, r) = (self.chain.name.clone(), reg.to_string());
+            self.db
+                .blocking(move |db| db.open_sweep_intent(&c, &r))
+                .await?
+        };
+        if let Some(intent) = open {
+            if self.resolve_intent(&intent, &address_str, address).await? == Resolution::Open {
+                return Ok(());
+            }
+        }
+
+        // 2. Plan from what is detected now (resolution may have settled or
+        // sent deposits to review).
         let chain_name = self.chain.name.clone();
-        let erc20_deposits = self
-            .db
-            .blocking(move |db| db.get_detected_erc20_deposits(&chain_name))
-            .await?;
+        let erc20: Vec<Erc20Deposit> = {
+            let c = chain_name.clone();
+            self.db
+                .blocking(move |db| db.get_detected_erc20_deposits(&c))
+                .await?
+                .into_iter()
+                .filter(|d| d.account_id == reg)
+                .collect()
+        };
+        let native: Vec<(String, String, String)> = {
+            let c = chain_name.clone();
+            self.db
+                .blocking(move |db| db.get_detected_deposits(&c))
+                .await?
+                .into_iter()
+                .filter(|(_, r, _)| r == reg)
+                .collect()
+        };
 
-        // Deposits come back in insertion order on both backends, so the first
-        // deposit of a group is stable: it keys the failure counters.
+        let signer = self.wallet.get_signer(derivation_index)?;
+        let wallet = alloy::network::EthereumWallet::from(signer);
+
         let mut pairs: Vec<Vec<Erc20Deposit>> = Vec::new();
-        let mut pair_index: std::collections::HashMap<(String, String), usize> =
-            std::collections::HashMap::new();
-
-        for deposit in erc20_deposits {
+        for deposit in erc20 {
             if !self.chain.is_token_allowed(&deposit.token_address) {
                 info!(
                     "[{}] Skipping non-allowlisted ERC20 deposit: key={}, token={}",
@@ -260,69 +282,85 @@ impl Sweeper {
                 self.fail_keys(std::slice::from_ref(&deposit.key)).await?;
                 continue;
             }
-
-            let target = self.chain.target_for_token(&deposit.token_address);
-            if target.kind == TargetKind::Hold {
-                // REQ-SW-6: detected and notified, never swept. A later change
-                // of the target's kind releases it.
+            if self.chain.target_for_token(&deposit.token_address).kind == TargetKind::Hold {
+                // REQ-SW-6: detected and notified, never swept; a later change of
+                // the target's kind releases it.
                 info!(
                     "[{}] Holding ERC20 deposit {} (token {} target is hold)",
                     self.chain.name, deposit.key, deposit.token_address
                 );
                 continue;
             }
-
-            let key = (
-                deposit.account_id.clone(),
-                deposit.token_address.to_lowercase(),
-            );
-            match pair_index.get(&key) {
-                Some(&i) => pairs[i].push(deposit),
-                None => {
-                    pair_index.insert(key, pairs.len());
-                    pairs.push(vec![deposit]);
-                }
+            let token = deposit.token_address.to_lowercase();
+            match pairs
+                .iter_mut()
+                .find(|p| p[0].token_address.to_lowercase() == token)
+            {
+                Some(pair) => pair.push(deposit),
+                None => pairs.push(vec![deposit]),
             }
         }
 
+        // Tokens first, in the order their deposits arrived, then the native
+        // coin. The first send ends the pass for this address: a long split of
+        // one token holds back the address's other tokens and its native sweep.
         for pair in pairs {
-            if let Err(e) = self.process_pair(pair).await {
-                warn!(
-                    "[{}] ERC20 pair skipped this pass: {:?}",
-                    self.chain.name, e
-                );
+            if self
+                .plan_pair(reg, &address_str, address, &wallet, pair)
+                .await?
+                == Outcome::Sent
+            {
+                return Ok(());
             }
+        }
+        if !native.is_empty() {
+            self.plan_native(reg, &address_str, address, &wallet, native)
+                .await?;
         }
         Ok(())
     }
 
-    async fn process_pair(&self, pair: Vec<Erc20Deposit>) -> Result<()> {
-        let first = &pair[0];
-        let registration_id = first.account_id.clone();
-        if let Some(blocker) = self
-            .pair_blocker(&registration_id, &first.token_address)
+    /// Whether an intent is still open for the address (after an error mid-send).
+    async fn address_has_open_intent(&self, reg: &str) -> Result<bool> {
+        let (c, r) = (self.chain.name.clone(), reg.to_string());
+        Ok(self
+            .db
+            .blocking(move |db| db.open_sweep_intent(&c, &r))
             .await?
-        {
-            // Nothing is swept here while a deposit on the pair is unresolved.
-            self.alert_once(&blocker, "pair_blocked").await?;
-            return Ok(());
-        }
-        let target = self.chain.target_for_token(&first.token_address);
-        // per_sender and per_transfer both sweep what a group is owed, not the
-        // balance: a sender's deposits, or one deposit.
-        let owed_mode = target.per_sender || target.per_transfer;
+            .is_some())
+    }
 
-        let (derivation_index, address_str, _webhook_url) = {
-            let reg_id = registration_id.clone();
-            self.db
-                .blocking(move |db| db.get_account_by_id(&reg_id))
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Account not found"))?
-        };
-        let signer = self.wallet.get_signer(derivation_index)?;
-        let wallet = alloy::network::EthereumWallet::from(signer);
+    async fn plan_pair(
+        &self,
+        reg: &str,
+        address_str: &str,
+        address: Address,
+        wallet: &alloy::network::EthereumWallet,
+        pair: Vec<Erc20Deposit>,
+    ) -> Result<Outcome> {
+        let first = &pair[0];
+        let target = self.chain.target_for_token(&first.token_address);
+        // per_sender and per_transfer sweep what a group is owed, not the balance.
+        let owed_mode = target.per_sender || target.per_transfer;
         let token_address = Address::from_str(&first.token_address)?;
-        let from_address = Address::from_str(&address_str)?;
+
+        // Deposits of this address and token waiting for a person (review or
+        // failed). Their tokens are still at the address.
+        let blocked = {
+            let (c, r, t) = (
+                self.chain.name.clone(),
+                reg.to_string(),
+                first.token_address.clone(),
+            );
+            self.db
+                .blocking(move |db| db.blocking_erc20_deposits(&c, &r, &t))
+                .await?
+        };
+        if !owed_mode && !blocked.is_empty() {
+            // A whole-balance sweep would spend their tokens: nothing is swept.
+            self.alert_once(&blocked[0].key, "pair_blocked").await?;
+            return Ok(Outcome::Idle);
+        }
 
         let mut subgroups: Vec<Vec<Erc20Deposit>> = Vec::new();
         if owed_mode {
@@ -331,8 +369,8 @@ impl Sweeper {
             let mut no_sender: Vec<String> = Vec::new();
             for deposit in pair {
                 match &deposit.from_address {
-                    // REQ-SW-12: a deposit with no recorded sender has no
-                    // refund address, so it is never swept by this target.
+                    // REQ-SW-12: no recorded sender, no refund address: never swept
+                    // by this target. Its amount stays reserved.
                     None => no_sender.push(deposit.key.clone()),
                     Some(_) if target.per_transfer => subgroups.push(vec![deposit]),
                     Some(from) => {
@@ -348,75 +386,776 @@ impl Sweeper {
                 }
             }
             if !no_sender.is_empty() {
-                self.send_to_review(&no_sender, "no_sender", None).await?;
+                self.send_to_review(&no_sender, "no_sender", None, false)
+                    .await?;
+            }
+            if subgroups.is_empty() {
+                return Ok(Outcome::Idle);
+            }
+            // The balance must cover everything owed on the pair: the live
+            // deposits and the ones waiting for a person (reserved). Below that,
+            // nothing is swept and nothing is capped: an operator looks.
+            let balance = get_token_balance(&self.provider, token_address, address).await?;
+            let mut owed_total = U256::ZERO;
+            for subgroup in &subgroups {
+                owed_total += self.remaining_owed(subgroup).await?;
+            }
+            owed_total += self.remaining_owed(&blocked).await?;
+            if balance < owed_total {
+                let keys: Vec<String> = subgroups.iter().flatten().map(|d| d.key.clone()).collect();
+                self.send_to_review(&keys, "balance_shortfall", None, false)
+                    .await?;
+                return Ok(Outcome::Idle);
             }
         } else {
             subgroups.push(pair);
         }
 
-        let live = subgroups;
-        if live.is_empty() {
-            return Ok(());
-        }
-
-        if owed_mode {
-            // One sender's sweep must never spend another sender's funds: if the
-            // address cannot cover what every sender is still owed, nothing is
-            // swept and an operator looks.
-            let balance = get_token_balance(&self.provider, token_address, from_address).await?;
-            let mut owed_total = U256::ZERO;
-            for subgroup in &live {
-                owed_total += self.remaining_owed(subgroup).await?;
-            }
-            if balance < owed_total {
-                let keys: Vec<String> = live.iter().flatten().map(|d| d.key.clone()).collect();
-                self.send_to_review(&keys, "balance_shortfall", None)
-                    .await?;
-                return Ok(());
-            }
-        }
-
-        for subgroup in live {
-            if let Err(e) = self
-                .sweep_subgroup(&wallet, &address_str, &target, &subgroup)
+        for subgroup in subgroups {
+            match self
+                .sweep_subgroup(reg, wallet, address_str, &target, &subgroup)
                 .await
             {
-                self.handle_group_failure(&subgroup, &e).await?;
+                Ok(Outcome::Sent) => return Ok(Outcome::Sent),
+                Ok(Outcome::Idle) => {}
+                Err(e) => {
+                    #[cfg(test)]
+                    if e.to_string().contains("test crash") {
+                        return Err(e);
+                    }
+                    self.handle_group_failure(&subgroup, &e).await?;
+                    // An error after the intent was written leaves it open: the
+                    // address is not planned again until it resolves.
+                    if self.address_has_open_intent(reg).await? {
+                        return Ok(Outcome::Sent);
+                    }
+                }
+            }
+        }
+        Ok(Outcome::Idle)
+    }
+
+    /// The native coin: one sweep of the whole balance (REQ-SW-11), covering
+    /// every detected native deposit of the address.
+    async fn plan_native(
+        &self,
+        reg: &str,
+        address_str: &str,
+        address: Address,
+        wallet: &alloy::network::EthereumWallet,
+        deposits: Vec<(String, String, String)>,
+    ) -> Result<Outcome> {
+        let blocked = {
+            let (c, r) = (self.chain.name.clone(), reg.to_string());
+            self.db
+                .blocking(move |db| db.blocking_native_deposits(&c, &r))
+                .await?
+        };
+        if let Some(key) = blocked.first() {
+            self.alert_once(key, "pair_blocked").await?;
+            return Ok(Outcome::Idle);
+        }
+        let result = self
+            .send_native(reg, address_str, address, wallet, &deposits)
+            .await;
+        match result {
+            Ok(()) => Ok(Outcome::Sent),
+            Err(e) => {
+                #[cfg(test)]
+                if e.to_string().contains("test crash") {
+                    return Err(e);
+                }
+                let err_str = format!("{e:?}");
+                if is_transient_funding_error(&err_str) {
+                    warn!(
+                        "[{}] Native deposits of {reg} waiting for faucet funding: {err_str}",
+                        self.chain.name
+                    );
+                } else {
+                    error!(
+                        "[{}] Failed to sweep native deposits of {reg}: {err_str}",
+                        self.chain.name
+                    );
+                }
+                if self.address_has_open_intent(reg).await? {
+                    return Ok(Outcome::Sent);
+                }
+                Ok(Outcome::Idle)
+            }
+        }
+    }
+
+    async fn send_native(
+        &self,
+        reg: &str,
+        address_str: &str,
+        address: Address,
+        wallet: &alloy::network::EthereumWallet,
+        deposits: &[(String, String, String)],
+    ) -> Result<()> {
+        let to_address = Address::from_str(&self.chain.treasury_address)?;
+        let mut balance = self.provider.get_balance(address).await?;
+        let gas_limit: u128 = 21000;
+        let fees = self.provider.estimate_eip1559_fees(None).await?;
+        let gas_cost = U256::from(gas_limit) * U256::from(fees.max_fee_per_gas);
+        let gas_cost_with_buffer = gas_cost + (gas_cost / U256::from(10));
+
+        if balance <= gas_cost_with_buffer {
+            match self.faucet.fund_new_address(address_str).await {
+                Ok(_) => {
+                    sleep(funding_settle()).await;
+                    balance = self.provider.get_balance(address).await?;
+                    if balance <= gas_cost_with_buffer {
+                        return Err(anyhow::anyhow!(
+                            "Still insufficient balance after faucet funding"
+                        ));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let value = balance - gas_cost_with_buffer;
+        let keys: Vec<String> = deposits.iter().map(|(tx, _, _)| tx.clone()).collect();
+        let intent_id = self
+            .create_intent(
+                reg,
+                address_str,
+                NATIVE_TOKEN,
+                &keys,
+                0,
+                &value.to_string(),
+                &to_address.to_string(),
+            )
+            .await?;
+        #[cfg(test)]
+        self.crash_if(CrashPoint::AfterIntentCreated)?;
+        let nonce = self.next_nonce(reg, address).await?;
+        let request = TransactionRequest::default()
+            .with_from(address)
+            .with_to(to_address)
+            .with_value(value)
+            .with_gas_limit(gas_limit)
+            .with_nonce(nonce)
+            .with_chain_id(self.chain.chain_id)
+            .with_max_fee_per_gas(fees.max_fee_per_gas)
+            .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
+        self.sign_store_broadcast(intent_id, nonce, request, wallet)
+            .await
+    }
+
+    async fn create_intent(
+        &self,
+        reg: &str,
+        address_str: &str,
+        token: &str,
+        keys: &[String],
+        part_index: u64,
+        amount: &str,
+        target: &str,
+    ) -> Result<i64> {
+        let new = NewSweepIntent {
+            chain: self.chain.name.clone(),
+            account_id: reg.to_string(),
+            address: address_str.to_lowercase(),
+            token_address: token.to_string(),
+            group_key: format!("{reg}|{}", token.to_lowercase()),
+            keys: keys.to_vec(),
+            part_index,
+            amount: amount.to_string(),
+            target: target.to_string(),
+        };
+        self.db
+            .blocking(move |db| db.create_sweep_intent(&new))
+            .await
+    }
+
+    /// The next nonce for an address: its pending count, but never at or below
+    /// the nonce of an intent that already landed (a public RPC's pending count
+    /// can be stale).
+    async fn next_nonce(&self, reg: &str, address: Address) -> Result<u64> {
+        let pending = self
+            .provider
+            .get_transaction_count(address)
+            .block_id(alloy::eips::BlockNumberOrTag::Pending.into())
+            .await?;
+        let highest = {
+            let (c, r) = (self.chain.name.clone(), reg.to_string());
+            self.db
+                .blocking(move |db| db.highest_landed_intent_nonce(&c, &r))
+                .await?
+        };
+        Ok(highest.map_or(pending, |h| pending.max(h + 1)))
+    }
+
+    /// Signs locally, stores the signed transaction on the intent, then
+    /// broadcasts it. A broadcast error is not an error here: the intent is open
+    /// with its hash and bytes, and the next pass rebroadcasts or resolves it. No
+    /// receipt is waited for.
+    async fn sign_store_broadcast(
+        &self,
+        intent_id: i64,
+        nonce: u64,
+        request: TransactionRequest,
+        wallet: &alloy::network::EthereumWallet,
+    ) -> Result<()> {
+        let max_fee = request.max_fee_per_gas.unwrap_or_default();
+        let max_priority = request.max_priority_fee_per_gas.unwrap_or_default();
+        let envelope = request
+            .build(wallet)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to sign the sweep: {e}"))?;
+        let tx = IntentTx {
+            hash: envelope.tx_hash().to_string(),
+            raw: alloy::primitives::hex::encode_prefixed(envelope.encoded_2718()),
+            max_fee: max_fee.to_string(),
+            max_priority: max_priority.to_string(),
+        };
+        {
+            let tx = tx.clone();
+            self.db
+                .blocking(move |db| db.set_sweep_intent_signed(intent_id, nonce, &tx))
+                .await?;
+        }
+        #[cfg(test)]
+        self.crash_if(CrashPoint::AfterSigned)?;
+        self.broadcast(&tx).await;
+        Ok(())
+    }
+
+    /// Broadcasts; returns the node's error, if any. "already known" and a lost
+    /// answer both land here: the intent resolves by receipt either way.
+    async fn broadcast(&self, tx: &IntentTx) -> Option<String> {
+        match alloy::primitives::hex::decode(&tx.raw) {
+            Ok(bytes) => match self.provider.send_raw_transaction(&bytes).await {
+                Ok(_) => None,
+                Err(e) => {
+                    warn!(
+                        "[{}] broadcast of {} failed: {e:?}",
+                        self.chain.name, tx.hash
+                    );
+                    Some(e.to_string())
+                }
+            },
+            Err(e) => {
+                warn!("[{}] stored raw tx unreadable: {e}", self.chain.name);
+                Some(e.to_string())
+            }
+        }
+    }
+
+    /// Sends the same signed bytes again. A node that refuses them for lack of gas
+    /// (the address paid for earlier transactions since) gets a faucet top-up and
+    /// one more try, for a token sweep.
+    async fn rebroadcast(
+        &self,
+        intent: &SweepIntent,
+        tx: &IntentTx,
+        address_str: &str,
+        address: Address,
+    ) -> Result<()> {
+        let Some(err) = self.broadcast(tx).await else {
+            return Ok(());
+        };
+        if err.to_lowercase().contains("insufficient funds") && intent.token_address != NATIVE_TOKEN
+        {
+            use alloy::consensus::TxEnvelope;
+            use alloy::eips::eip2718::Decodable2718;
+            let bytes = alloy::primitives::hex::decode(&tx.raw)?;
+            if let TxEnvelope::Eip1559(signed) = TxEnvelope::decode_2718(&mut &bytes[..])? {
+                let t = signed.tx();
+                self.ensure_gas(address_str, address, t.gas_limit, t.max_fee_per_gas)
+                    .await?;
+                self.broadcast(tx).await;
             }
         }
         Ok(())
     }
 
-    /// Moves deposits to `needs_review` and raises the alert operators watch for.
-    async fn send_to_review(&self, keys: &[String], kind: &str, tx: Option<&str>) -> Result<()> {
-        {
-            let chain_name = self.chain.name.clone();
-            let keys = keys.to_vec();
-            let kind = kind.to_string();
-            self.db
-                .blocking(move |db| {
-                    db.mark_erc20_deposits_needs_review_for_keys(&chain_name, &keys, &kind)
-                })
+    /// Resolves an open intent. It keeps its nonce for good: it is never
+    /// dropped once signed, only settled, failed, or sent to review.
+    async fn resolve_intent(
+        &self,
+        intent: &SweepIntent,
+        address_str: &str,
+        address: Address,
+    ) -> Result<Resolution> {
+        if intent.txs.is_empty() {
+            // Stopped between writing the intent and signing: nothing exists on
+            // any network, so there is nothing to wait for.
+            warn!(
+                "[{}] sweep intent {} was never signed; dropping it",
+                self.chain.name, intent.id
+            );
+            self.finish_intent(intent.id, "dropped").await?;
+            return Ok(Resolution::Done);
+        }
+        if let Some((tx, receipt)) = self.find_receipt(intent).await? {
+            self.apply_receipt(intent, &tx, &receipt, address_str, address)
+                .await?;
+            return Ok(Resolution::Done);
+        }
+        let nonce = intent
+            .nonce
+            .ok_or_else(|| anyhow::anyhow!("signed intent {} has no nonce", intent.id))?;
+        let newest = intent.txs.last().expect("checked non-empty").clone();
+        let latest = self.provider.get_transaction_count(address).await?;
+        let id = intent.id;
+        if latest > nonce {
+            // The nonce is used and none of our hashes has a receipt. Receipt
+            // indexing can lag the nonce: look again, and only after a second
+            // pass conclude that something outside evmhot used this key.
+            if let Some((tx, receipt)) = self.find_receipt(intent).await? {
+                self.apply_receipt(intent, &tx, &receipt, address_str, address)
+                    .await?;
+                return Ok(Resolution::Done);
+            }
+            let gone = self
+                .db
+                .blocking(move |db| db.bump_sweep_intent_gone_passes(id))
+                .await?;
+            if gone >= GONE_PASSES_TO_REVIEW {
+                self.send_to_review(
+                    &intent.keys,
+                    "sweep_review",
+                    Some(&newest.hash),
+                    intent.token_address == NATIVE_TOKEN,
+                )
+                .await?;
+                self.finish_intent(id, "review").await?;
+                return Ok(Resolution::Done);
+            }
+            return Ok(Resolution::Open);
+        }
+
+        // Not mined, nonce free. Reprice only a transaction the network will not
+        // take at its price, after it has waited; otherwise send the same bytes
+        // again (an evicted transaction comes back, a known one is a no-op).
+        let passes = self
+            .db
+            .blocking(move |db| db.bump_sweep_intent_passes(id))
+            .await?;
+        let estimate = self.provider.estimate_eip1559_fees(None).await?;
+        let held_fee: u128 = newest.max_fee.parse().unwrap_or(0);
+        if passes >= REPRICE_AFTER_PASSES && held_fee < estimate.max_fee_per_gas {
+            self.reprice(intent, &newest, &estimate, address_str, address)
+                .await?;
+        } else {
+            self.rebroadcast(intent, &newest, address_str, address)
                 .await?;
         }
-        for key in keys {
-            error!(
-                "EVMHOT_ALERT kind={kind} network={} deposit={}:{key} tx={}",
-                self.chain.name,
-                self.chain.name,
-                tx.unwrap_or("-")
-            );
+        Ok(Resolution::Open)
+    }
+
+    /// Re-signs the intent's transaction at the same nonce with both fee fields
+    /// raised by at least 10% (or to the current estimate, whichever is higher),
+    /// stores it next to the earlier ones, and broadcasts it. Both can land, but
+    /// only one can: they share the nonce.
+    async fn reprice(
+        &self,
+        intent: &SweepIntent,
+        newest: &IntentTx,
+        estimate: &alloy::providers::utils::Eip1559Estimation,
+        address_str: &str,
+        address: Address,
+    ) -> Result<()> {
+        use alloy::consensus::TxEnvelope;
+        use alloy::eips::eip2718::Decodable2718;
+        let bytes = alloy::primitives::hex::decode(&newest.raw)?;
+        let TxEnvelope::Eip1559(signed) = TxEnvelope::decode_2718(&mut &bytes[..])? else {
+            return Err(anyhow::anyhow!(
+                "stored sweep is not an EIP-1559 transaction"
+            ));
+        };
+        let old = signed.tx().clone();
+        let bump = |old: u128| (old * 11).div_ceil(10);
+        let max_fee = bump(old.max_fee_per_gas).max(estimate.max_fee_per_gas);
+        let priority = bump(old.max_priority_fee_per_gas)
+            .max(estimate.max_priority_fee_per_gas)
+            .min(max_fee);
+        let signer = {
+            let r = intent.account_id.clone();
+            let (index, _, _) = self
+                .db
+                .blocking(move |db| db.get_account_by_id(&r))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Account not found"))?;
+            self.wallet.get_signer(index)?
+        };
+        let wallet = alloy::network::EthereumWallet::from(signer);
+        let mut value = old.value;
+        if intent.token_address == NATIVE_TOKEN {
+            // The dearer fee must still fit in the balance the value was cut from.
+            let extra = U256::from(old.gas_limit) * U256::from(max_fee - old.max_fee_per_gas);
+            value = value.saturating_sub(extra);
+        } else {
+            // A higher fee needs more gas in the address.
+            self.ensure_gas(address_str, address, old.gas_limit as u128, max_fee)
+                .await?;
+        }
+        let alloy::primitives::TxKind::Call(to) = old.to else {
+            return Err(anyhow::anyhow!("stored sweep has no recipient"));
+        };
+        let request = TransactionRequest::default()
+            .with_from(address)
+            .with_to(to)
+            .with_value(value)
+            .with_input(old.input.clone())
+            .with_gas_limit(old.gas_limit)
+            .with_nonce(old.nonce)
+            .with_chain_id(self.chain.chain_id)
+            .with_max_fee_per_gas(max_fee)
+            .with_max_priority_fee_per_gas(priority);
+        info!(
+            "[{}] repricing sweep intent {} at nonce {} (max fee {} -> {})",
+            self.chain.name, intent.id, old.nonce, old.max_fee_per_gas, max_fee
+        );
+        self.sign_store_broadcast(intent.id, old.nonce, request, &wallet)
+            .await
+    }
+
+    /// The first stored transaction (newest first) that has a receipt. At most
+    /// one of an intent's transactions can land: they share a nonce.
+    async fn find_receipt(
+        &self,
+        intent: &SweepIntent,
+    ) -> Result<Option<(IntentTx, TransactionReceipt)>> {
+        for tx in intent.txs.iter().rev() {
+            let hash = alloy::primitives::TxHash::from_str(&tx.hash)?;
+            if let Some(receipt) = self.provider.get_transaction_receipt(hash).await? {
+                return Ok(Some((tx.clone(), receipt)));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn apply_receipt(
+        &self,
+        intent: &SweepIntent,
+        tx: &IntentTx,
+        receipt: &TransactionReceipt,
+        address_str: &str,
+        address: Address,
+    ) -> Result<()> {
+        if intent.token_address == NATIVE_TOKEN {
+            if !receipt.inner.status() {
+                // Reverted: the deposits stay detected and are planned again.
+                warn!(
+                    "[{}] native sweep {} reverted; planning again",
+                    self.chain.name, tx.hash
+                );
+                return self.finish_intent(intent.id, "failed").await;
+            }
+            return self.settle_native(intent, address_str).await;
+        }
+        let token = Address::from_str(&intent.token_address)?;
+        let to = Address::from_str(&intent.target)?;
+        let planned = U256::from_str(&intent.amount)?;
+        match evaluate_receipt(receipt, token, address, to, planned) {
+            Verdict::Reverted => {
+                self.finish_intent(intent.id, "failed").await?;
+                self.record_failure(
+                    &intent.keys,
+                    &format!("sweep transaction reverted (receipt status 0): {}", tx.hash),
+                )
+                .await
+            }
+            Verdict::Review(why) => {
+                warn!(
+                    "[{}] sweep {} needs review: {why}",
+                    self.chain.name, tx.hash
+                );
+                self.send_to_review(&intent.keys, "sweep_review", Some(&tx.hash), false)
+                    .await?;
+                self.finish_intent(intent.id, "review").await
+            }
+            Verdict::Success(record) => {
+                let chain_name = self.chain.name.clone();
+                let keys = intent.keys.clone();
+                let id = intent.id;
+                self.db
+                    .blocking(move |db| {
+                        db.settle_sweep_intent(&chain_name, id, &keys, &record, &[])
+                    })
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// A native sweep landed: its deposits are swept, with their webhooks, in
+    /// one transaction.
+    async fn settle_native(&self, intent: &SweepIntent, address_str: &str) -> Result<()> {
+        let detected = {
+            let c = self.chain.name.clone();
+            self.db
+                .blocking(move |db| db.get_detected_deposits(&c))
+                .await?
+        };
+        let webhook_url = {
+            let r = intent.account_id.clone();
+            self.db.blocking(move |db| db.get_webhook_url(&r)).await?
+        };
+        let mut settlements = Vec::new();
+        for key in &intent.keys {
+            let amount = detected
+                .iter()
+                .find(|(tx, _, _)| tx == key)
+                .map(|(_, _, a)| a.clone())
+                .unwrap_or_default();
+            let from = {
+                let (c, k) = (self.chain.name.clone(), key.clone());
+                self.db
+                    .blocking(move |db| db.get_deposit_from_address(&c, &k))
+                    .await?
+            };
+            let id = format!("{}:{}", self.chain.name, key);
+            let outbox = webhook_url.as_ref().map(|url| OutboxEntry {
+                id: id.clone(),
+                event: "deposit_swept".to_string(),
+                registration_id: intent.account_id.clone(),
+                webhook_url: url.clone(),
+                payload: serde_json::json!({
+                    "id": id,
+                    "chain": self.chain.name,
+                    "chain_id": self.chain.chain_id,
+                    "event": "deposit_swept",
+                    "account_id": address_str,
+                    "registration_id": intent.account_id,
+                    "original_tx_hash": key,
+                    "from_address": from,
+                    "amount": amount,
+                    "token_type": "native"
+                })
+                .to_string(),
+            });
+            settlements.push(NativeSettlement {
+                tx_hash: key.clone(),
+                outbox,
+            });
+        }
+        let (c, id) = (self.chain.name.clone(), intent.id);
+        let enqueued = self
+            .db
+            .blocking(move |db| db.settle_native_intent(&c, id, &settlements))
+            .await?;
+        if enqueued > 0 {
+            self.deliverer.notify_worker();
         }
         Ok(())
+    }
+
+    /// Native gas for a token transfer: top the address up from the faucet when
+    /// it cannot pay `gas_limit` at `max_fee` (with the usual buffers).
+    async fn ensure_gas(
+        &self,
+        address_str: &str,
+        address: Address,
+        gas_limit: u128,
+        max_fee: u128,
+    ) -> Result<()> {
+        let cost = U256::from(gas_limit) * U256::from(max_fee);
+        let needed = cost + (cost / U256::from(10));
+        let mut balance = self.provider.get_balance(address).await?;
+        if balance < needed {
+            match self.faucet.fund_new_address(address_str).await {
+                Ok(_) => {
+                    sleep(funding_settle()).await;
+                    balance = self.provider.get_balance(address).await?;
+                    if balance < needed {
+                        return Err(anyhow::anyhow!(
+                            "Insufficient native balance for gas even after faucet funding"
+                        ));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Sweeps one group (one address, one token, and one sender or one deposit
+    /// when the target says so): sends at most the next part (REQ-SW-9,
+    /// REQ-SW-10). A group is settled only by its recorded sweeps, and only when
+    /// nothing is left owed (REQ-WH-4).
+    async fn sweep_subgroup(
+        &self,
+        reg: &str,
+        wallet: &alloy::network::EthereumWallet,
+        from_address_str: &str,
+        target: &SweepTarget,
+        group: &[Erc20Deposit],
+    ) -> Result<Outcome> {
+        let first = &group[0];
+        let from_address = Address::from_str(from_address_str)?;
+        let to_address = Address::from_str(
+            target
+                .address
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("sweep target has no address"))?,
+        )?;
+        let token_address = Address::from_str(&first.token_address)?;
+        let keys: Vec<String> = group.iter().map(|d| d.key.clone()).collect();
+        let owed_mode = target.per_sender || target.per_transfer;
+
+        let token_balance = get_token_balance(&self.provider, token_address, from_address).await?;
+        let recorded = self.recorded_sweeps(&keys).await?;
+        let sweepable = if owed_mode {
+            // What this group is still owed. The pair's balance covers it: the
+            // shortfall check ran before.
+            self.remaining_owed(group).await?
+        } else {
+            // REQ-SW-1: the whole balance.
+            token_balance
+        };
+
+        if sweepable.is_zero() {
+            if !recorded.is_empty() {
+                // Nothing left owed and sweeps are on record: settle by them.
+                self.finish_group(from_address_str, group).await?;
+                return Ok(Outcome::Idle);
+            }
+            // REQ-SW-3 applies only to a group with no sweep on record and no
+            // intent that could have moved funds. Failed and dropped intents did
+            // not; a closed-by-operator one is the operator's word that it did
+            // not matter.
+            let intent_states = {
+                let chain_name = self.chain.name.clone();
+                let keys = keys.clone();
+                self.db
+                    .blocking(move |db| db.sweep_intent_states_for_keys(&chain_name, &keys))
+                    .await?
+            };
+            let could_have_moved = intent_states
+                .iter()
+                .any(|st| st != "failed" && st != "dropped" && st != "closed_by_operator");
+            if token_balance.is_zero() && !owed_mode && !could_have_moved {
+                let retry_count = {
+                    let chain_name = self.chain.name.clone();
+                    let key = first.key.clone();
+                    self.db
+                        .blocking(move |db| db.increment_zero_balance_count(&chain_name, &key))
+                        .await?
+                };
+                if retry_count >= MAX_ZERO_BALANCE_RETRIES {
+                    let chain_name = self.chain.name.clone();
+                    let keys = keys.clone();
+                    self.db
+                        .blocking(move |db| {
+                            db.mark_erc20_deposits_swept_for_keys(&chain_name, &keys)
+                        })
+                        .await?;
+                }
+            }
+            return Ok(Outcome::Idle);
+        }
+
+        let Some(amount) = next_sweep_part(sweepable, target.min, target.max, target.per_transfer)
+        else {
+            // REQ-SW-7: below the minimum it waits for later deposits.
+            let min = target.min.unwrap_or_default();
+            if recorded.is_empty() {
+                info!(
+                    "[{}] ERC20 deposit {} waiting: {} is below the target minimum {}",
+                    self.chain.name, first.key, sweepable, min
+                );
+            } else {
+                // Dust after a split: it stays owed, the deposits are not
+                // settled, and a later deposit lifts it above the minimum.
+                self.alert_once(&first.key, "dust").await?;
+            }
+            return Ok(Outcome::Idle);
+        };
+
+        self.send_erc20_part(
+            reg,
+            wallet,
+            from_address_str,
+            token_address,
+            to_address,
+            amount,
+            &PartCtx {
+                token: &first.token_address,
+                keys: &keys,
+                part_index: recorded.len() as u64,
+            },
+        )
+        .await?;
+        Ok(Outcome::Sent)
+    }
+
+    /// One `transfer(target, amount)` call: intent first, then signed with an
+    /// explicit nonce, stored, broadcast. The receipt is read on a later pass.
+    async fn send_erc20_part(
+        &self,
+        reg: &str,
+        wallet: &alloy::network::EthereumWallet,
+        from_address_str: &str,
+        token_address: Address,
+        to_address: Address,
+        amount: U256,
+        ctx: &PartCtx<'_>,
+    ) -> Result<()> {
+        let provider = &self.provider;
+        let from_address = Address::from_str(from_address_str)?;
+        let transfer_call = IERC20::transferCall {
+            to: to_address,
+            amount,
+        };
+        let call_data = transfer_call.abi_encode();
+        let tx_for_estimate = TransactionRequest::default()
+            .with_from(from_address)
+            .with_to(token_address)
+            .with_input(call_data.clone());
+
+        let estimated_gas = provider.estimate_gas(&tx_for_estimate).await?;
+        let gas_limit_with_buffer = estimated_gas + (estimated_gas / 10);
+        let fees = provider.estimate_eip1559_fees(None).await?;
+        self.ensure_gas(
+            from_address_str,
+            from_address,
+            gas_limit_with_buffer,
+            fees.max_fee_per_gas,
+        )
+        .await?;
+
+        let intent_id = self
+            .create_intent(
+                reg,
+                from_address_str,
+                ctx.token,
+                ctx.keys,
+                ctx.part_index,
+                &amount.to_string(),
+                &to_address.to_string(),
+            )
+            .await?;
+        #[cfg(test)]
+        self.crash_if(CrashPoint::AfterIntentCreated)?;
+        let nonce = self.next_nonce(reg, from_address).await?;
+        let request = TransactionRequest::default()
+            .with_from(from_address)
+            .with_to(token_address)
+            .with_input(call_data)
+            .with_gas_limit(gas_limit_with_buffer)
+            .with_nonce(nonce)
+            .with_chain_id(self.chain.chain_id)
+            .with_max_fee_per_gas(fees.max_fee_per_gas)
+            .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
+        self.sign_store_broadcast(intent_id, nonce, request, wallet)
+            .await
     }
 
     /// REQ-SW-4: funding errors wait; a decoding error fails the group at once;
     /// any other failure (including a reverted sweep, REQ-SW-5) counts, and the
     /// fifth consecutive one fails the group.
     async fn handle_group_failure(&self, group: &[Erc20Deposit], e: &anyhow::Error) -> Result<()> {
-        let err_str = format!("{:?}", e);
-        let first_key = group[0].key.clone();
-        if is_transient_funding_error(&err_str) {
+        let keys: Vec<String> = group.iter().map(|d| d.key.clone()).collect();
+        self.record_failure(&keys, &format!("{e:?}")).await
+    }
+
+    async fn record_failure(&self, keys: &[String], err_str: &str) -> Result<()> {
+        let first_key = keys[0].clone();
+        if is_transient_funding_error(err_str) {
             warn!(
                 "[{}] ERC20 deposit {} waiting for faucet funding: {}",
                 self.chain.name, first_key, err_str
@@ -427,10 +1166,9 @@ impl Sweeper {
             "[{}] Failed to sweep ERC20 deposit {}: {}",
             self.chain.name, first_key, err_str
         );
-        let keys: Vec<String> = group.iter().map(|d| d.key.clone()).collect();
-        if is_permanent_sweep_error(&err_str) {
-            self.fail_keys(&keys).await?;
-            for key in &keys {
+        if is_permanent_sweep_error(err_str) {
+            self.fail_keys(keys).await?;
+            for key in keys {
                 warn!(
                     "[{}] Permanently failed ERC20 deposit {} (permanent sweep error)",
                     self.chain.name, key
@@ -447,8 +1185,8 @@ impl Sweeper {
         };
         if let Ok(failures) = failures {
             if failures >= MAX_SWEEP_RETRIES {
-                self.fail_keys(&keys).await?;
-                for key in &keys {
+                self.fail_keys(keys).await?;
+                for key in keys {
                     warn!(
                         "[{}] Permanently failed ERC20 deposit {} after {} attempts: {}",
                         self.chain.name, key, failures, err_str
@@ -459,219 +1197,37 @@ impl Sweeper {
         Ok(())
     }
 
-    async fn fail_keys(&self, keys: &[String]) -> Result<()> {
-        // A deposit with a sweep in flight is not failed out from under it.
-        let keys = self.keys_without_pending(keys).await?;
-        if keys.is_empty() {
-            return Ok(());
-        }
-        let chain_name = self.chain.name.clone();
-        self.db
-            .blocking(move |db| db.mark_erc20_deposits_failed_for_keys(&chain_name, &keys))
-            .await
-    }
-
-    async fn sweep_deposit<SP>(
+    /// Moves deposits to `needs_review` and raises the alert operators watch for.
+    async fn send_to_review(
         &self,
-        provider: &SP,
-        from_address_str: &str,
-        tx_hash: &str,
-        registration_id: &str,
-        amount_str: &str,
-    ) -> Result<()>
-    where
-        SP: Provider<BoxTransport, alloy::network::Ethereum>,
-    {
-        let from_address = Address::from_str(from_address_str)?;
-        let to_address = Address::from_str(&self.chain.treasury_address)?;
-
-        let mut balance = provider.get_balance(from_address).await?;
-        let gas_limit: u128 = 21000;
-        let fee_estimate = provider.estimate_eip1559_fees(None).await?;
-        let max_fee_per_gas = fee_estimate.max_fee_per_gas;
-        let gas_cost = U256::from(gas_limit) * U256::from(max_fee_per_gas);
-        let gas_cost_with_buffer = gas_cost + (gas_cost / U256::from(10));
-
-        if balance <= gas_cost_with_buffer {
-            match self.faucet.fund_new_address(from_address_str).await {
-                Ok(_) => {
-                    sleep(funding_settle()).await;
-                    balance = provider.get_balance(from_address).await?;
-                    if balance <= gas_cost_with_buffer {
-                        return Err(anyhow::anyhow!(
-                            "Still insufficient balance after faucet funding"
-                        ));
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        let value_to_send = balance - gas_cost_with_buffer;
-
-        let tx = TransactionRequest::default()
-            .with_to(to_address)
-            .with_value(value_to_send)
-            .with_gas_limit(gas_limit);
-
-        let pending_tx = provider.send_transaction(tx).await?;
-        let receipt = pending_tx.get_receipt().await?;
-
-        // REQ-SW-5: only a successful receipt settles the deposit.
-        if !receipt.inner.status() {
-            return Err(anyhow::anyhow!(
-                "native sweep transaction reverted (receipt status 0): {:?}",
-                receipt.transaction_hash
-            ));
-        }
-
-        let from = {
+        keys: &[String],
+        kind: &str,
+        tx: Option<&str>,
+        native: bool,
+    ) -> Result<()> {
+        {
             let chain_name = self.chain.name.clone();
-            let tx_hash = tx_hash.to_string();
-            self.db
-                .blocking(move |db| db.get_deposit_from_address(&chain_name, &tx_hash))
-                .await?
-        };
-        let webhook_url = {
-            let reg_id = registration_id.to_string();
-            self.db
-                .blocking(move |db| db.get_webhook_url(&reg_id))
-                .await?
-        };
-        let webhook_id = format!("{}:{}", self.chain.name, tx_hash);
-        let outbox = webhook_url.map(|webhook_url| OutboxEntry {
-            id: webhook_id.clone(),
-            event: "deposit_swept".to_string(),
-            registration_id: registration_id.to_string(),
-            webhook_url,
-            payload: serde_json::json!({
-                "id": webhook_id,
-                "chain": self.chain.name,
-                "chain_id": self.chain.chain_id,
-                "event": "deposit_swept",
-                "account_id": from_address_str,
-                "registration_id": registration_id,
-                "original_tx_hash": tx_hash,
-                "from_address": from,
-                "amount": amount_str,
-                "token_type": "native"
-            })
-            .to_string(),
-        });
-
-        // REQ-WH-7: the swept mark and its webhook are one transaction.
-        let enqueued = {
-            let chain_name = self.chain.name.clone();
-            let tx_hash = tx_hash.to_string();
+            let keys = keys.to_vec();
+            let kind = kind.to_string();
             self.db
                 .blocking(move |db| {
-                    db.complete_native_sweep(&chain_name, &tx_hash, outbox.as_ref())
+                    if native {
+                        db.mark_native_deposits_needs_review_for_keys(&chain_name, &keys, &kind)
+                    } else {
+                        db.mark_erc20_deposits_needs_review_for_keys(&chain_name, &keys, &kind)
+                    }
                 })
-                .await?
-        };
-        if enqueued {
-            self.deliverer.notify_worker();
+                .await?;
         }
-
-        info!(
-            "[{}] Swept funds! Tx hash: {:?}",
-            self.chain.name, receipt.transaction_hash
-        );
-
-        Ok(())
-    }
-
-    /// What a group still owes: its deposits' amounts minus the sweeps already
-    /// recorded for them (`per_sender` only; whole-balance sweeps use the balance).
-    async fn remaining_owed(&self, group: &[Erc20Deposit]) -> Result<U256> {
-        let keys: Vec<String> = group.iter().map(|d| d.key.clone()).collect();
-        let mut owed = U256::ZERO;
-        for deposit in group {
-            owed += U256::from_str(&deposit.amount)?;
-        }
-        let mut swept = U256::ZERO;
-        for record in self.recorded_sweeps(&keys).await? {
-            swept += U256::from_str(&record.sweep_amount)?;
-        }
-        Ok(owed.saturating_sub(swept))
-    }
-
-    /// Resolves every pending intent on the chain, whatever its deposits' status
-    /// now is: a deposit can have gone `failed` or been dropped from the
-    /// allowlist with a sweep still in flight, and that sweep must still be
-    /// checked (and a retry of the deposit stays refused until it is).
-    async fn resolve_all_pending(&self) -> Result<()> {
-        let pending = {
-            let chain_name = self.chain.name.clone();
-            self.db
-                .blocking(move |db| db.all_pending_sweep_intents(&chain_name))
-                .await?
-        };
-        let mut by_pair: Vec<((String, String), Vec<SweepIntent>)> = Vec::new();
-        for intent in pending {
-            let key = (
-                intent.account_id.clone(),
-                intent.token_address.to_lowercase(),
+        for key in keys {
+            error!(
+                "EVMHOT_ALERT kind={kind} network={} deposit={}:{key} tx={}",
+                self.chain.name,
+                self.chain.name,
+                tx.unwrap_or("-")
             );
-            match by_pair.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, list)) => list.push(intent),
-                None => by_pair.push((key, vec![intent])),
-            }
-        }
-        for ((account_id, token), intents) in by_pair {
-            let reg = account_id.clone();
-            let Some((_, address, _)) = self
-                .db
-                .blocking(move |db| db.get_account_by_id(&reg))
-                .await?
-            else {
-                warn!(
-                    "[{}] pending sweep for unknown account {account_id}",
-                    self.chain.name
-                );
-                continue;
-            };
-            let result = self
-                .resolve_intents(
-                    intents,
-                    Address::from_str(&token)?,
-                    Address::from_str(&address)?,
-                )
-                .await;
-            if let Err(e) = result {
-                warn!(
-                    "[{}] could not resolve sweeps for {account_id}: {e:?}",
-                    self.chain.name
-                );
-            }
         }
         Ok(())
-    }
-
-    /// While any deposit on an (address, token) pair is in review, failed, or has
-    /// a sweep in flight, nothing is swept on that pair: its funds may be
-    /// unaccounted for, and a sweep would spend them. Returns the blocking
-    /// deposit's key.
-    async fn pair_blocker(&self, account_id: &str, token: &str) -> Result<Option<String>> {
-        let pending = {
-            let chain_name = self.chain.name.clone();
-            self.db
-                .blocking(move |db| db.all_pending_sweep_intents(&chain_name))
-                .await?
-        };
-        if let Some(intent) = pending
-            .iter()
-            .find(|i| i.account_id == account_id && i.token_address.eq_ignore_ascii_case(token))
-        {
-            return Ok(intent.keys.first().cloned());
-        }
-        let chain_name = self.chain.name.clone();
-        let (account, token) = (account_id.to_string(), token.to_string());
-        let blocking = self
-            .db
-            .blocking(move |db| db.blocking_erc20_deposits(&chain_name, &account, &token))
-            .await?;
-        Ok(blocking.into_iter().next())
     }
 
     /// Logs an alert marker once per (deposit, kind); later passes only debug.
@@ -708,284 +1264,31 @@ impl Sweeper {
             .collect())
     }
 
-    /// Resolves the intents an earlier pass left pending, by their transaction
-    /// hash's receipt (REQ-SW-5). No hash, or no receipt after
-    /// `MAX_INTENT_WAIT_PASSES` passes, sends the deposits to review.
-    async fn resolve_intents(
-        &self,
-        pending: Vec<SweepIntent>,
-        token: Address,
-        from: Address,
-    ) -> Result<IntentState> {
-        let mut waiting = false;
-        for intent in pending {
-            let Some(hash) = intent.tx_hash.clone() else {
-                // Stopped between storing the intent and signing: nothing was
-                // ever signed or sent, so the group simply re-plans.
-                warn!(
-                    "[{}] sweep intent {} was never signed; dropping it",
-                    self.chain.name, intent.id
-                );
-                self.finish_intent(intent.id, "dropped").await?;
-                continue;
-            };
-            let tx_hash = alloy::primitives::TxHash::from_str(&hash)?;
-            let mut receipt = self.provider.get_transaction_receipt(tx_hash).await?;
-            if receipt.is_none() {
-                let id = intent.id;
-                match (intent.nonce, intent.raw_tx.as_deref()) {
-                    (Some(nonce), Some(raw)) => {
-                        let latest = self.provider.get_transaction_count(from).await?;
-                        if latest > nonce {
-                            // It may have been mined between the two calls.
-                            receipt = self.provider.get_transaction_receipt(tx_hash).await?;
-                            if receipt.is_none() {
-                                // The nonce was used by another transaction.
-                                self.send_to_review(&intent.keys, "sweep_review", Some(&hash))
-                                    .await?;
-                                self.finish_intent(id, "review").await?;
-                                return Ok(IntentState::Review);
-                            }
-                        } else {
-                            let passes = self
-                                .db
-                                .blocking(move |db| db.bump_sweep_intent_passes(id))
-                                .await?;
-                            if passes >= MAX_INTENT_WAIT_PASSES {
-                                // Still unmined and the nonce is free: a new
-                                // sweep at this nonce replaces it, which is safe.
-                                warn!(
-                                    "[{}] sweep {hash} never landed after {passes} passes; dropping its intent",
-                                    self.chain.name
-                                );
-                                self.finish_intent(id, "dropped").await?;
-                                continue;
-                            }
-                            // Same bytes, same hash: rebroadcasting is idempotent.
-                            match alloy::primitives::hex::decode(raw) {
-                                Ok(bytes) => {
-                                    if let Err(e) = self.provider.send_raw_transaction(&bytes).await
-                                    {
-                                        warn!(
-                                            "[{}] rebroadcast of {hash} failed: {e:?}",
-                                            self.chain.name
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("[{}] stored raw tx unreadable: {e}", self.chain.name)
-                                }
-                            }
-                            waiting = true;
-                            continue;
-                        }
-                    }
-                    _ => {
-                        // Signed by an earlier version, without its raw bytes or nonce:
-                        // it cannot be rebroadcast or judged, so wait, then review.
-                        let passes = self
-                            .db
-                            .blocking(move |db| db.bump_sweep_intent_passes(id))
-                            .await?;
-                        if passes >= MAX_INTENT_WAIT_PASSES {
-                            self.send_to_review(&intent.keys, "sweep_review", Some(&hash))
-                                .await?;
-                            self.finish_intent(id, "review").await?;
-                            return Ok(IntentState::Review);
-                        }
-                        waiting = true;
-                        continue;
-                    }
-                }
-            }
-            let Some(receipt) = receipt else { continue };
-            let to = Address::from_str(&intent.target)?;
-            let planned = U256::from_str(&intent.amount)?;
-            match evaluate_receipt(&receipt, token, from, to, planned) {
-                Verdict::Reverted => self.finish_intent(intent.id, "failed").await?,
-                Verdict::Review(why) => {
-                    warn!("[{}] sweep {hash} needs review: {why}", self.chain.name);
-                    self.send_to_review(&intent.keys, "sweep_review", Some(&hash))
-                        .await?;
-                    self.finish_intent(intent.id, "review").await?;
-                    return Ok(IntentState::Review);
-                }
-                Verdict::Success(record) => {
-                    let chain_name = self.chain.name.clone();
-                    let keys = intent.keys.clone();
-                    let id = intent.id;
-                    self.db
-                        .blocking(move |db| {
-                            db.settle_sweep_intent(&chain_name, id, &keys, &record, &[])
-                        })
-                        .await?;
-                }
-            }
+    async fn fail_keys(&self, keys: &[String]) -> Result<()> {
+        // A deposit with a sweep in flight is not failed out from under it.
+        let keys = self.keys_without_pending(keys).await?;
+        if keys.is_empty() {
+            return Ok(());
         }
-        Ok(if waiting {
-            IntentState::Waiting
-        } else {
-            IntentState::Clear
-        })
-    }
-
-    async fn finish_intent(&self, id: i64, state: &str) -> Result<()> {
-        let state = state.to_string();
+        let chain_name = self.chain.name.clone();
         self.db
-            .blocking(move |db| db.finish_sweep_intent(id, &state))
+            .blocking(move |db| db.mark_erc20_deposits_failed_for_keys(&chain_name, &keys))
             .await
     }
 
-    /// Sweeps one group (one address, one token, and one sender when the target
-    /// is `per_sender`). Parts are planned lazily, at most `MAX_PARTS_PER_PASS`
-    /// per pass, and each is its own `transfer` call with its own coordinate
-    /// (REQ-SW-9, REQ-SW-10). A group is settled only by its recorded sweeps,
-    /// and only when nothing is left owed (REQ-WH-4).
-    async fn sweep_subgroup(
-        &self,
-        wallet: &alloy::network::EthereumWallet,
-        from_address_str: &str,
-        target: &SweepTarget,
-        group: &[Erc20Deposit],
-    ) -> Result<()> {
-        let first = &group[0];
-        let from_address = Address::from_str(from_address_str)?;
-        let to_address = Address::from_str(
-            target
-                .address
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("sweep target has no address"))?,
-        )?;
-        let token_address = Address::from_str(&first.token_address)?;
+    /// What a group still owes: its deposits' amounts minus the sweeps already
+    /// recorded for them (`per_sender` only; whole-balance sweeps use the balance).
+    async fn remaining_owed(&self, group: &[Erc20Deposit]) -> Result<U256> {
         let keys: Vec<String> = group.iter().map(|d| d.key.clone()).collect();
-
-        let token_balance = get_token_balance(&self.provider, token_address, from_address).await?;
-        let recorded = self.recorded_sweeps(&keys).await?;
-        let sweepable = if target.per_sender || target.per_transfer {
-            // REQ-SW-12: one sender's share, not the whole balance.
-            self.remaining_owed(group).await?.min(token_balance)
-        } else {
-            // REQ-SW-1: the whole balance.
-            token_balance
-        };
-
-        if sweepable.is_zero() {
-            if !recorded.is_empty() {
-                // Nothing left owed and sweeps are on record: settle by them.
-                return self.finish_group(from_address_str, group).await;
-            }
-            // REQ-SW-3 applies only to a group with no sweep on record and no
-            // intent that could have moved funds (failed or dropped ones did not):
-            // a review, pending or succeeded intent means an operator or a
-            // receipt must say where the tokens went.
-            let intent_states = {
-                let chain_name = self.chain.name.clone();
-                let keys = keys.clone();
-                self.db
-                    .blocking(move |db| db.sweep_intent_states_for_keys(&chain_name, &keys))
-                    .await?
-            };
-            let could_have_moved = intent_states
-                .iter()
-                .any(|st| st != "failed" && st != "dropped");
-            if token_balance.is_zero() && !could_have_moved {
-                let retry_count = {
-                    let chain_name = self.chain.name.clone();
-                    let key = first.key.clone();
-                    self.db
-                        .blocking(move |db| db.increment_zero_balance_count(&chain_name, &key))
-                        .await?
-                };
-                if retry_count >= MAX_ZERO_BALANCE_RETRIES {
-                    let chain_name = self.chain.name.clone();
-                    let keys = keys.clone();
-                    self.db
-                        .blocking(move |db| {
-                            db.mark_erc20_deposits_swept_for_keys(&chain_name, &keys)
-                        })
-                        .await?;
-                }
-            }
-            return Ok(());
+        let mut owed = U256::ZERO;
+        for deposit in group {
+            owed += U256::from_str(&deposit.amount)?;
         }
-
-        if let Some(min) = target.min {
-            if sweepable < min {
-                // REQ-SW-7: it waits for later deposits to reach the minimum.
-                if recorded.is_empty() {
-                    info!(
-                        "[{}] ERC20 deposit {} waiting: {} is below the target minimum {}",
-                        self.chain.name, first.key, sweepable, min
-                    );
-                } else {
-                    // Dust after a split: it stays owed, the deposits are not
-                    // settled, and a later deposit lifts it above the minimum.
-                    self.alert_once(&first.key, "dust").await?;
-                }
-                return Ok(());
-            }
+        let mut swept = U256::ZERO;
+        for record in self.recorded_sweeps(&keys).await? {
+            swept += U256::from_str(&record.sweep_amount)?;
         }
-
-        let parts = plan_sweep_parts(sweepable, target.min, target.max, MAX_PARTS_PER_PASS);
-        let planned_total = parts.iter().fold(U256::ZERO, |a, p| a + *p);
-        let group_key = format!(
-            "{}|{}|{}",
-            first.account_id,
-            first.token_address.to_lowercase(),
-            first.from_address.as_deref().unwrap_or("*").to_lowercase()
-        );
-        let first_part = recorded.len() as u64;
-        let count = parts.len();
-        for (i, amount) in parts.into_iter().enumerate() {
-            let result = self
-                .sweep_part(
-                    wallet,
-                    from_address_str,
-                    token_address,
-                    to_address,
-                    amount,
-                    &PartCtx {
-                        account_id: &first.account_id,
-                        token: &first.token_address,
-                        keys: &keys,
-                        group_key: &group_key,
-                        part_index: first_part + i as u64,
-                    },
-                )
-                .await?;
-            let PartResult::Sent { intent_id, record } = result else {
-                // Sent to review: the group is out of play.
-                return Ok(());
-            };
-            // Last part of an amount that is now fully swept: settle in the same
-            // transaction as the sweep record and the outbox (REQ-WH-7).
-            let finishing = i + 1 == count && planned_total == sweepable;
-            let settlements = if finishing {
-                self.build_settlements(from_address_str, group, Some((&keys, &record)))
-                    .await?
-            } else {
-                Vec::new()
-            };
-            let enqueued = {
-                let chain_name = self.chain.name.clone();
-                let keys = keys.clone();
-                self.db
-                    .blocking(move |db| {
-                        db.settle_sweep_intent(&chain_name, intent_id, &keys, &record, &settlements)
-                    })
-                    .await?
-            };
-            if enqueued > 0 {
-                self.deliverer.notify_worker();
-            }
-        }
-        if planned_total < sweepable {
-            let left = sweepable - planned_total;
-            if target.min.is_some_and(|m| left < m) {
-                self.alert_once(&first.key, "dust").await?;
-            }
-        }
-        Ok(())
+        Ok(owed.saturating_sub(swept))
     }
 
     /// Distinct sweeps recorded against any deposit of the group.
@@ -1006,135 +1309,6 @@ impl Sweeper {
             }
         }
         Ok(out)
-    }
-
-    /// One `transfer(target, amount)` call. The intent is stored before the
-    /// transaction is signed, and its hash as soon as it is sent; the receipt is
-    /// then checked (status, a matching `Transfer`, and its value).
-    #[allow(clippy::too_many_arguments)]
-    async fn sweep_part(
-        &self,
-        wallet: &alloy::network::EthereumWallet,
-        from_address_str: &str,
-        token_address: Address,
-        to_address: Address,
-        amount: U256,
-        ctx: &PartCtx<'_>,
-    ) -> Result<PartResult> {
-        let keys = ctx.keys;
-        let provider = &self.provider;
-        let from_address = Address::from_str(from_address_str)?;
-        let transfer_call = IERC20::transferCall {
-            to: to_address,
-            amount,
-        };
-        let call_data = transfer_call.abi_encode();
-
-        let tx_for_estimate = TransactionRequest::default()
-            .with_from(from_address)
-            .with_to(token_address)
-            .with_input(call_data.clone());
-
-        let estimated_gas = provider.estimate_gas(&tx_for_estimate).await?;
-        let gas_limit_with_buffer = estimated_gas + (estimated_gas / 10);
-        let fee_estimate = provider.estimate_eip1559_fees(None).await?;
-        let max_fee_per_gas = fee_estimate.max_fee_per_gas;
-        let estimated_gas_cost = U256::from(gas_limit_with_buffer) * U256::from(max_fee_per_gas);
-        let estimated_gas_cost_with_buffer =
-            estimated_gas_cost + (estimated_gas_cost / U256::from(10));
-
-        let mut native_balance = provider.get_balance(from_address).await?;
-
-        if native_balance < estimated_gas_cost_with_buffer {
-            match self.faucet.fund_new_address(from_address_str).await {
-                Ok(_) => {
-                    sleep(funding_settle()).await;
-                    native_balance = provider.get_balance(from_address).await?;
-                    if native_balance < estimated_gas_cost_with_buffer {
-                        return Err(anyhow::anyhow!(
-                            "Insufficient native balance for gas even after faucet funding"
-                        ));
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        // The intent exists before anything is signed. If the process stops
-        // before the signed transaction is stored, nothing was sent and the next
-        // pass drops the intent and re-plans.
-        let intent_id = {
-            let new = NewSweepIntent {
-                chain: self.chain.name.clone(),
-                account_id: ctx.account_id.to_string(),
-                token_address: ctx.token.to_string(),
-                group_key: ctx.group_key.to_string(),
-                keys: ctx.keys.to_vec(),
-                part_index: ctx.part_index,
-                amount: amount.to_string(),
-                target: to_address.to_string(),
-            };
-            self.db
-                .blocking(move |db| db.create_sweep_intent(&new))
-                .await?
-        };
-        #[cfg(test)]
-        self.crash_if(CrashPoint::AfterIntentCreated)?;
-
-        // Sign locally with an explicit nonce, and store the nonce, hash and raw
-        // bytes before broadcasting: whatever happens to the broadcast, the next
-        // pass can rebroadcast the same transaction or see that its nonce was used.
-        let nonce = provider
-            .get_transaction_count(from_address)
-            .block_id(alloy::eips::BlockNumberOrTag::Pending.into())
-            .await?;
-        let request = TransactionRequest::default()
-            .with_from(from_address)
-            .with_to(token_address)
-            .with_input(call_data)
-            .with_gas_limit(gas_limit_with_buffer)
-            .with_nonce(nonce)
-            .with_chain_id(self.chain.chain_id)
-            .with_max_fee_per_gas(fee_estimate.max_fee_per_gas)
-            .with_max_priority_fee_per_gas(fee_estimate.max_priority_fee_per_gas);
-        let envelope = request
-            .build(wallet)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to sign the sweep: {e}"))?;
-        let tx_hash = envelope.tx_hash().to_string();
-        let raw = envelope.encoded_2718();
-        {
-            let hash = tx_hash.clone();
-            let raw_hex = alloy::primitives::hex::encode_prefixed(&raw);
-            self.db
-                .blocking(move |db| db.set_sweep_intent_signed(intent_id, nonce, &hash, &raw_hex))
-                .await?;
-        }
-        #[cfg(test)]
-        self.crash_if(CrashPoint::AfterSigned)?;
-
-        // A broadcast error leaves the intent pending, with its hash and bytes;
-        // the next pass resolves it.
-        let pending_tx = provider.send_raw_transaction(&raw).await?;
-        let receipt = pending_tx.get_receipt().await?;
-
-        match evaluate_receipt(&receipt, token_address, from_address, to_address, amount) {
-            // REQ-SW-5, INV-5: a reverted sweep is a failure, never a sweep.
-            Verdict::Reverted => {
-                self.finish_intent(intent_id, "failed").await?;
-                Err(anyhow::anyhow!(
-                    "sweep transaction reverted (receipt status 0): {tx_hash}"
-                ))
-            }
-            Verdict::Review(why) => {
-                warn!("[{}] sweep {tx_hash} needs review: {why}", self.chain.name);
-                self.send_to_review(keys, "sweep_review", Some(&tx_hash))
-                    .await?;
-                self.finish_intent(intent_id, "review").await?;
-                Ok(PartResult::Review)
-            }
-            Verdict::Success(record) => Ok(PartResult::Sent { intent_id, record }),
-        }
     }
 
     /// Settlements for the group's deposits that have a recorded sweep, with
@@ -1237,7 +1411,7 @@ impl Sweeper {
     }
 
     /// `deposit_swept` for a token deposit (REQ-WH-3, REQ-WH-4, REQ-WH-9).
-    fn erc20_swept_payload(
+    pub(crate) fn erc20_swept_payload(
         &self,
         id: &str,
         account_id: &str,
@@ -1279,25 +1453,33 @@ impl Sweeper {
         }
         payload
     }
+
+    async fn finish_intent(&self, id: i64, state: &str) -> Result<()> {
+        let state = state.to_string();
+        self.db
+            .blocking(move |db| db.finish_sweep_intent(id, &state))
+            .await
+    }
+}
+
+/// An address's pass: whether a transaction was sent for it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Sent,
+    Idle,
+}
+
+/// Whether an intent is still waiting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    Open,
+    Done,
 }
 
 struct PartCtx<'a> {
-    account_id: &'a str,
     token: &'a str,
     keys: &'a [String],
-    group_key: &'a str,
     part_index: u64,
-}
-
-enum IntentState {
-    Clear,
-    Waiting,
-    Review,
-}
-
-enum PartResult {
-    Sent { intent_id: i64, record: SweepRecord },
-    Review,
 }
 
 use alloy::sol;

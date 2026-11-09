@@ -661,7 +661,37 @@ impl Case {
             )
             .unwrap();
         if open != 0 {
-            self.fail(&format!("{open} intents still open after settling"));
+            let mut stmt = conn
+                .prepare("SELECT id, account_id, token_address, keys, nonce, passes, gone_passes, tx_hash FROM sweep_intents WHERE state = 'pending'")
+                .unwrap();
+            let rows: Vec<String> = stmt
+                .query_map([], |r| {
+                    Ok(format!(
+                        "intent {} acct {} token {} keys {} nonce {:?} passes {} gone {} tx {:?}",
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, i64>(6)?,
+                        r.get::<_, Option<String>>(7)?
+                    ))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let c = self.chain.lock().unwrap();
+            let nonces: Vec<String> = self
+                .accounts
+                .iter()
+                .map(|(r, a)| format!("{r} latest nonce {}", c.latest_nonce(*a)))
+                .collect();
+            let held = c.held_hashes();
+            drop(c);
+            self.fail(&format!(
+                "{open} intents still open after settling: {rows:?}; {nonces:?}; held {held:?}"
+            ));
         }
         // A deposit still detected must be blocked by a deposit in review/failed
         // on its address (whole-balance targets); owed modes reserve instead.
@@ -760,16 +790,31 @@ async fn run_case(seed: u64, steps: usize) {
     case.settle_and_check_liveness().await;
 }
 
-/// A few hundred deterministic cases. `PROP_SEEDS=n` runs n instead.
+/// 120 deterministic cases (about two minutes). `PROP_SEEDS=n` runs n instead; the
+/// ignored test below runs 1000. `PROP_SEED=k` runs only case k; `PROP_TRACE=1` prints
+/// every RPC call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "fails on the 89c33c8 sweeper (seed 0: a pass hangs on a receipt); the next commit fixes it and removes this"]
 async fn sweep_sending_keeps_its_invariants_on_a_fake_chain() {
     crate::sweeper::FUNDING_SETTLE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
     let n: u64 = std::env::var("PROP_SEEDS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(200);
+        .unwrap_or(120);
+    if let Some(seed) = std::env::var("PROP_SEED").ok().and_then(|v| v.parse().ok()) {
+        run_case(seed, 30).await;
+        return;
+    }
     for seed in 0..n {
         run_case(seed, 30).await;
+    }
+}
+
+/// The long run: 1000 cases. `cargo test -- --ignored`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "long: 1000 cases"]
+async fn sweep_sending_keeps_its_invariants_on_a_fake_chain_long_run() {
+    crate::sweeper::FUNDING_SETTLE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    for seed in 1000..2000 {
+        run_case(seed, 40).await;
     }
 }
