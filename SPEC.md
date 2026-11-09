@@ -1,6 +1,6 @@
 # evmhot — System Specification
 
-**Version:** 0.2.1 · **Status:** draft for review · **Owner:** @pandres95
+**Version:** 0.2.2 · **Status:** draft for review · **Owner:** @pandres95
 
 ## 0. How to read this document
 
@@ -16,6 +16,7 @@ yet are marked **(not built)**, and `PLAN.md` §4 names the feature that builds 
 | Version | Date | Change |
 |---|---|---|
 | 0.1.0 | 2026-11-09 | The service as it ran: registration, detection, sweeps, faucet, webhooks, store, API |
+| 0.2.2 | 2026-11-09 | Amendment 0003: the `hold` target kind; `sweeps` in `deposit_swept` |
 | 0.2.1 | 2026-11-09 | Amendment 0002: derivation indices are 32-bit raw child numbers; `register`'s response shape; JSON error bodies |
 | 0.2.0 | 2026-11-09 | Amendment 0001: sweep target kinds and bounds, the sweep coordinate, finality per network, sweep outcome check, lag and provider alerts, atomic outbox, separate tokens, counter ceiling; withdraws the symbol filter |
 
@@ -183,6 +184,9 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   - `directed_deposit` **(not built)**: a contract and a 32-byte recipient. The sweep calls the contract's deposit
     function with the amount and the recipient. The recipient is configuration, one per network and token, and is
     the same for every deposit address.
+  - `hold` **(not built)**: no sweep. Deposits are detected, stored and notified with `deposit_detected`, and stay in
+    their deposit addresses until the token's target changes to another kind. Changing it releases every held
+    deposit to the new target. (Amendment 0003.)
 - `REQ-SW-7` **(not built)** A target MAY declare a minimum and a maximum per sweep, in the token's minor units:
   - A balance below the minimum MUST NOT be swept to that target. It stays in the deposit address until later
     deposits bring it to the minimum.
@@ -221,9 +225,12 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   `token_symbol`, `token_address`, `token_decimals`. The deposit's transaction hash is `tx_hash` in `deposit_detected`
   and `original_tx_hash` in `deposit_swept`.
 - `REQ-WH-4` A token `deposit_swept` adds `sweep_tx_hash`; a native one carries no sweep fields. **(not built)** A
-  token `deposit_swept` also adds the sweep coordinate of `REQ-SW-10`: `sweep_block_number`, `sweep_block_hash`,
-  `sweep_log_index` and `sweep_amount`. Several deposits settled by one sweep produce one `deposit_swept` each, all
-  naming the same sweep coordinate.
+  token `deposit_swept` also adds `sweeps`, a list with one entry per sweep that settled the deposit, each the sweep
+  coordinate of `REQ-SW-10`: `{sweep_tx_hash, sweep_block_number, sweep_block_hash, sweep_log_index, sweep_amount}`.
+  It usually has one entry; it has several when the amount was split by a target's maximum (`REQ-SW-7`). The
+  top-level `sweep_tx_hash` is the first entry's. Several deposits settled by one sweep produce one `deposit_swept`
+  each, all naming the same entry. `deposit_swept` is sent only once every sweep of the deposit has succeeded.
+  (Revised by amendment 0003.)
 - `REQ-WH-9` **(not built)** Every deposit records the sender of its inbound transfer, and both events carry it as
   `from_address`. A consumer uses it as the refund address.
 - `REQ-WH-5` Once a webhook is in the outbox, delivery is at least once: a worker delivers it, retrying non-2xx answers
