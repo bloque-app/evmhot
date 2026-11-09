@@ -958,6 +958,55 @@ impl Db {
         }
     }
 
+    pub fn record_webhook_attempt_after(
+        &self,
+        id: &str,
+        event: &str,
+        http_status: Option<u16>,
+        error: Option<&str>,
+        status: &str,
+        retry_after_secs: u64,
+    ) -> Result<u64> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.record_webhook_attempt_after(
+                id,
+                event,
+                http_status,
+                error,
+                status,
+                retry_after_secs,
+            ),
+            DbInner::Postgres(p) => p.record_webhook_attempt_after(
+                id,
+                event,
+                http_status,
+                error,
+                status,
+                retry_after_secs,
+            ),
+        }
+    }
+
+    pub fn get_pending_webhook_delivery_keys_with_notify(
+        &self,
+        max_retries: u32,
+        notify_max_retries: u32,
+        batch_size: u32,
+    ) -> Result<Vec<(String, String)>> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.get_pending_webhook_delivery_keys_with_notify(
+                max_retries,
+                notify_max_retries,
+                batch_size,
+            ),
+            DbInner::Postgres(p) => p.get_pending_webhook_delivery_keys_with_notify(
+                max_retries,
+                notify_max_retries,
+                batch_size,
+            ),
+        }
+    }
+
     pub fn get_pending_webhook_delivery_keys(
         &self,
         max_retries: u32,

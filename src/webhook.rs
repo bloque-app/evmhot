@@ -8,7 +8,15 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+/// Outbox key of the copy of `deposit_swept` for a target's `notify_url`.
+const NOTIFY_EVENT: &str = "deposit_swept:notify";
+/// Notify deliveries keep trying for at least this long (two hours): the swap
+/// service being down for an hour must not lose a sweep it was never told about.
+const NOTIFY_RETRY_WINDOW_SECS: u64 = 2 * 60 * 60;
+/// Minimum seconds between two attempts of one notify delivery.
+const NOTIFY_MIN_SPACING_SECS: u64 = 60;
 
 pub struct WebhookDeliverer {
     db: Db,
@@ -17,6 +25,9 @@ pub struct WebhookDeliverer {
     /// these URLs carries its own token, never the registration webhooks' one.
     notify_tokens: std::collections::HashMap<String, String>,
     max_retries: u32,
+    /// Attempts allowed to a notify delivery, spaced `notify_spacing_secs` apart.
+    notify_max_retries: u32,
+    notify_spacing_secs: u64,
     retry_delay_ms: u64,
     poll_interval_secs: u64,
     batch_size: u32,
@@ -25,7 +36,26 @@ pub struct WebhookDeliverer {
     notify: Arc<Notify>,
 }
 
+/// Seconds between notify attempts: the minimum, or the worker's poll interval if
+/// that is longer (a row cannot be tried more often than the worker runs).
+fn notify_spacing(poll_interval_secs: u64) -> u64 {
+    NOTIFY_MIN_SPACING_SECS.max(poll_interval_secs)
+}
+
+/// Attempts that cover `NOTIFY_RETRY_WINDOW_SECS` at that spacing.
+fn notify_attempts(poll_interval_secs: u64) -> u32 {
+    NOTIFY_RETRY_WINDOW_SECS.div_ceil(notify_spacing(poll_interval_secs)) as u32
+}
+
 impl WebhookDeliverer {
+    fn max_retries_for(&self, event: &str) -> u32 {
+        if event == NOTIFY_EVENT {
+            self.notify_max_retries
+        } else {
+            self.max_retries
+        }
+    }
+
     pub fn new(db: Db, config: &Config) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -46,6 +76,8 @@ impl WebhookDeliverer {
             jwt_token: config.webhook_jwt_token.clone(),
             notify_tokens,
             max_retries: config.webhook_max_retries,
+            notify_max_retries: notify_attempts(config.webhook_retry_poll_interval_secs),
+            notify_spacing_secs: notify_spacing(config.webhook_retry_poll_interval_secs),
             retry_delay_ms: config.webhook_retry_delay_ms,
             poll_interval_secs: config.webhook_retry_poll_interval_secs,
             batch_size: config.webhook_retry_batch_size,
@@ -73,6 +105,8 @@ impl WebhookDeliverer {
             jwt_token,
             notify_tokens: std::collections::HashMap::new(),
             max_retries,
+            notify_max_retries: notify_attempts(poll_interval_secs),
+            notify_spacing_secs: notify_spacing(poll_interval_secs),
             retry_delay_ms,
             poll_interval_secs,
             batch_size,
@@ -177,7 +211,7 @@ impl WebhookDeliverer {
         let claimed = {
             let id = id.to_string();
             let event = event.to_string();
-            let max_retries = self.max_retries;
+            let max_retries = self.max_retries_for(&event);
             self.db
                 .blocking(move |db| {
                     db.claim_webhook_delivery(&id, &event, lease_until, max_retries)
@@ -220,7 +254,8 @@ impl WebhookDeliverer {
             }
             Err(e) => {
                 let (http_status, err_msg) = delivery_error_parts(&e);
-                let next_status = if record.attempt_count + 1 >= self.max_retries as u64 {
+                let next_status = if record.attempt_count + 1 >= self.max_retries_for(event) as u64
+                {
                     "failed"
                 } else {
                     "pending"
@@ -230,14 +265,20 @@ impl WebhookDeliverer {
                     let event_owned = event.to_string();
                     let err_msg = err_msg.clone();
                     let next_status_owned = next_status.to_string();
+                    let retry_after = if event == NOTIFY_EVENT {
+                        self.notify_spacing_secs
+                    } else {
+                        0
+                    };
                     self.db
                         .blocking(move |db| {
-                            db.record_webhook_attempt(
+                            db.record_webhook_attempt_after(
                                 &id_owned,
                                 &event_owned,
                                 http_status,
                                 Some(&err_msg),
                                 &next_status_owned,
+                                retry_after,
                             )
                         })
                         .await?
@@ -248,6 +289,15 @@ impl WebhookDeliverer {
                     warn!(
                         "Webhook delivery failed permanently: id={id}, event={event}, attempts={attempts}, error={err_msg}"
                     );
+                    if event == NOTIFY_EVENT {
+                        // That sweep is never registered at the swap service
+                        // otherwise: say so where the alerts are read. The id is
+                        // `<network>:<tx hash>:<log index>`.
+                        let network = id.split(':').next().unwrap_or("-");
+                        error!(
+                            "EVMHOT_ALERT kind=notify_failed network={network} deposit={id} tx=- (event {event}, {attempts} attempts, last error: {err_msg}; retry with POST /admin/retry_webhooks)"
+                        );
+                    }
                 } else {
                     warn!(
                         "Webhook delivery attempt failed: id={id}, event={event}, attempts={attempts}, error={err_msg}"
@@ -261,10 +311,17 @@ impl WebhookDeliverer {
 
     pub async fn process_pending_batch(&self) -> Result<usize> {
         let max_retries = self.max_retries;
+        let notify_max_retries = self.notify_max_retries;
         let batch_size = self.batch_size;
         let keys = self
             .db
-            .blocking(move |db| db.get_pending_webhook_delivery_keys(max_retries, batch_size))
+            .blocking(move |db| {
+                db.get_pending_webhook_delivery_keys_with_notify(
+                    max_retries,
+                    notify_max_retries,
+                    batch_size,
+                )
+            })
             .await?;
 
         if keys.is_empty() {

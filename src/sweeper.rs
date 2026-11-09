@@ -406,6 +406,93 @@ impl Sweeper {
         Ok(())
     }
 
+    /// Before an operator retry: read, now, the receipts of every transaction
+    /// ever signed for the deposits' reviewed or closed intents. The watch on a
+    /// "nonce used" verdict ends after a while, and a retry of a sweep that really
+    /// landed would make its amount owed again.
+    ///
+    /// - a successful receipt with the planned `Transfer`: the sweep is recorded
+    ///   (the next pass sends `deposit_swept`), the deposits are released, and
+    ///   `review_self_resolved` is raised: the retry is answered as settled;
+    /// - a successful receipt without it: the retry is refused;
+    /// - nothing landed: the retry may go ahead.
+    pub(crate) async fn settle_landed_before_retry(
+        &self,
+        keys: &[String],
+        native: bool,
+    ) -> Result<RetryGate> {
+        for state in ["review", "review_gone", "closed_by_operator"] {
+            let intents = {
+                let c = self.chain.name.clone();
+                self.db
+                    .blocking(move |db| db.sweep_intents_in_state(&c, state))
+                    .await?
+            };
+            for intent in intents
+                .into_iter()
+                .filter(|i| i.keys.iter().any(|k| keys.contains(k)))
+                .filter(|i| (i.token_address == NATIVE_TOKEN) == native)
+            {
+                let address = Address::from_str(&intent.address)?;
+                for tx in intent.txs.iter().rev() {
+                    let hash = alloy::primitives::TxHash::from_str(&tx.hash)?;
+                    let Some(receipt) = self.provider.get_transaction_receipt(hash).await? else {
+                        continue;
+                    };
+                    if !receipt.inner.status() {
+                        continue; // reverted: nothing moved
+                    }
+                    if native {
+                        // Native deposits carry no coordinate to check.
+                        self.release_and_alert(&intent, &tx.hash, true).await?;
+                        self.settle_native(&intent, &intent.address).await?;
+                        return Ok(RetryGate::Settled(tx.hash.clone()));
+                    }
+                    let token = Address::from_str(&intent.token_address)?;
+                    let to = Address::from_str(&intent.target)?;
+                    let planned = U256::from_str(&intent.amount)?;
+                    match evaluate_receipt(&receipt, token, address, to, planned) {
+                        Verdict::Success(record) => {
+                            {
+                                let (c, id, ks) =
+                                    (self.chain.name.clone(), intent.id, intent.keys.clone());
+                                self.db
+                                    .blocking(move |db| {
+                                        db.settle_sweep_intent(&c, id, &ks, &record, &[])
+                                    })
+                                    .await?;
+                            }
+                            self.release_and_alert(&intent, &tx.hash, false).await?;
+                            return Ok(RetryGate::Settled(tx.hash.clone()));
+                        }
+                        Verdict::Review(why) => {
+                            return Ok(RetryGate::Refused(format!(
+                                "sweep {} succeeded on chain but does not match what was planned ({why}); check the chain before retrying",
+                                tx.hash
+                            )));
+                        }
+                        Verdict::Reverted => {}
+                    }
+                }
+            }
+        }
+        Ok(RetryGate::Clear)
+    }
+
+    async fn release_and_alert(&self, intent: &SweepIntent, tx: &str, native: bool) -> Result<()> {
+        {
+            let (c, keys) = (self.chain.name.clone(), intent.keys.clone());
+            self.db
+                .blocking(move |db| db.release_review_deposits_for_keys(&c, &keys, native))
+                .await?;
+        }
+        for key in &intent.keys {
+            self.alert_once_with_tx(key, "review_self_resolved", tx)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Whether an intent is still open for the address (after an error mid-send).
     async fn address_has_open_intent(&self, reg: &str) -> Result<bool> {
         let (c, r) = (self.chain.name.clone(), reg.to_string());
@@ -1660,6 +1747,17 @@ impl Sweeper {
 enum Outcome {
     Sent,
     Idle,
+}
+
+/// What an operator retry finds when it reads the receipts first.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RetryGate {
+    /// Nothing signed for these deposits landed: retrying is safe.
+    Clear,
+    /// A sweep did land; it is now recorded and the deposits released.
+    Settled(String),
+    /// A sweep landed but is not what was planned: no retry.
+    Refused(String),
 }
 
 /// Whether an intent is still waiting.

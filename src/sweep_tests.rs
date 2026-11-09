@@ -3564,3 +3564,180 @@ async fn deposits_without_a_sender_are_reserved_in_the_same_pass() {
         Some("balance_shortfall")
     );
 }
+
+// ------------------------------------------------------- final set before merge
+
+/// A per_transfer deposit whose sweep landed, but whose "nonce used" verdict was
+/// reviewed and whose watch has ended (no receipt was visible all that time).
+async fn landed_but_final_review(fx: &Fixture, receipt_amount: u128, tx: &str) -> (Rpc, Sweeper) {
+    let rpc = Rpc::start(
+        100,
+        vec![tx.to_string()],
+        vec![(
+            tx.to_string(),
+            ok_receipt(tx, 140, 2, TOKEN, &fx.addr, TARGET_A, receipt_amount),
+        )],
+    )
+    .await;
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |t| t.per_transfer = true));
+    rpc.hide_receipts(true);
+    sweeper.process_deposits_once().await.unwrap(); // sent
+    rpc.set_latest_nonce(1);
+    rpc.set_balance(0);
+    sweeper.process_deposits_once().await.unwrap(); // nonce seen used
+    rpc.set_block(1000 + 70);
+    sweeper.process_deposits_once().await.unwrap(); // review_gone
+    rpc.set_block(1000 + 6000);
+    sweeper.process_deposits_once().await.unwrap(); // watch over: final review
+    assert_eq!(
+        fx.db
+            .sweep_intents_in_state(TEST_CHAIN, "review")
+            .unwrap()
+            .len(),
+        1
+    );
+    (rpc, sweeper)
+}
+
+#[tokio::test]
+async fn retry_after_the_watch_settles_a_sweep_that_landed_instead_of_sweeping_it_again() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let t = sweep_tx(1101);
+    let (rpc, sweeper) = landed_but_final_review(&fx, 100, &t).await;
+    // The receipt is there now, though nobody was watching any more.
+    rpc.hide_receipts(false);
+    let keys = vec!["0xaaa:1".to_string()];
+    let gate = sweeper
+        .settle_landed_before_retry(&keys, false)
+        .await
+        .unwrap();
+    assert!(
+        matches!(gate, crate::sweeper::RetryGate::Settled(_)),
+        "{gate:?}"
+    );
+    // Recorded, released, and settled by the usual pass: one event, one sweep.
+    assert_eq!(fx.db.get_sweeps(TEST_CHAIN, "0xaaa:1").unwrap().len(), 1);
+    assert_eq!(fx.detected(), 1);
+    sweeper.process_deposits_n(2).await.unwrap();
+    assert_eq!(fx.detected(), 0);
+    assert!(fx.swept_webhook("0xaaa:1").is_some());
+    assert_eq!(rpc.sent(), 1, "swept once, not twice");
+    assert!(!fx
+        .db
+        .alert_once(TEST_CHAIN, "0xaaa:1", "review_self_resolved")
+        .unwrap());
+}
+
+#[tokio::test]
+async fn retry_after_the_watch_refuses_when_the_landed_sweep_is_not_what_was_planned() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let t = sweep_tx(1102);
+    let (rpc, sweeper) = landed_but_final_review(&fx, 90, &t).await; // moved 90, not 100
+    rpc.hide_receipts(false);
+    let keys = vec!["0xaaa:1".to_string()];
+    let gate = sweeper
+        .settle_landed_before_retry(&keys, false)
+        .await
+        .unwrap();
+    let crate::sweeper::RetryGate::Refused(why) = gate else {
+        panic!("expected a refusal, got {gate:?}");
+    };
+    assert!(why.contains("succeeded on chain"), "{why}");
+    // Nothing was released or recorded.
+    assert!(fx.db.get_sweeps(TEST_CHAIN, "0xaaa:1").unwrap().is_empty());
+    assert_eq!(fx.detected(), 0);
+}
+
+#[tokio::test]
+async fn retry_with_nothing_landed_is_clear() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let t = sweep_tx(1103);
+    let (rpc, sweeper) = landed_but_final_review(&fx, 100, &t).await;
+    // The receipt never shows up: the sweep did not land.
+    assert!(rpc.sent() == 1);
+    let keys = vec!["0xaaa:1".to_string()];
+    let gate = sweeper
+        .settle_landed_before_retry(&keys, false)
+        .await
+        .unwrap();
+    assert_eq!(gate, crate::sweeper::RetryGate::Clear);
+}
+
+#[tokio::test]
+async fn a_notify_delivery_keeps_trying_for_hours_and_alerts_when_it_fails() {
+    let (mediums, swap) = (endpoint(200).await, endpoint(500).await);
+    let (fx, id) = settle_into_notifying_target(&mediums, &swap).await;
+    // Poll interval 60s: attempts spaced a minute apart, 120 of them.
+    let deliverer = crate::webhook::WebhookDeliverer::new_for_test(
+        fx.db.clone(),
+        Some("mediums-token".into()),
+        3,
+        10,
+        60,
+        50,
+        60,
+    )
+    .unwrap()
+    .with_notify_tokens(&[(swap.uri().as_str(), "swap-token")]);
+    deliverer.process_pending_batch().await.unwrap();
+    let note = || {
+        fx.db
+            .get_webhook_delivery(&id, "deposit_swept:notify")
+            .unwrap()
+            .unwrap()
+    };
+    // The registration webhook's schedule (3 attempts here) does not apply: the
+    // notify row is still pending after one failure, and is not offered again for
+    // a minute.
+    assert_eq!(note().status, "pending");
+    assert!(fx
+        .db
+        .get_pending_webhook_delivery_keys_with_notify(3, 120, 50)
+        .unwrap()
+        .is_empty());
+    // Fast-forward its attempts to the last one.
+    for _ in 0..118 {
+        fx.db
+            .record_webhook_attempt(&id, "deposit_swept:notify", Some(500), Some("x"), "pending")
+            .unwrap();
+    }
+    assert_eq!(note().attempt_count, 119);
+    assert_eq!(
+        note().status,
+        "pending",
+        "119 of 120 attempts: still trying"
+    );
+    deliverer.process_pending_batch().await.unwrap();
+    // The 120th failure ends it. (It is two hours at a minute apart.)
+    assert_eq!(note().status, "failed");
+    // An operator can bring it back, by its event label.
+    assert!(fx
+        .db
+        .retry_webhook_delivery(&id, "deposit_swept:notify")
+        .unwrap());
+    assert_eq!(note().status, "pending");
+}
+
+#[test]
+fn unknown_keys_in_a_chains_table_fail_at_load_and_the_example_has_none() {
+    // The shipped example loads as it is.
+    parse_chains_toml(include_str!("../chains.toml.example")).expect("chains.toml.example loads");
+    // A key this binary does not know (an old template's `detection`, or a typo)
+    // is an error, not a silent no-op.
+    let with = |extra: &str| chains_toml(extra, TEST_TREASURY);
+    for key in [
+        "detection = \"finalized\"",
+        "scan_native = true",
+        "poll_intervall = 2",
+    ] {
+        let err = parse_chains_toml(&with(key)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown field"),
+            "`{key}` was accepted or misreported: {msg}"
+        );
+    }
+}

@@ -32,7 +32,7 @@ use faucet::Faucet;
 use monitor::Monitor;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use sweeper::Sweeper;
+use sweeper::{RetryGate, Sweeper};
 use traits::Service;
 use wallet::Wallet;
 use webhook::{WebhookDeliverer, WebhookRetryService};
@@ -115,6 +115,9 @@ pub struct RetrySweepRequest {
 pub struct RetrySweepResponse {
     pub retried: bool,
     pub token_type: String,
+    /// True when the deposit was not retried because its earlier sweep had in
+    /// fact landed: the sweep is now recorded and `deposit_swept` follows.
+    pub settled: bool,
 }
 
 /// Request to re-queue a failed webhook delivery.
@@ -225,27 +228,59 @@ impl HotWalletService {
             return Err(anyhow::anyhow!("Unknown chain: {}", request.chain));
         }
 
-        if let Some(log_index) = request.log_index {
-            let retried = self
-                .db
+        let ctx = self.chain_context(&request.chain)?;
+        let sweeper = Sweeper::new(
+            ctx.cfg.clone(),
+            Arc::clone(&self.webhook_deliverer),
+            self.db.clone(),
+            self.wallet.clone(),
+            ctx.provider.clone(),
+            Arc::clone(&ctx.faucet),
+        );
+        let native = request.log_index.is_none();
+        let key = match request.log_index {
+            Some(i) => format!("{}:{i}", request.tx_hash),
+            None => request.tx_hash.clone(),
+        };
+        let token_type = if native { "native" } else { "erc20" }.to_string();
+
+        // A sweep that landed after the verdict that sent the deposit to review must
+        // be recorded, not swept again: read the receipts before releasing anything.
+        match sweeper
+            .settle_landed_before_retry(std::slice::from_ref(&key), native)
+            .await?
+        {
+            RetryGate::Settled(tx) => {
+                tracing::warn!(
+                    "retry of {key} on {}: sweep {tx} had landed; recorded instead",
+                    request.chain
+                );
+                return Ok(RetrySweepResponse {
+                    retried: false,
+                    token_type,
+                    settled: true,
+                });
+            }
+            RetryGate::Refused(why) => return Err(anyhow::anyhow!("cannot retry: {why}")),
+            RetryGate::Clear => {}
+        }
+
+        let retried = if let Some(log_index) = request.log_index {
+            self.db
                 .blocking(move |db| {
                     db.retry_erc20_deposit(&request.chain, &request.tx_hash, log_index)
                 })
-                .await?;
-            Ok(RetrySweepResponse {
-                retried,
-                token_type: "erc20".to_string(),
-            })
+                .await?
         } else {
-            let retried = self
-                .db
+            self.db
                 .blocking(move |db| db.retry_native_deposit(&request.chain, &request.tx_hash))
-                .await?;
-            Ok(RetrySweepResponse {
-                retried,
-                token_type: "native".to_string(),
-            })
-        }
+                .await?
+        };
+        Ok(RetrySweepResponse {
+            retried,
+            token_type,
+            settled: false,
+        })
     }
 
     /// Interactive-lane write routed through `Db::blocking` so this HTTP path

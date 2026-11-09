@@ -2290,6 +2290,20 @@ impl Db {
         error: Option<&str>,
         status: &str,
     ) -> Result<u64> {
+        self.record_webhook_attempt_after(id, event, http_status, error, status, 0)
+    }
+
+    /// As `record_webhook_attempt`; a row that stays pending is not offered again
+    /// for `retry_after_secs` (it is leased for that long).
+    pub fn record_webhook_attempt_after(
+        &self,
+        id: &str,
+        event: &str,
+        http_status: Option<u16>,
+        error: Option<&str>,
+        status: &str,
+        retry_after_secs: u64,
+    ) -> Result<u64> {
         let id = id.to_string();
         let event = event.to_string();
         let error = error.map(str::to_string);
@@ -2302,10 +2316,18 @@ impl Db {
                      last_http_status = ?3,
                      last_error = ?4,
                      status = ?5,
-                     leased_until = NULL,
+                     leased_until = CASE WHEN ?5 = 'pending' AND ?7 > 0 THEN ?6 + ?7 ELSE NULL END,
                      updated_at = ?6
                  WHERE id = ?1 AND event = ?2",
-                params![id, event, http_status.map(i64::from), error, status, now],
+                params![
+                    id,
+                    event,
+                    http_status.map(i64::from),
+                    error,
+                    status,
+                    now,
+                    retry_after_secs as i64
+                ],
             )?;
             let count: i64 = conn.query_row(
                 "SELECT attempt_count FROM webhook_deliveries WHERE id = ?1 AND event = ?2",
@@ -2321,19 +2343,35 @@ impl Db {
         max_retries: u32,
         batch_size: u32,
     ) -> Result<Vec<(String, String)>> {
+        self.get_pending_webhook_delivery_keys_with_notify(max_retries, max_retries, batch_size)
+    }
+
+    /// As above, with its own attempt limit for `deposit_swept:notify` rows.
+    pub fn get_pending_webhook_delivery_keys_with_notify(
+        &self,
+        max_retries: u32,
+        notify_max_retries: u32,
+        batch_size: u32,
+    ) -> Result<Vec<(String, String)>> {
         let now = now_unix_secs();
         let conn = self.read.get()?;
         let mut stmt = conn.prepare(
             "SELECT id, event FROM webhook_deliveries
              WHERE status = 'pending'
-               AND attempt_count < ?1
+               AND attempt_count < CASE WHEN event = 'deposit_swept:notify' THEN ?4 ELSE ?1 END
                AND (leased_until IS NULL OR leased_until < ?2)
              ORDER BY updated_at ASC
              LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![max_retries as i64, now, batch_size as i64], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        let rows = stmt.query_map(
+            params![
+                max_retries as i64,
+                now,
+                batch_size as i64,
+                notify_max_retries as i64
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }

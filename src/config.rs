@@ -141,8 +141,11 @@ pub fn next_sweep_part(
     Some(max)
 }
 
-/// Per-chain configuration loaded from `chains.toml`.
+/// Per-chain configuration loaded from `chains.toml`. An unknown key is an
+/// error: a setting that is silently ignored (a misspelt one, or one an older
+/// template carried for a feature that is not built) is worse than a refusal.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChainConfigRaw {
     pub name: String,
     pub chain_id: u64,

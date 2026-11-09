@@ -1504,6 +1504,20 @@ impl PostgresBackend {
         error: Option<&str>,
         status: &str,
     ) -> Result<u64> {
+        self.record_webhook_attempt_after(id, event, http_status, error, status, 0)
+    }
+
+    /// As `record_webhook_attempt`; a row that stays pending is not offered again
+    /// for `retry_after_secs` (it is leased for that long).
+    pub fn record_webhook_attempt_after(
+        &self,
+        id: &str,
+        event: &str,
+        http_status: Option<u16>,
+        error: Option<&str>,
+        status: &str,
+        retry_after_secs: u64,
+    ) -> Result<u64> {
         let mut guard = self.conn()?;
         let client = guard.client();
         let now = now_unix_secs();
@@ -1514,10 +1528,18 @@ impl PostgresBackend {
                  last_http_status = $3,
                  last_error = $4,
                  status = $5,
-                 leased_until = NULL,
+                 leased_until = CASE WHEN $5 = 'pending' AND $7 > 0 THEN $6 + $7 ELSE NULL END,
                  updated_at = $6
              WHERE id = $1 AND event = $2",
-            &[&id, &event, &http_status, &error, &status, &now],
+            &[
+                &id,
+                &event,
+                &http_status,
+                &error,
+                &status,
+                &now,
+                &(retry_after_secs as i64),
+            ],
         )?;
         let count: i64 = client
             .query_one(
@@ -1533,18 +1555,29 @@ impl PostgresBackend {
         max_retries: u32,
         batch_size: u32,
     ) -> Result<Vec<(String, String)>> {
+        self.get_pending_webhook_delivery_keys_with_notify(max_retries, max_retries, batch_size)
+    }
+
+    /// As above, with its own attempt limit for `deposit_swept:notify` rows.
+    pub fn get_pending_webhook_delivery_keys_with_notify(
+        &self,
+        max_retries: u32,
+        notify_max_retries: u32,
+        batch_size: u32,
+    ) -> Result<Vec<(String, String)>> {
         let now = now_unix_secs();
         let mut guard = self.conn()?;
         let max_retries = max_retries as i64;
+        let notify_max_retries = notify_max_retries as i64;
         let batch_size = batch_size as i64;
         let rows = guard.client().query(
             "SELECT id, event FROM webhook_deliveries
              WHERE status = 'pending'
-               AND attempt_count < $1
+               AND attempt_count < CASE WHEN event = 'deposit_swept:notify' THEN $4 ELSE $1 END
                AND (leased_until IS NULL OR leased_until < $2)
              ORDER BY updated_at ASC
              LIMIT $3",
-            &[&max_retries, &now, &batch_size],
+            &[&max_retries, &now, &batch_size, &notify_max_retries],
         )?;
         Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
     }
