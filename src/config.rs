@@ -61,6 +61,13 @@ pub struct TokenTargetRaw {
     /// not even from the same sender.
     #[serde(default)]
     pub per_transfer: bool,
+    /// Also deliver every token `deposit_swept` for a deposit settled into this
+    /// target to this URL (the swap service), with its own bearer token.
+    #[serde(default)]
+    pub notify_url: Option<String>,
+    /// Name of the environment variable that holds that bearer token.
+    #[serde(default)]
+    pub notify_token_env: Option<String>,
 }
 
 /// A validated sweep target for one token.
@@ -74,6 +81,10 @@ pub struct SweepTarget {
     pub admits_only: bool,
     pub per_sender: bool,
     pub per_transfer: bool,
+    /// Second destination for `deposit_swept`. The token itself is read from the
+    /// environment variable `notify_token_env` names, never kept in the config.
+    pub notify_url: Option<String>,
+    pub notify_token_env: Option<String>,
 }
 
 impl SweepTarget {
@@ -86,6 +97,8 @@ impl SweepTarget {
             admits_only: false,
             per_sender: false,
             per_transfer: false,
+            notify_url: None,
+            notify_token_env: None,
         }
     }
 }
@@ -509,6 +522,28 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
                     }
                 }
             }
+            let (notify_url, notify_token_env) = match (&table.notify_url, &table.notify_token_env)
+            {
+                (None, None) => (None, None),
+                (Some(url), env) => {
+                    let url = url.trim();
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        bail!("{field}.notify_url must be an http(s) URL");
+                    }
+                    let Some(env) = env.as_deref().map(str::trim).filter(|e| !e.is_empty()) else {
+                        bail!("{field}: notify_url needs notify_token_env, the name of the variable holding its bearer token");
+                    };
+                    // Startup fails rather than deliver unauthenticated.
+                    if std::env::var(env)
+                        .map(|v| v.trim().is_empty())
+                        .unwrap_or(true)
+                    {
+                        bail!("{field}: notify_url is set but the environment variable {env} is empty or unset");
+                    }
+                    (Some(url.to_string()), Some(env.to_string()))
+                }
+                (None, Some(_)) => bail!("{field}: notify_token_env without notify_url"),
+            };
             if max == Some(U256::ZERO) {
                 bail!("{field}.max must be greater than zero");
             }
@@ -534,6 +569,7 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
                         || table.admits_only
                         || table.per_sender
                         || table.per_transfer
+                        || table.notify_url.is_some()
                     {
                         bail!(
                             "{field}: kind \"hold\" takes no address, bounds or flags; \
@@ -553,6 +589,8 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
                     admits_only: table.admits_only,
                     per_sender: table.per_sender,
                     per_transfer: table.per_transfer,
+                    notify_url,
+                    notify_token_env,
                 },
             );
         }

@@ -1123,13 +1123,25 @@ fn assert_f002a_store_cycle(db: &Db) {
     let settlements = vec![evmhot::db::Erc20Settlement {
         key: "0xt1:3".to_string(),
         outbox: Some(f002a_outbox("base:0xt1:3", "deposit_swept")),
+        notify: Some(evmhot::db::OutboxEntry {
+            webhook_url: "https://swap.example/hook".to_string(),
+            event: "deposit_swept:notify".to_string(),
+            ..f002a_outbox("base:0xt1:3", "deposit_swept")
+        }),
     }];
-    assert_eq!(db.complete_erc20_sweep("base", &settlements).unwrap(), 1);
+    // One row for the registration webhook, one for the target's notify_url.
+    assert_eq!(db.complete_erc20_sweep("base", &settlements).unwrap(), 2);
     assert!(db.get_detected_erc20_deposits("base").unwrap().is_empty());
     assert!(db
         .get_webhook_delivery("base:0xt1:3", "deposit_swept")
         .unwrap()
         .is_some());
+    // The copy for the target's notify_url is a separate row, same transaction.
+    let note = db
+        .get_webhook_delivery("base:0xt1:3", "deposit_swept:notify")
+        .unwrap()
+        .expect("notify row");
+    assert_eq!(note.webhook_url, "https://swap.example/hook");
     assert!(db
         .complete_native_sweep(
             "base",
@@ -1266,6 +1278,7 @@ fn postgres_req_wh_7_failed_outbox_write_rolls_back_the_state_change() {
     let settlements = vec![evmhot::db::Erc20Settlement {
         key: "0xt1:3".to_string(),
         outbox: Some(f002a_outbox("base:0xt1:3", "deposit_swept")),
+        notify: None,
     }];
     assert!(db.complete_erc20_sweep("base", &settlements).is_err());
     assert!(db

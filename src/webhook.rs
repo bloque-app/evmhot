@@ -13,6 +13,9 @@ use tracing::{info, warn};
 pub struct WebhookDeliverer {
     db: Db,
     jwt_token: Option<String>,
+    /// Bearer tokens for sweep-target `notify_url`s, by URL. A delivery to one of
+    /// these URLs carries its own token, never the registration webhooks' one.
+    notify_tokens: std::collections::HashMap<String, String>,
     max_retries: u32,
     retry_delay_ms: u64,
     poll_interval_secs: u64,
@@ -27,9 +30,21 @@ impl WebhookDeliverer {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
+        let mut notify_tokens = std::collections::HashMap::new();
+        for chain in &config.chains {
+            for target in chain.token_targets.values() {
+                if let (Some(url), Some(env)) = (&target.notify_url, &target.notify_token_env) {
+                    // Config load already refused an empty variable.
+                    let token = std::env::var(env)
+                        .map_err(|_| anyhow!("{env} is not set (notify_url {url})"))?;
+                    notify_tokens.insert(url.clone(), token.trim().to_string());
+                }
+            }
+        }
         Ok(Self {
             db,
             jwt_token: config.webhook_jwt_token.clone(),
+            notify_tokens,
             max_retries: config.webhook_max_retries,
             retry_delay_ms: config.webhook_retry_delay_ms,
             poll_interval_secs: config.webhook_retry_poll_interval_secs,
@@ -56,6 +71,7 @@ impl WebhookDeliverer {
         Ok(Self {
             db,
             jwt_token,
+            notify_tokens: std::collections::HashMap::new(),
             max_retries,
             retry_delay_ms,
             poll_interval_secs,
@@ -64,6 +80,16 @@ impl WebhookDeliverer {
             client,
             notify: Arc::new(Notify::new()),
         })
+    }
+
+    /// Test helper: bearer tokens for `notify_url`s.
+    #[cfg(test)]
+    pub fn with_notify_tokens(mut self, tokens: &[(&str, &str)]) -> Self {
+        self.notify_tokens = tokens
+            .iter()
+            .map(|(u, t)| (u.to_string(), t.to_string()))
+            .collect();
+        self
     }
 
     pub fn notify_worker(&self) {
@@ -267,7 +293,9 @@ impl WebhookDeliverer {
         payload: &Value,
     ) -> std::result::Result<u16, DeliveryError> {
         let mut request = self.client.post(url).json(payload);
-        if let Some(ref token) = self.jwt_token {
+        // A notify URL gets its own token; everything else the webhook token.
+        let token = self.notify_tokens.get(url).or(self.jwt_token.as_ref());
+        if let Some(token) = token {
             request = request.header("Authorization", format!("Bearer {token}"));
         }
 

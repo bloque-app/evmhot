@@ -192,6 +192,9 @@ pub struct SweepIntent {
 pub struct Erc20Settlement {
     pub key: String,
     pub outbox: Option<OutboxEntry>,
+    /// The same event for the target's `notify_url`, written in the same
+    /// transaction under its own outbox key.
+    pub notify: Option<OutboxEntry>,
 }
 
 /// Typed errors for the write-queue fast paths, so HTTP layers can map

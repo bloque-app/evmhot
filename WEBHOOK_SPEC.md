@@ -78,6 +78,11 @@ native deposit carries no sweep fields. A token deposit adds:
   value differs from the planned amount) is moved to `needs_review` and gets **no** `deposit_swept`; evmhot logs
   `EVMHOT_ALERT kind=sweep_review network=<n> deposit=<id> tx=<hash>` and an operator decides
   (`POST /admin/retry_sweeps` moves it back to `detected`, and closes its review intents). Other review kinds: `balance_shortfall`, `no_sender`. `sweep_review` also covers a sweep whose nonce was used by a transaction outside evmhot.
+- A target may also name a `notify_url` (see `chains.toml.example`): the same token `deposit_swept`, byte for byte, is then
+  delivered there as well, with that URL's own bearer token. The two deliveries are independent rows (the store keys the
+  second one `(id, "deposit_swept:notify")`; the body's `event` is `deposit_swept` in both), retried and leased separately, so
+  a failing destination never holds back the other. Each receiver still uses `(id, event)` from the body as its
+  idempotency key.
 - `(id, event)` stays the receiver's idempotency key.
 
 ## Lazy faucet

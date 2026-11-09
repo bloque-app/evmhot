@@ -86,6 +86,8 @@ impl Shape {
             admits_only: false,
             per_sender: matches!(self, Shape::PerSender | Shape::PerSenderMax),
             per_transfer: matches!(self, Shape::PerTransfer | Shape::PerTransferMax),
+            notify_url: None,
+            notify_token_env: None,
         }
     }
 }

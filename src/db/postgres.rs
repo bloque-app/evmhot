@@ -947,6 +947,11 @@ impl PostgresBackend {
                     enqueued += 1;
                 }
             }
+            if let Some(entry) = &settlement.notify {
+                if upsert_outbox(&mut tx, entry)? {
+                    enqueued += 1;
+                }
+            }
         }
         tx.commit()?;
         Ok(enqueued)
@@ -1338,6 +1343,11 @@ impl PostgresBackend {
                 &[&chain, &tx_hash, &log_index],
             )?;
             if let Some(entry) = &settlement.outbox {
+                if upsert_outbox(&mut tx, entry)? {
+                    enqueued += 1;
+                }
+            }
+            if let Some(entry) = &settlement.notify {
                 if upsert_outbox(&mut tx, entry)? {
                     enqueued += 1;
                 }

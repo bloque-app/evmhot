@@ -429,6 +429,8 @@ fn target_for(
             admits_only: false,
             per_sender: false,
             per_transfer: false,
+            notify_url: None,
+            notify_token_env: None,
         };
         build(&mut target);
         chain.token_targets.insert(token, target);
@@ -869,6 +871,8 @@ async fn req_sw_6_hold_detects_and_notifies_but_never_sweeps_then_releases() {
                 admits_only: false,
                 per_sender: false,
                 per_transfer: false,
+                notify_url: None,
+                notify_token_env: None,
             },
         );
     };
@@ -1703,10 +1707,12 @@ fn req_wh_7_failed_outbox_write_rolls_back_the_swept_mark() {
         crate::db::Erc20Settlement {
             key: "0xt1:1".into(),
             outbox: Some(outbox("c:0xt1:1", "deposit_swept")),
+            notify: None,
         },
         crate::db::Erc20Settlement {
             key: "0xt2:2".into(),
             outbox: Some(outbox("c:0xt2:2", "deposit_swept")),
+            notify: None,
         },
     ];
 
@@ -3045,4 +3051,193 @@ async fn deposit_swept_payload_matches_the_published_contract() {
         let value: Value = serde_json::from_str(fixture).unwrap();
         assert_valid(&validator, &value, "a published fixture");
     }
+}
+
+// ------------------------------------------------------------ notify_url
+
+async fn endpoint(status: u16) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(status))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// The single request a server received: its Authorization header and body.
+async fn auth(server: &MockServer) -> (Option<String>, Value) {
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1, "one delivery");
+    let header = reqs[0]
+        .headers
+        .get(&"authorization".parse().unwrap())
+        .map(|v| v.as_str().to_string());
+    (
+        header,
+        serde_json::from_slice::<Value>(&reqs[0].body).unwrap(),
+    )
+}
+
+/// Settles one deposit into a target with a `notify_url`, the registration
+/// pointing at `mediums`. Returns the fixture and the deposit's outbox id.
+async fn settle_into_notifying_target(
+    mediums: &MockServer,
+    swap: &MockServer,
+) -> (Fixture, String) {
+    let fx = fixture();
+    fx.db
+        .register_account("user_1", 0, &fx.addr, &mediums.uri())
+        .unwrap();
+    fx.token_deposit(&hash32(0xaa), 1, "100", Some(SENDER_A));
+    let t = sweep_tx(951);
+    let rpc = Rpc::start(
+        100,
+        vec![t.clone()],
+        vec![(
+            t.clone(),
+            ok_receipt(&t, 120, 2, TOKEN, &fx.addr, TARGET_A, 100),
+        )],
+    )
+    .await;
+    let swap_uri = swap.uri();
+    let sweeper = fx.sweeper(
+        &rpc,
+        target_for(TOKEN, move |t| {
+            t.notify_url = Some(swap_uri.clone());
+            t.notify_token_env = Some("EVMHOT_TEST_NOTIFY_TOKEN".into());
+        }),
+    );
+    sweeper.process_deposits_n(3).await.unwrap();
+    assert_eq!(fx.detected(), 0);
+    let id = format!("{TEST_CHAIN}:{}:1", hash32(0xaa));
+    (fx, id)
+}
+
+#[tokio::test]
+async fn notify_url_gets_the_same_deposit_swept_with_its_own_auth() {
+    let (mediums, swap) = (endpoint(200).await, endpoint(200).await);
+    let (fx, id) = settle_into_notifying_target(&mediums, &swap).await;
+
+    // Two outbox rows, keyed apart: (id, deposit_swept) and (id, deposit_swept:notify).
+    let reg = fx
+        .db
+        .get_webhook_delivery(&id, "deposit_swept")
+        .unwrap()
+        .unwrap();
+    let note = fx
+        .db
+        .get_webhook_delivery(&id, "deposit_swept:notify")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reg.webhook_url, mediums.uri());
+    assert_eq!(note.webhook_url, swap.uri());
+    assert_eq!(reg.payload, note.payload, "the same payload");
+
+    let deliverer = crate::webhook::WebhookDeliverer::new_for_test(
+        fx.db.clone(),
+        Some("mediums-token".into()),
+        3,
+        10,
+        60,
+        50,
+        60,
+    )
+    .unwrap()
+    .with_notify_tokens(&[(swap.uri().as_str(), "swap-token")]);
+    deliverer.process_pending_batch().await.unwrap();
+
+    let (m_auth, m_body) = auth(&mediums).await;
+    let (s_auth, s_body) = auth(&swap).await;
+    assert_eq!(m_auth.as_deref(), Some("Bearer mediums-token"));
+    assert_eq!(s_auth.as_deref(), Some("Bearer swap-token"));
+    assert_eq!(m_body, s_body);
+    assert_eq!(s_body["event"], "deposit_swept");
+    // Both validate against the published contract.
+    assert_valid(&contract_validator(), &s_body, "the notify delivery");
+    for event in ["deposit_swept", "deposit_swept:notify"] {
+        assert_eq!(
+            fx.db
+                .get_webhook_delivery(&id, event)
+                .unwrap()
+                .unwrap()
+                .status,
+            "delivered"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failed_swap_delivery_does_not_block_the_registration_one() {
+    let (mediums, swap) = (endpoint(200).await, endpoint(500).await);
+    let (fx, id) = settle_into_notifying_target(&mediums, &swap).await;
+    let deliverer = crate::webhook::WebhookDeliverer::new_for_test(
+        fx.db.clone(),
+        Some("mediums-token".into()),
+        3,
+        10,
+        60,
+        50,
+        60,
+    )
+    .unwrap()
+    .with_notify_tokens(&[(swap.uri().as_str(), "swap-token")]);
+    deliverer.process_pending_batch().await.unwrap();
+    assert_eq!(
+        fx.db
+            .get_webhook_delivery(&id, "deposit_swept")
+            .unwrap()
+            .unwrap()
+            .status,
+        "delivered"
+    );
+    let note = fx
+        .db
+        .get_webhook_delivery(&id, "deposit_swept:notify")
+        .unwrap()
+        .unwrap();
+    // Still pending, with its attempt counted: it retries like any webhook.
+    assert_eq!(note.status, "pending");
+    assert_eq!(note.attempt_count, 1);
+    assert_eq!(mediums.received_requests().await.unwrap().len(), 1);
+}
+
+#[test]
+fn notify_url_needs_a_token_in_the_environment_or_startup_fails() {
+    let toml = |extra: &str| {
+        chains_toml(
+            &format!(
+                "[chains.token_targets.\"{TOKEN}\"]\nkind = \"transfer\"\naddress = \"{TARGET_A}\"\n{extra}\n"
+            ),
+            TEST_TREASURY,
+        )
+    };
+    let url = "notify_url = \"https://swap.example.invalid/hook\"";
+    // No variable named.
+    assert!(parse_chains_toml(&toml(url)).is_err());
+    // A variable named but unset or empty.
+    std::env::remove_var("EVMHOT_TEST_NOTIFY_TOKEN_UNSET");
+    let unset = format!("{url}\nnotify_token_env = \"EVMHOT_TEST_NOTIFY_TOKEN_UNSET\"");
+    let err = parse_chains_toml(&toml(&unset)).unwrap_err().to_string();
+    assert!(err.contains("EVMHOT_TEST_NOTIFY_TOKEN_UNSET"), "{err}");
+    std::env::set_var("EVMHOT_TEST_NOTIFY_TOKEN_EMPTY", "  ");
+    let empty = format!("{url}\nnotify_token_env = \"EVMHOT_TEST_NOTIFY_TOKEN_EMPTY\"");
+    assert!(parse_chains_toml(&toml(&empty)).is_err());
+    // Set: accepted, and the token itself is not kept in the config.
+    std::env::set_var("EVMHOT_TEST_NOTIFY_TOKEN_SET", "s3cret-value");
+    let set = format!("{url}\nnotify_token_env = \"EVMHOT_TEST_NOTIFY_TOKEN_SET\"");
+    let chains = parse_chains_toml(&toml(&set)).unwrap();
+    let target = chains[0].target_for_token(TOKEN);
+    assert_eq!(
+        target.notify_url.as_deref(),
+        Some("https://swap.example.invalid/hook")
+    );
+    assert!(!format!("{chains:?}").contains("s3cret-value"));
+    // A token variable without a URL, and a non-http URL, are refused.
+    assert!(
+        parse_chains_toml(&toml("notify_token_env = \"EVMHOT_TEST_NOTIFY_TOKEN_SET\"")).is_err()
+    );
+    assert!(parse_chains_toml(&toml(
+        "notify_url = \"ftp://x\"\nnotify_token_env = \"EVMHOT_TEST_NOTIFY_TOKEN_SET\""
+    ))
+    .is_err());
 }

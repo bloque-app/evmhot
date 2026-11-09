@@ -1650,6 +1650,11 @@ impl Db {
                             enqueued += 1;
                         }
                     }
+                    if let Some(entry) = &settlement.notify {
+                        if upsert_outbox(conn, entry)? {
+                            enqueued += 1;
+                        }
+                    }
                 }
                 Ok(enqueued)
             })
@@ -2070,6 +2075,11 @@ impl Db {
                         params![chain, tx_hash, log_index],
                     )?;
                     if let Some(entry) = &settlement.outbox {
+                        if upsert_outbox(conn, entry)? {
+                            enqueued += 1;
+                        }
+                    }
+                    if let Some(entry) = &settlement.notify {
                         if upsert_outbox(conn, entry)? {
                             enqueued += 1;
                         }

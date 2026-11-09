@@ -83,6 +83,9 @@ const REPRICE_AFTER_PASSES: u64 = 10;
 /// Passes in which a sweep's nonce is seen used, with no receipt of ours, before
 /// the deposits go to review (receipt indexing can lag the nonce).
 const GONE_PASSES_TO_REVIEW: u64 = 2;
+/// Outbox key (the `event` column) of the copy of `deposit_swept` sent to a
+/// target's `notify_url`. The payload's own `event` is still `deposit_swept`.
+pub(crate) const NOTIFY_EVENT_KEY: &str = "deposit_swept:notify";
 /// An intent's `token_address` for the native coin.
 const NATIVE_TOKEN: &str = "native";
 const QUEUE_LOG_INTERVAL_CYCLES: u64 = 60;
@@ -1345,6 +1348,7 @@ impl Sweeper {
     ) -> Result<Vec<Erc20Settlement>> {
         let first = &group[0];
         let registration_id = &first.account_id;
+        let target = self.chain.target_for_token(&first.token_address);
         let webhook_url = {
             let reg_id = registration_id.clone();
             self.db
@@ -1384,27 +1388,38 @@ impl Sweeper {
             if sweeps.is_empty() {
                 continue;
             }
-            let outbox = webhook_url.as_ref().map(|webhook_url| {
-                let webhook_id = format!("{}:{}", self.chain.name, deposit.key);
-                OutboxEntry {
-                    id: webhook_id.clone(),
-                    event: "deposit_swept".to_string(),
-                    registration_id: registration_id.clone(),
-                    webhook_url: webhook_url.clone(),
-                    payload: self
-                        .erc20_swept_payload(
-                            &webhook_id,
-                            from_address_str,
-                            deposit,
-                            token_decimals,
-                            &sweeps,
-                        )
-                        .to_string(),
-                }
+            let webhook_id = format!("{}:{}", self.chain.name, deposit.key);
+            let payload = self
+                .erc20_swept_payload(
+                    &webhook_id,
+                    from_address_str,
+                    deposit,
+                    token_decimals,
+                    &sweeps,
+                )
+                .to_string();
+            let outbox = webhook_url.as_ref().map(|webhook_url| OutboxEntry {
+                id: webhook_id.clone(),
+                event: "deposit_swept".to_string(),
+                registration_id: registration_id.clone(),
+                webhook_url: webhook_url.clone(),
+                payload: payload.clone(),
+            });
+            // The same event for the target's notify_url (the swap service), in
+            // the same transaction. Its outbox key carries a distinct event
+            // label, so (id, event) never collides with the registration
+            // webhook's row; the payload's `event` stays "deposit_swept".
+            let notify = target.notify_url.as_ref().map(|url| OutboxEntry {
+                id: webhook_id.clone(),
+                event: NOTIFY_EVENT_KEY.to_string(),
+                registration_id: registration_id.clone(),
+                webhook_url: url.clone(),
+                payload: payload.clone(),
             });
             settlements.push(Erc20Settlement {
                 key: deposit.key.clone(),
                 outbox,
+                notify,
             });
         }
         Ok(settlements)
