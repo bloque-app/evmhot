@@ -1,14 +1,14 @@
 use crate::{
-    config::ChainConfig,
-    db::{Db, Erc20Deposit},
+    config::{plan_sweep_parts, ChainConfig, SweepTarget, TargetKind},
+    db::{Db, Erc20Deposit, Erc20Settlement, OutboxEntry, SweepRecord},
     faucet::Faucet,
     wallet::Wallet,
     webhook::WebhookDeliverer,
 };
 use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{keccak256, Address, U256};
 use alloy::providers::{Provider, RootProvider};
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::sol_types::SolCall;
 use alloy::transports::BoxTransport;
 use anyhow::Result;
@@ -18,20 +18,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
-
-struct Erc20WebhookInfo<'a> {
-    id: &'a str,
-    chain: &'a str,
-    chain_id: u64,
-    account_id: &'a str,
-    registration_id: &'a str,
-    deposit_key: &'a str,
-    amount: &'a str,
-    token_symbol: &'a str,
-    token_address: &'a str,
-    token_decimals: Option<u8>,
-    sweep_tx_hash: &'a str,
-}
 
 pub struct Sweeper {
     chain: ChainConfig,
@@ -132,6 +118,11 @@ impl Sweeper {
     }
 
     async fn process_deposits(&self) -> Result<()> {
+        self.process_native_deposits().await?;
+        self.process_erc20_deposits().await
+    }
+
+    async fn process_native_deposits(&self) -> Result<()> {
         let chain_name = self.chain.name.clone();
         let deposits = self
             .db
@@ -190,17 +181,24 @@ impl Sweeper {
                 }
             }
         }
+        Ok(())
+    }
 
+    /// Token sweeps. Detected deposits are grouped by deposit address and token
+    /// (and by sender when the token's target says `per_sender`, REQ-SW-12);
+    /// each group is processed once per pass.
+    async fn process_erc20_deposits(&self) -> Result<()> {
         let chain_name = self.chain.name.clone();
         let erc20_deposits = self
             .db
             .blocking(move |db| db.get_detected_erc20_deposits(&chain_name))
             .await?;
-        let mut swept_pairs: HashSet<(String, String)> = HashSet::new();
+
+        let mut groups: Vec<Vec<Erc20Deposit>> = Vec::new();
+        let mut group_index: std::collections::HashMap<(String, String, Option<String>), usize> =
+            std::collections::HashMap::new();
 
         for deposit in erc20_deposits {
-            let registration_id = &deposit.account_id;
-
             if !self.chain.is_token_allowed(&deposit.token_address) {
                 info!(
                     "[{}] Skipping non-allowlisted ERC20 deposit: key={}, token={}",
@@ -214,14 +212,42 @@ impl Sweeper {
                 continue;
             }
 
-            if deposit.token_symbol == "UNKNOWN" {
-                let chain_name = self.chain.name.clone();
-                let key = deposit.key.clone();
-                self.db
-                    .blocking(move |db| db.mark_erc20_deposit_swept(&chain_name, &key))
-                    .await?;
+            let target = self.chain.target_for_token(&deposit.token_address);
+            if target.kind == TargetKind::Hold {
+                // REQ-SW-6: detected and notified, never swept. A later change
+                // of the target's kind releases it on the next pass.
+                info!(
+                    "[{}] Holding ERC20 deposit {} (token {} target is hold)",
+                    self.chain.name, deposit.key, deposit.token_address
+                );
                 continue;
             }
+
+            let token = deposit.token_address.to_lowercase();
+            let sender = if target.per_sender {
+                match &deposit.from_address {
+                    Some(from) => Some(from.to_lowercase()),
+                    // A deposit with no recorded sender cannot be grouped:
+                    // it is swept on its own.
+                    None => Some(format!("unknown:{}", deposit.key)),
+                }
+            } else {
+                None
+            };
+            let key = (deposit.account_id.clone(), token, sender);
+            match group_index.get(&key) {
+                Some(&i) => groups[i].push(deposit),
+                None => {
+                    group_index.insert(key, groups.len());
+                    groups.push(vec![deposit]);
+                }
+            }
+        }
+
+        for group in groups {
+            let first = &group[0];
+            let registration_id = first.account_id.clone();
+            let target = self.chain.target_for_token(&first.token_address);
 
             let (derivation_index, address_str, _webhook_url) = {
                 let reg_id = registration_id.clone();
@@ -231,11 +257,6 @@ impl Sweeper {
                     .ok_or_else(|| anyhow::anyhow!("Account not found"))?
             };
 
-            let pair_key = (address_str.clone(), deposit.token_address.clone());
-            if swept_pairs.contains(&pair_key) {
-                continue;
-            }
-
             let signer = self.wallet.get_signer(derivation_index)?;
             let wallet = alloy::network::EthereumWallet::from(signer);
 
@@ -244,87 +265,72 @@ impl Sweeper {
                 .wallet(wallet)
                 .on_provider(&self.provider);
 
-            match self
-                .sweep_erc20_deposit(&sweep_provider, &address_str, &deposit)
+            if let Err(e) = self
+                .sweep_erc20_group(&sweep_provider, &address_str, &target, &group)
                 .await
             {
-                Ok(_) => {
-                    swept_pairs.insert(pair_key);
-                }
-                Err(e) => {
-                    let err_str = format!("{:?}", e);
-                    if is_transient_funding_error(&err_str) {
-                        warn!(
-                            "[{}] ERC20 deposit {} waiting for faucet funding: {}",
-                            self.chain.name, deposit.key, err_str
-                        );
-                    } else {
-                        error!(
-                            "[{}] Failed to sweep ERC20 deposit {}: {}",
-                            self.chain.name, deposit.key, err_str
-                        );
-                        if is_permanent_sweep_error(&err_str) {
-                            let failed = {
-                                let chain_name = self.chain.name.clone();
-                                let reg_id = registration_id.clone();
-                                let token_address = deposit.token_address.clone();
-                                self.db
-                                    .blocking(move |db| {
-                                        db.mark_erc20_deposits_failed_for_account_token(
-                                            &chain_name,
-                                            &reg_id,
-                                            &token_address,
-                                        )
-                                    })
-                                    .await?
-                            };
-                            for key in failed {
-                                warn!(
-                                    "[{}] Permanently failed ERC20 deposit {} (permanent sweep error)",
-                                    self.chain.name, key
-                                );
-                            }
-                        } else {
-                            let failures = {
-                                let chain_name = self.chain.name.clone();
-                                let key = deposit.key.clone();
-                                self.db
-                                    .blocking(move |db| {
-                                        db.increment_sweep_failure_count(&chain_name, &key)
-                                    })
-                                    .await
-                            };
-                            if let Ok(failures) = failures {
-                                if failures >= MAX_SWEEP_RETRIES {
-                                    let failed = {
-                                        let chain_name = self.chain.name.clone();
-                                        let reg_id = registration_id.clone();
-                                        let token_address = deposit.token_address.clone();
-                                        self.db
-                                            .blocking(move |db| {
-                                                db.mark_erc20_deposits_failed_for_account_token(
-                                                    &chain_name,
-                                                    &reg_id,
-                                                    &token_address,
-                                                )
-                                            })
-                                            .await?
-                                    };
-                                    for key in failed {
-                                        warn!(
-                                            "[{}] Permanently failed ERC20 deposit {} after {} attempts: {}",
-                                            self.chain.name, key, failures, err_str
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                self.handle_group_failure(&group, &e).await?;
             }
         }
 
         Ok(())
+    }
+
+    /// REQ-SW-4: funding errors wait; a decoding error fails the group at once;
+    /// any other failure (including a reverted sweep, REQ-SW-5) counts, and the
+    /// fifth consecutive one fails the group.
+    async fn handle_group_failure(&self, group: &[Erc20Deposit], e: &anyhow::Error) -> Result<()> {
+        let err_str = format!("{:?}", e);
+        let first_key = group[0].key.clone();
+        if is_transient_funding_error(&err_str) {
+            warn!(
+                "[{}] ERC20 deposit {} waiting for faucet funding: {}",
+                self.chain.name, first_key, err_str
+            );
+            return Ok(());
+        }
+        error!(
+            "[{}] Failed to sweep ERC20 deposit {}: {}",
+            self.chain.name, first_key, err_str
+        );
+        let keys: Vec<String> = group.iter().map(|d| d.key.clone()).collect();
+        if is_permanent_sweep_error(&err_str) {
+            self.fail_keys(&keys).await?;
+            for key in &keys {
+                warn!(
+                    "[{}] Permanently failed ERC20 deposit {} (permanent sweep error)",
+                    self.chain.name, key
+                );
+            }
+            return Ok(());
+        }
+        let failures = {
+            let chain_name = self.chain.name.clone();
+            let key = first_key.clone();
+            self.db
+                .blocking(move |db| db.increment_sweep_failure_count(&chain_name, &key))
+                .await
+        };
+        if let Ok(failures) = failures {
+            if failures >= MAX_SWEEP_RETRIES {
+                self.fail_keys(&keys).await?;
+                for key in &keys {
+                    warn!(
+                        "[{}] Permanently failed ERC20 deposit {} after {} attempts: {}",
+                        self.chain.name, key, failures, err_str
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn fail_keys(&self, keys: &[String]) -> Result<()> {
+        let chain_name = self.chain.name.clone();
+        let keys = keys.to_vec();
+        self.db
+            .blocking(move |db| db.mark_erc20_deposits_failed_for_keys(&chain_name, &keys))
+            .await
     }
 
     async fn sweep_deposit<SP>(
@@ -373,30 +379,60 @@ impl Sweeper {
         let pending_tx = provider.send_transaction(tx).await?;
         let receipt = pending_tx.get_receipt().await?;
 
-        {
+        // REQ-SW-5: only a successful receipt settles the deposit.
+        if !receipt.inner.status() {
+            return Err(anyhow::anyhow!(
+                "native sweep transaction reverted (receipt status 0): {:?}",
+                receipt.transaction_hash
+            ));
+        }
+
+        let from = {
             let chain_name = self.chain.name.clone();
             let tx_hash = tx_hash.to_string();
             self.db
-                .blocking(move |db| db.mark_deposit_swept(&chain_name, &tx_hash))
-                .await?;
-        }
-
+                .blocking(move |db| db.get_deposit_from_address(&chain_name, &tx_hash))
+                .await?
+        };
+        let webhook_url = {
+            let reg_id = registration_id.to_string();
+            self.db
+                .blocking(move |db| db.get_webhook_url(&reg_id))
+                .await?
+        };
         let webhook_id = format!("{}:{}", self.chain.name, tx_hash);
-        if let Err(e) = self
-            .enqueue_deposit_swept_webhook(
-                &webhook_id,
-                from_address_str,
-                registration_id,
-                tx_hash,
-                amount_str,
-                None,
-            )
-            .await
-        {
-            error!(
-                "[{}] Failed to enqueue deposit_swept webhook for {webhook_id}: {e:?}",
-                self.chain.name
-            );
+        let outbox = webhook_url.map(|webhook_url| OutboxEntry {
+            id: webhook_id.clone(),
+            event: "deposit_swept".to_string(),
+            registration_id: registration_id.to_string(),
+            webhook_url,
+            payload: serde_json::json!({
+                "id": webhook_id,
+                "chain": self.chain.name,
+                "chain_id": self.chain.chain_id,
+                "event": "deposit_swept",
+                "account_id": from_address_str,
+                "registration_id": registration_id,
+                "original_tx_hash": tx_hash,
+                "from_address": from,
+                "amount": amount_str,
+                "token_type": "native"
+            })
+            .to_string(),
+        });
+
+        // REQ-WH-7: the swept mark and its webhook are one transaction.
+        let enqueued = {
+            let chain_name = self.chain.name.clone();
+            let tx_hash = tx_hash.to_string();
+            self.db
+                .blocking(move |db| {
+                    db.complete_native_sweep(&chain_name, &tx_hash, outbox.as_ref())
+                })
+                .await?
+        };
+        if enqueued {
+            self.deliverer.notify_worker();
         }
 
         info!(
@@ -407,49 +443,147 @@ impl Sweeper {
         Ok(())
     }
 
-    async fn sweep_erc20_deposit<SP>(
+    /// Sweeps one group of deposits (one address, one token, and one sender when
+    /// the target is `per_sender`). Each part is its own `transfer` call and its
+    /// own coordinate (REQ-SW-9, REQ-SW-10); the deposits are marked swept, and
+    /// `deposit_swept` sent, once after the last part (REQ-WH-4).
+    async fn sweep_erc20_group<SP>(
         &self,
         provider: &SP,
         from_address_str: &str,
-        deposit: &Erc20Deposit,
+        target: &SweepTarget,
+        group: &[Erc20Deposit],
     ) -> Result<()>
     where
         SP: Provider<BoxTransport, alloy::network::Ethereum>,
     {
+        let first = &group[0];
         let from_address = Address::from_str(from_address_str)?;
-        let to_address = Address::from_str(self.chain.treasury_for_token(&deposit.token_address))?;
-        let token_address = Address::from_str(&deposit.token_address)?;
+        let to_address = Address::from_str(
+            target
+                .address
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("sweep target has no address"))?,
+        )?;
+        let token_address = Address::from_str(&first.token_address)?;
+        let keys: Vec<String> = group.iter().map(|d| d.key.clone()).collect();
 
         let token_balance = get_token_balance(&self.provider, token_address, from_address).await?;
 
-        if deposit.token_symbol.len() > 5 {
-            let chain_name = self.chain.name.clone();
-            let key = deposit.key.clone();
-            self.db
-                .blocking(move |db| db.mark_erc20_deposit_swept(&chain_name, &key))
-                .await?;
-            return Ok(());
-        }
+        // Sweeps recorded by an earlier pass that did not finish the group.
+        let recorded = self.recorded_sweeps(&keys).await?;
+        let sweepable = if target.per_sender {
+            // REQ-SW-12: one sender's share, not the whole balance.
+            let mut owed = U256::ZERO;
+            for deposit in group {
+                owed += U256::from_str(&deposit.amount)?;
+            }
+            let mut already = U256::ZERO;
+            for record in &recorded {
+                already += U256::from_str(&record.sweep_amount)?;
+            }
+            owed.saturating_sub(already).min(token_balance)
+        } else {
+            // REQ-SW-1: the whole balance.
+            token_balance
+        };
 
-        if token_balance.is_zero() {
-            let retry_count = {
-                let chain_name = self.chain.name.clone();
-                let key = deposit.key.clone();
-                self.db
-                    .blocking(move |db| db.increment_zero_balance_count(&chain_name, &key))
-                    .await?
-            };
-            if retry_count >= MAX_ZERO_BALANCE_RETRIES {
-                let chain_name = self.chain.name.clone();
-                let key = deposit.key.clone();
-                self.db
-                    .blocking(move |db| db.mark_erc20_deposit_swept(&chain_name, &key))
-                    .await?;
+        if sweepable.is_zero() {
+            if !recorded.is_empty() {
+                return self.complete_group(from_address_str, group).await;
+            }
+            if token_balance.is_zero() {
+                // REQ-SW-3
+                let retry_count = {
+                    let chain_name = self.chain.name.clone();
+                    let key = first.key.clone();
+                    self.db
+                        .blocking(move |db| db.increment_zero_balance_count(&chain_name, &key))
+                        .await?
+                };
+                if retry_count >= MAX_ZERO_BALANCE_RETRIES {
+                    let chain_name = self.chain.name.clone();
+                    let keys = keys.clone();
+                    self.db
+                        .blocking(move |db| {
+                            db.mark_erc20_deposits_swept_for_keys(&chain_name, &keys)
+                        })
+                        .await?;
+                }
             }
             return Ok(());
         }
 
-        let amount = token_balance;
+        if let Some(min) = target.min {
+            if sweepable < min {
+                // REQ-SW-7: it waits for later deposits to reach the minimum.
+                info!(
+                    "[{}] ERC20 deposit {} waiting: {} is below the target minimum {}",
+                    self.chain.name, first.key, sweepable, min
+                );
+                if !recorded.is_empty() {
+                    // Earlier parts went out; what is left is below the minimum.
+                    return self.complete_group(from_address_str, group).await;
+                }
+                return Ok(());
+            }
+        }
+
+        let parts = plan_sweep_parts(sweepable, target.min, target.max);
+        for amount in parts {
+            let record = self
+                .sweep_erc20_part(
+                    provider,
+                    from_address_str,
+                    token_address,
+                    to_address,
+                    amount,
+                )
+                .await?;
+            let chain_name = self.chain.name.clone();
+            let keys = keys.clone();
+            self.db
+                .blocking(move |db| db.record_sweep(&chain_name, &keys, &record))
+                .await?;
+        }
+
+        self.complete_group(from_address_str, group).await
+    }
+
+    /// Distinct sweeps recorded against any deposit of the group.
+    async fn recorded_sweeps(&self, keys: &[String]) -> Result<Vec<SweepRecord>> {
+        let mut seen: HashSet<(String, u64)> = HashSet::new();
+        let mut out = Vec::new();
+        for key in keys {
+            let chain_name = self.chain.name.clone();
+            let key = key.clone();
+            let records = self
+                .db
+                .blocking(move |db| db.get_sweeps(&chain_name, &key))
+                .await?;
+            for record in records {
+                if seen.insert((record.sweep_tx_hash.clone(), record.sweep_log_index)) {
+                    out.push(record);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// One `transfer(target, amount)` call: fund gas, send, check the receipt,
+    /// and read the coordinate from the `Transfer` log it emitted.
+    async fn sweep_erc20_part<SP>(
+        &self,
+        provider: &SP,
+        from_address_str: &str,
+        token_address: Address,
+        to_address: Address,
+        amount: U256,
+    ) -> Result<SweepRecord>
+    where
+        SP: Provider<BoxTransport, alloy::network::Ethereum>,
+    {
+        let from_address = Address::from_str(from_address_str)?;
         let transfer_call = IERC20::transferCall {
             to: to_address,
             amount,
@@ -493,138 +627,134 @@ impl Sweeper {
 
         let pending_tx = provider.send_transaction(tx).await?;
         let receipt = pending_tx.get_receipt().await?;
-        let sweep_tx_hash = receipt.transaction_hash.to_string();
 
-        let registration_id = &deposit.account_id;
-        let swept = {
-            let chain_name = self.chain.name.clone();
-            let reg_id = registration_id.clone();
-            let token_address = deposit.token_address.clone();
-            self.db
-                .blocking(move |db| {
-                    db.mark_erc20_deposits_swept_for_account_token(
-                        &chain_name,
-                        &reg_id,
-                        &token_address,
-                    )
-                })
-                .await?
-        };
-
-        let keys: Vec<String> = swept.iter().map(|(k, _)| k.clone()).collect();
-        {
-            let chain_name = self.chain.name.clone();
-            let keys = keys.clone();
-            let sweep_tx_hash = sweep_tx_hash.clone();
-            self.db
-                .blocking(move |db| {
-                    db.set_sweep_tx_hash_for_keys(&chain_name, &keys, &sweep_tx_hash)
-                })
-                .await?;
+        // REQ-SW-5, INV-5: a reverted sweep is a failure, never a sweep.
+        if !receipt.inner.status() {
+            return Err(anyhow::anyhow!(
+                "sweep transaction reverted (receipt status 0): {:?}",
+                receipt.transaction_hash
+            ));
         }
 
-        let token_decimals = {
-            let chain_name = self.chain.name.clone();
-            let token_address = deposit.token_address.clone();
-            self.db
-                .blocking(move |db| db.get_token_metadata(&chain_name, &token_address))
-                .await?
-                .map(|(_, decimals, _)| decimals)
-        };
-
-        for (key, dep_amount) in &swept {
-            let webhook_id = format!("{}:{}", self.chain.name, key);
-            let webhook_info = Erc20WebhookInfo {
-                id: &webhook_id,
-                chain: &self.chain.name,
-                chain_id: self.chain.chain_id,
-                account_id: from_address_str,
-                registration_id,
-                deposit_key: key,
-                amount: dep_amount,
-                token_symbol: &deposit.token_symbol,
-                token_address: &deposit.token_address,
-                token_decimals,
-                sweep_tx_hash: &sweep_tx_hash,
-            };
-            if let Err(e) = self.enqueue_erc20_webhook(&webhook_info).await {
-                error!(
-                    "[{}] swept webhook enqueue failed for {key}: {e:?}",
-                    self.chain.name
-                );
-            }
-        }
-
-        Ok(())
+        sweep_record_from_receipt(&receipt, token_address, from_address, to_address)
     }
 
-    async fn enqueue_deposit_swept_webhook(
-        &self,
-        id: &str,
-        account_id: &str,
-        registration_id: &str,
-        tx_hash: &str,
-        amount: &str,
-        erc20_info: Option<&Erc20WebhookInfo<'_>>,
-    ) -> Result<()> {
+    /// Marks the group's deposits swept and enqueues one `deposit_swept` per
+    /// deposit, in one transaction (REQ-WH-7). Only reached once every part of
+    /// the group has succeeded.
+    async fn complete_group(&self, from_address_str: &str, group: &[Erc20Deposit]) -> Result<()> {
+        let first = &group[0];
+        let registration_id = &first.account_id;
         let webhook_url = {
-            let reg_id = registration_id.to_string();
+            let reg_id = registration_id.clone();
             self.db
                 .blocking(move |db| db.get_webhook_url(&reg_id))
                 .await?
         };
-        let Some(webhook_url) = webhook_url else {
-            return Ok(());
+        let token_decimals = {
+            let chain_name = self.chain.name.clone();
+            let token_address = first.token_address.clone();
+            let stored = self
+                .db
+                .blocking(move |db| db.get_token_metadata(&chain_name, &token_address))
+                .await?
+                .map(|(_, decimals, _)| decimals);
+            // The monitor reports an unreadable token as 18 decimals.
+            stored.or((first.token_symbol == "UNKNOWN").then_some(18))
         };
 
-        let payload = if let Some(info) = erc20_info {
-            let mut payload = serde_json::json!({
-                "id": info.id,
-                "chain": info.chain,
-                "chain_id": info.chain_id,
-                "event": "deposit_swept",
-                "account_id": info.account_id,
-                "registration_id": info.registration_id,
-                "original_tx_hash": info.deposit_key.split(':').next().unwrap_or(info.deposit_key),
-                "amount": info.amount,
-                "token_type": "erc20",
-                "token_symbol": info.token_symbol,
-                "token_address": info.token_address,
-                "sweep_tx_hash": info.sweep_tx_hash
-            });
-            if let Some(decimals) = info.token_decimals {
-                payload["token_decimals"] = serde_json::json!(decimals);
+        let mut settlements = Vec::with_capacity(group.len());
+        for deposit in group {
+            let sweeps = {
+                let chain_name = self.chain.name.clone();
+                let key = deposit.key.clone();
+                self.db
+                    .blocking(move |db| db.get_sweeps(&chain_name, &key))
+                    .await?
+            };
+            if sweeps.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "no sweep recorded for deposit {}",
+                    deposit.key
+                ));
             }
-            payload
-        } else {
-            serde_json::json!({
-                "id": id,
-                "chain": self.chain.name,
-                "chain_id": self.chain.chain_id,
-                "event": "deposit_swept",
-                "account_id": account_id,
-                "registration_id": registration_id,
-                "original_tx_hash": tx_hash,
-                "amount": amount,
-                "token_type": "native"
-            })
-        };
+            let outbox = webhook_url.as_ref().map(|webhook_url| {
+                let webhook_id = format!("{}:{}", self.chain.name, deposit.key);
+                OutboxEntry {
+                    id: webhook_id.clone(),
+                    event: "deposit_swept".to_string(),
+                    registration_id: registration_id.clone(),
+                    webhook_url: webhook_url.clone(),
+                    payload: self
+                        .erc20_swept_payload(
+                            &webhook_id,
+                            from_address_str,
+                            deposit,
+                            token_decimals,
+                            &sweeps,
+                        )
+                        .to_string(),
+                }
+            });
+            settlements.push(Erc20Settlement {
+                key: deposit.key.clone(),
+                outbox,
+            });
+        }
 
-        self.deliverer
-            .enqueue(&webhook_url, registration_id, payload)
-            .await
+        let enqueued = {
+            let chain_name = self.chain.name.clone();
+            self.db
+                .blocking(move |db| db.complete_erc20_sweep(&chain_name, &settlements))
+                .await?
+        };
+        if enqueued > 0 {
+            self.deliverer.notify_worker();
+        }
+        Ok(())
     }
 
-    async fn enqueue_erc20_webhook(&self, info: &Erc20WebhookInfo<'_>) -> Result<()> {
-        self.enqueue_deposit_swept_webhook(
-            info.id,
-            info.account_id,
-            info.registration_id,
-            info.deposit_key,
-            info.amount,
-            Some(info),
-        )
-        .await
+    /// `deposit_swept` for a token deposit (REQ-WH-3, REQ-WH-4, REQ-WH-9).
+    fn erc20_swept_payload(
+        &self,
+        id: &str,
+        account_id: &str,
+        deposit: &Erc20Deposit,
+        token_decimals: Option<u8>,
+        sweeps: &[SweepRecord],
+    ) -> serde_json::Value {
+        let entries: Vec<serde_json::Value> = sweeps
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "sweep_tx_hash": s.sweep_tx_hash,
+                    "sweep_block_number": s.sweep_block_number,
+                    "sweep_block_hash": s.sweep_block_hash,
+                    "sweep_log_index": s.sweep_log_index,
+                    "sweep_amount": s.sweep_amount,
+                })
+            })
+            .collect();
+        let mut payload = serde_json::json!({
+            "id": id,
+            "chain": self.chain.name,
+            "chain_id": self.chain.chain_id,
+            "event": "deposit_swept",
+            "account_id": account_id,
+            "registration_id": deposit.account_id,
+            "original_tx_hash": deposit.key.split(':').next().unwrap_or(&deposit.key),
+            "from_address": deposit.from_address,
+            "amount": deposit.amount,
+            "token_type": "erc20",
+            "token_symbol": deposit.token_symbol,
+            "token_address": deposit.token_address,
+            "sweep_tx_hash": sweeps[0].sweep_tx_hash,
+            "sweeps": entries,
+        });
+        if let Some(decimals) = token_decimals {
+            payload["token_decimals"] = serde_json::json!(decimals);
+        }
+        payload
     }
 }
 
@@ -652,6 +782,61 @@ async fn get_token_balance(
     let contract = IERC20::new(token_address, provider);
     let balance = contract.balanceOf(owner_address).call().await?._0;
     Ok(balance)
+}
+
+/// Finds the token's `Transfer` from the deposit address to the target in a
+/// successful sweep receipt and returns the sweep coordinate (REQ-SW-10). The
+/// log index is the log's block-level index from the receipt, not its position
+/// within the transaction. A receipt with no such log is an error: a sweep
+/// whose coordinate cannot be shown is not reported.
+fn sweep_record_from_receipt(
+    receipt: &TransactionReceipt,
+    token: Address,
+    from: Address,
+    to: Address,
+) -> Result<SweepRecord> {
+    let signature = keccak256("Transfer(address,address,uint256)".as_bytes());
+    let topic_address = |topic: &alloy::primitives::B256| Address::from_slice(&topic[12..]);
+    let log = receipt
+        .inner
+        .logs()
+        .iter()
+        .find(|log| {
+            let topics = log.topics();
+            log.address() == token
+                && topics.len() == 3
+                && topics[0] == signature
+                && topic_address(&topics[1]) == from
+                && topic_address(&topics[2]) == to
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "sweep receipt {:?} has no Transfer log from the deposit address to the target",
+                receipt.transaction_hash
+            )
+        })?;
+    let log_index = log
+        .log_index
+        .ok_or_else(|| anyhow::anyhow!("sweep Transfer log carries no log index"))?;
+    let data = &log.data().data;
+    let amount = if data.len() >= 32 {
+        U256::from_be_slice(&data[..32])
+    } else {
+        U256::from_be_slice(data)
+    };
+    let block_number = receipt
+        .block_number
+        .ok_or_else(|| anyhow::anyhow!("sweep receipt carries no block number"))?;
+    let block_hash = receipt
+        .block_hash
+        .ok_or_else(|| anyhow::anyhow!("sweep receipt carries no block hash"))?;
+    Ok(SweepRecord {
+        sweep_tx_hash: receipt.transaction_hash.to_string(),
+        sweep_block_number: block_number,
+        sweep_block_hash: block_hash.to_string(),
+        sweep_log_index: log_index,
+        sweep_amount: amount.to_string(),
+    })
 }
 
 #[cfg(test)]

@@ -79,6 +79,9 @@ impl WebhookDeliverer {
     }
 
     /// Hot path: persist pending delivery and wake the worker. No HTTP.
+    /// Detection and sweeps now write their outbox rows in the state change's
+    /// own transaction (REQ-WH-7); this is for webhooks with no state change.
+    #[allow(dead_code)]
     pub async fn enqueue(
         &self,
         webhook_url: &str,

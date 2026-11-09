@@ -294,7 +294,7 @@ fn test_sweeper_multiple_deposits() {
 // ========== Verify Transfer Tests ==========
 
 // Helper matcher for body contains
-fn body_json_contains(substring: &str) -> impl wiremock::Match {
+pub(crate) fn body_json_contains(substring: &str) -> impl wiremock::Match {
     BodyContains(substring.to_string())
 }
 
@@ -328,7 +328,7 @@ fn field_hex(field: &str, value: u64) -> String {
     format!("\"{field}\":\"0x{value:x}\"")
 }
 
-fn empty_block_rpc_response() -> serde_json::Value {
+pub(crate) fn empty_block_rpc_response() -> serde_json::Value {
     let block_hash = "0x000000000000000000000000000000000000000000000000000000000000000a";
     let parent_hash = "0x0000000000000000000000000000000000000000000000000000000000000009";
     let root_hash = "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -1230,7 +1230,7 @@ async fn test_erc20_sweep_emits_per_deposit_webhooks() {
                 "cumulativeGasUsed": "0x186a0",
                 "gasUsed": "0x186a0",
                 "contractAddress": null,
-                "logs": [],
+                "logs": [test_support::transfer_log_json(token_address, &addr, TEST_TREASURY, 3000000030, 4, sweep_tx_hash, 11, 1)],
                 "status": "0x1",
                 "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
                 "type": "0x0",
@@ -1453,7 +1453,7 @@ async fn test_erc20_sweep_uses_token_treasury_override() {
                 "cumulativeGasUsed": "0x186a0",
                 "gasUsed": "0x186a0",
                 "contractAddress": null,
-                "logs": [],
+                "logs": [test_support::transfer_log_json(token_address, &addr, override_treasury, 3000000000, 4, sweep_tx_hash, 11, 1)],
                 "status": "0x1",
                 "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
                 "type": "0x0",
@@ -1659,7 +1659,7 @@ async fn test_erc20_sweep_webhook_best_effort_on_failure() {
                 "cumulativeGasUsed": "0x186a0",
                 "gasUsed": "0x186a0",
                 "contractAddress": null,
-                "logs": [],
+                "logs": [test_support::transfer_log_json(token_address, &addr, TEST_TREASURY, 3000000030, 4, sweep_tx_hash, 11, 1)],
                 "status": "0x1",
                 "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
                 "type": "0x0",
@@ -1679,6 +1679,7 @@ async fn test_erc20_sweep_webhook_best_effort_on_failure() {
         .unwrap(),
     );
     let deliverer = test_webhook_deliverer(db.clone());
+    let deliverer_for_wake = Arc::clone(&deliverer);
     let webhook_worker = WebhookRetryService::new(Arc::clone(&deliverer));
     tokio::spawn(async move {
         webhook_worker.run().await;
@@ -1736,6 +1737,10 @@ async fn test_erc20_sweep_webhook_best_effort_on_failure() {
             both_delivered = true;
             break;
         }
+        // The 503'd row is retried on the next worker pass. Both rows now land
+        // in one transaction (REQ-WH-7), so there is no second enqueue to
+        // trigger that pass; wake the worker as the poll interval would.
+        deliverer_for_wake.notify_worker();
         sleep(Duration::from_millis(100)).await;
     }
 
@@ -2928,7 +2933,11 @@ async fn test_block_number_unknown_chain() {
 // Builds a native-transfer block RPC response by cloning the shared empty-block
 // skeleton (so the many fixed-size hex fields like logsBloom stay valid) and
 // overriding only the block number and transaction list.
-fn native_tx_block_response(block_num: u64, to_addr: &str, tx_hash: &str) -> serde_json::Value {
+pub(crate) fn native_tx_block_response(
+    block_num: u64,
+    to_addr: &str,
+    tx_hash: &str,
+) -> serde_json::Value {
     let mut resp = empty_block_rpc_response();
     let block_hex = format!("0x{block_num:x}");
     resp["result"]["number"] = json!(block_hex);

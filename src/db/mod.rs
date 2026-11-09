@@ -68,6 +68,62 @@ pub struct Erc20Deposit {
     pub amount: String,
     pub token_address: String,
     pub token_symbol: String,
+    /// Sender of the inbound transfer (REQ-WH-9). `None` for rows recorded
+    /// before the sender was stored.
+    pub from_address: Option<String>,
+}
+
+/// A native deposit to record, with its sender (REQ-WH-9).
+#[derive(Clone, Debug)]
+pub struct NewNativeDeposit {
+    pub chain: String,
+    pub tx_hash: String,
+    pub account_id: String,
+    pub amount: String,
+    pub from_address: Option<String>,
+}
+
+/// A token deposit to record, with its sender (REQ-WH-9).
+#[derive(Clone, Debug)]
+pub struct NewErc20Deposit {
+    pub chain: String,
+    pub tx_hash: String,
+    pub log_index: u64,
+    pub account_id: String,
+    pub amount: String,
+    pub token_address: String,
+    pub token_symbol: String,
+    pub from_address: Option<String>,
+}
+
+/// One outbox row (`webhook_deliveries`), written in the same transaction as
+/// the state change it reports (REQ-WH-7).
+#[derive(Clone, Debug)]
+pub struct OutboxEntry {
+    pub id: String,
+    pub event: String,
+    pub registration_id: String,
+    pub webhook_url: String,
+    pub payload: String,
+}
+
+/// The sweep coordinate (REQ-SW-10): where the `Transfer` into the target sits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SweepRecord {
+    pub sweep_tx_hash: String,
+    pub sweep_block_number: u64,
+    pub sweep_block_hash: String,
+    /// Block-level log index of the `Transfer` into the target, from the receipt.
+    pub sweep_log_index: u64,
+    pub sweep_amount: String,
+}
+
+/// A token deposit to mark swept, with the `deposit_swept` outbox row that
+/// goes with it (none when the registration has no webhook URL).
+#[derive(Clone, Debug)]
+pub struct Erc20Settlement {
+    pub key: String,
+    pub outbox: Option<OutboxEntry>,
 }
 
 /// Typed errors for the write-queue fast paths, so HTTP layers can map
@@ -452,6 +508,101 @@ impl Db {
         match self.inner.as_ref() {
             DbInner::Sqlite(s) => s.get_sweep_failure_count(chain, local_key),
             DbInner::Postgres(p) => p.get_sweep_failure_count(chain, local_key),
+        }
+    }
+
+    /// Records a native deposit and, when it is new, its `deposit_detected`
+    /// outbox row, in one transaction (REQ-WH-7). Returns whether it was new.
+    pub fn record_native_deposit_atomic(
+        &self,
+        deposit: &NewNativeDeposit,
+        outbox: Option<&OutboxEntry>,
+    ) -> Result<bool> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.record_native_deposit_atomic(deposit, outbox),
+            DbInner::Postgres(p) => p.record_native_deposit_atomic(deposit, outbox),
+        }
+    }
+
+    /// Records a token deposit and, when it is new, its `deposit_detected`
+    /// outbox row, in one transaction (REQ-WH-7). Returns whether it was new.
+    pub fn record_erc20_deposit_atomic(
+        &self,
+        deposit: &NewErc20Deposit,
+        outbox: Option<&OutboxEntry>,
+    ) -> Result<bool> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.record_erc20_deposit_atomic(deposit, outbox),
+            DbInner::Postgres(p) => p.record_erc20_deposit_atomic(deposit, outbox),
+        }
+    }
+
+    /// Marks a native deposit swept and enqueues its `deposit_swept` row in one
+    /// transaction (REQ-WH-7). Returns whether an outbox row was written.
+    pub fn complete_native_sweep(
+        &self,
+        chain: &str,
+        tx_hash: &str,
+        outbox: Option<&OutboxEntry>,
+    ) -> Result<bool> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.complete_native_sweep(chain, tx_hash, outbox),
+            DbInner::Postgres(p) => p.complete_native_sweep(chain, tx_hash, outbox),
+        }
+    }
+
+    /// Marks token deposits swept and enqueues their `deposit_swept` rows in
+    /// one transaction (REQ-WH-7). Returns how many outbox rows were written.
+    pub fn complete_erc20_sweep(
+        &self,
+        chain: &str,
+        settlements: &[Erc20Settlement],
+    ) -> Result<usize> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.complete_erc20_sweep(chain, settlements),
+            DbInner::Postgres(p) => p.complete_erc20_sweep(chain, settlements),
+        }
+    }
+
+    /// Stores one sweep against each of the given deposit keys (REQ-SW-10).
+    /// Idempotent per `(deposit, sweep tx, log index)`.
+    pub fn record_sweep(&self, chain: &str, keys: &[String], record: &SweepRecord) -> Result<()> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.record_sweep(chain, keys, record),
+            DbInner::Postgres(p) => p.record_sweep(chain, keys, record),
+        }
+    }
+
+    /// The sweeps recorded against a deposit, oldest first.
+    pub fn get_sweeps(&self, chain: &str, local_key: &str) -> Result<Vec<SweepRecord>> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.get_sweeps(chain, local_key),
+            DbInner::Postgres(p) => p.get_sweeps(chain, local_key),
+        }
+    }
+
+    /// Sender recorded for a native deposit (`None` for older rows).
+    pub fn get_deposit_from_address(&self, chain: &str, tx_hash: &str) -> Result<Option<String>> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.get_deposit_from_address(chain, tx_hash),
+            DbInner::Postgres(p) => p.get_deposit_from_address(chain, tx_hash),
+        }
+    }
+
+    /// Marks exactly these token deposits swept, with no sweep transaction (the
+    /// bounded zero-balance rule, REQ-SW-3).
+    pub fn mark_erc20_deposits_swept_for_keys(&self, chain: &str, keys: &[String]) -> Result<()> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.mark_erc20_deposits_swept_for_keys(chain, keys),
+            DbInner::Postgres(p) => p.mark_erc20_deposits_swept_for_keys(chain, keys),
+        }
+    }
+
+    /// Marks exactly these token deposits failed (REQ-SW-4).
+    pub fn mark_erc20_deposits_failed_for_keys(&self, chain: &str, keys: &[String]) -> Result<()> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.mark_erc20_deposits_failed_for_keys(chain, keys),
+            DbInner::Postgres(p) => p.mark_erc20_deposits_failed_for_keys(chain, keys),
         }
     }
 

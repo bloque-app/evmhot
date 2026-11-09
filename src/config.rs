@@ -27,6 +27,102 @@ impl MinDepositSettings {
     }
 }
 
+/// What a sweep target does with a token (REQ-SW-6).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetKind {
+    /// Token transfer to an address.
+    Transfer,
+    /// No sweep: deposits are detected and notified, and stay where they are
+    /// until the target's kind changes (amendment 0003).
+    Hold,
+}
+
+/// A `[chains.token_targets."0x..."]` table, as written.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenTargetRaw {
+    pub kind: TargetKind,
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Minimum per sweep, in the token's minor units (REQ-SW-7).
+    #[serde(default)]
+    pub min: Option<String>,
+    /// Maximum per sweep, in the token's minor units (REQ-SW-7).
+    #[serde(default)]
+    pub max: Option<String>,
+    /// This address admits only this token (REQ-SW-8).
+    #[serde(default)]
+    pub admits_only: bool,
+    /// Each sweep needs one refund address: never mix senders (REQ-SW-12).
+    #[serde(default)]
+    pub per_sender: bool,
+}
+
+/// A validated sweep target for one token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SweepTarget {
+    pub kind: TargetKind,
+    /// Lowercased `0x` address. `None` only for `Hold`.
+    pub address: Option<String>,
+    pub min: Option<U256>,
+    pub max: Option<U256>,
+    pub admits_only: bool,
+    pub per_sender: bool,
+}
+
+impl SweepTarget {
+    fn plain(address: String) -> Self {
+        Self {
+            kind: TargetKind::Transfer,
+            address: Some(address),
+            min: None,
+            max: None,
+            admits_only: false,
+            per_sender: false,
+        }
+    }
+}
+
+/// Splits `amount` into sweeps that respect a target's bounds (REQ-SW-7).
+///
+/// - Below `min`: no sweep (the amount waits).
+/// - Above `max`: parts of `max`, then the remainder.
+/// - A remainder under `min` is topped up from the previous part when both can
+///   stay within bounds; otherwise it stays in the deposit address, because no
+///   sweep may fall outside the target's bounds.
+pub fn plan_sweep_parts(amount: U256, min: Option<U256>, max: Option<U256>) -> Vec<U256> {
+    let min = min.unwrap_or(U256::ZERO);
+    if amount.is_zero() || amount < min {
+        return Vec::new();
+    }
+    let Some(max) = max.filter(|m| !m.is_zero()) else {
+        return vec![amount];
+    };
+    if amount <= max {
+        return vec![amount];
+    }
+    let full = amount / max;
+    let rem = amount % max;
+    let mut parts: Vec<U256> = Vec::new();
+    let mut i = U256::ZERO;
+    while i < full {
+        parts.push(max);
+        i += U256::from(1u8);
+    }
+    if !rem.is_zero() {
+        if rem >= min {
+            parts.push(rem);
+        } else if max + rem >= min + min {
+            // Both parts stay within [min, max]: rem < min gives prev < max.
+            let last = parts.len() - 1;
+            parts[last] = max + rem - min;
+            parts.push(min);
+        }
+    }
+    parts
+}
+
 /// Per-chain configuration loaded from `chains.toml`.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ChainConfigRaw {
@@ -50,6 +146,11 @@ pub struct ChainConfigRaw {
     /// (and native ETH) use `treasury_address`.
     #[serde(default)]
     pub token_treasuries: HashMap<String, String>,
+    /// Map of token contract address -> sweep target table (kind, address,
+    /// bounds, admission, per-sender). A token may appear here or in
+    /// `token_treasuries`, not both.
+    #[serde(default)]
+    pub token_targets: HashMap<String, TokenTargetRaw>,
     #[serde(default = "default_block_offset")]
     pub block_offset_from_head: u64,
     #[serde(default = "default_poll_interval")]
@@ -123,6 +224,8 @@ pub struct ChainConfig {
     /// Lowercased token contract → lowercased sweep destination. Empty means
     /// every ERC20 uses `treasury_address`.
     pub token_treasuries: HashMap<String, String>,
+    /// Lowercased token contract -> table-form sweep target.
+    pub token_targets: HashMap<String, SweepTarget>,
 }
 
 impl ChainConfig {
@@ -143,6 +246,16 @@ impl ChainConfig {
             .unwrap_or(self.treasury_address.as_str())
     }
 
+    /// The sweep target for a token: its `token_targets` table, else its
+    /// `token_treasuries` address, else the network default (REQ-SW-2, REQ-SW-6).
+    pub fn target_for_token(&self, token_address: &str) -> SweepTarget {
+        let token = normalize_token_address(token_address);
+        if let Some(target) = self.token_targets.get(&token) {
+            return target.clone();
+        }
+        SweepTarget::plain(normalize_token_address(self.treasury_for_token(&token)))
+    }
+
     /// Stable lines describing native + per-token sweep destinations, for boot logs.
     pub fn sweep_route_log_lines(&self) -> Vec<String> {
         let mut lines = Vec::with_capacity(1 + self.allowed_token_addresses.len());
@@ -150,6 +263,29 @@ impl ChainConfig {
         let mut tokens: Vec<&String> = self.allowed_token_addresses.iter().collect();
         tokens.sort();
         for token in tokens {
+            if let Some(target) = self.token_targets.get(token) {
+                let mut line = match (&target.kind, &target.address) {
+                    (TargetKind::Hold, _) => format!("{token} -> hold (token_targets)"),
+                    (TargetKind::Transfer, address) => format!(
+                        "{token} -> {} (token_targets)",
+                        address.as_deref().unwrap_or("")
+                    ),
+                };
+                if let Some(min) = target.min {
+                    line.push_str(&format!(" min={min}"));
+                }
+                if let Some(max) = target.max {
+                    line.push_str(&format!(" max={max}"));
+                }
+                if target.admits_only {
+                    line.push_str(" admits_only");
+                }
+                if target.per_sender {
+                    line.push_str(" per_sender");
+                }
+                lines.push(line);
+                continue;
+            }
             let dest = self.treasury_for_token(token);
             let via = if self.token_treasuries.contains_key(token) {
                 "token_treasuries"
@@ -314,6 +450,79 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
             token_treasuries.insert(token_norm, normalize_token_address(dest_trimmed));
         }
 
+        let mut token_targets = HashMap::new();
+        for (token, table) in &raw.token_targets {
+            let token_norm = normalize_token_address(token);
+            let field = format!("Chain '{}': token_targets[{}]", raw.name, token);
+            if !allowed_token_addresses.contains(&token_norm) {
+                bail!("{field} is not in allowed_token_addresses");
+            }
+            if token_treasuries.contains_key(&token_norm) {
+                bail!("{field} is also listed in token_treasuries; use one or the other");
+            }
+            let min = table
+                .min
+                .as_deref()
+                .map(|v| parse_u256_str(v, &format!("{field}.min")))
+                .transpose()?;
+            let max = table
+                .max
+                .as_deref()
+                .map(|v| parse_u256_str(v, &format!("{field}.max")))
+                .transpose()?;
+            if max == Some(U256::ZERO) {
+                bail!("{field}.max must be greater than zero");
+            }
+            if let (Some(min), Some(max)) = (min, max) {
+                if min > max {
+                    bail!("{field}: min ({min}) is greater than max ({max})");
+                }
+            }
+            let address = match table.kind {
+                TargetKind::Transfer => {
+                    let Some(address) = table.address.as_deref() else {
+                        bail!("{field}: kind \"transfer\" requires an address");
+                    };
+                    let address = address.trim();
+                    Address::from_str(address)
+                        .with_context(|| format!("{field}: invalid address: {address}"))?;
+                    Some(normalize_token_address(address))
+                }
+                TargetKind::Hold => {
+                    if table.address.is_some()
+                        || table.min.is_some()
+                        || table.max.is_some()
+                        || table.admits_only
+                        || table.per_sender
+                    {
+                        bail!(
+                            "{field}: kind \"hold\" takes no address, bounds or flags; \
+                             set a transfer target to release held deposits"
+                        );
+                    }
+                    None
+                }
+            };
+            token_targets.insert(
+                token_norm,
+                SweepTarget {
+                    kind: table.kind,
+                    address,
+                    min,
+                    max,
+                    admits_only: table.admits_only,
+                    per_sender: table.per_sender,
+                },
+            );
+        }
+        check_admits_only(
+            &raw.name,
+            &raw.treasury_address,
+            &allowed_token_addresses,
+            &token_treasuries,
+            &token_targets,
+        )?;
+
         chains.push(ChainConfig {
             name: raw.name,
             chain_id: raw.chain_id,
@@ -334,10 +543,64 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
             },
             allowed_token_addresses,
             token_treasuries,
+            token_targets,
         });
     }
 
     Ok(chains)
+}
+
+/// REQ-SW-8: a target that admits only one token must not receive anything
+/// else. The native coin and every token without a target of its own go to the
+/// network default target, so that address cannot be an `admits_only` address.
+fn check_admits_only(
+    chain: &str,
+    default_target: &str,
+    allowed_tokens: &HashSet<String>,
+    token_treasuries: &HashMap<String, String>,
+    token_targets: &HashMap<String, SweepTarget>,
+) -> Result<()> {
+    let default_norm = normalize_token_address(default_target);
+    // Where every token goes (None = held, goes nowhere).
+    let route = |token: &str| -> Option<String> {
+        if let Some(target) = token_targets.get(token) {
+            return target.address.clone();
+        }
+        Some(
+            token_treasuries
+                .get(token)
+                .cloned()
+                .unwrap_or_else(|| default_norm.clone()),
+        )
+    };
+    let mut guarded: Vec<(&String, &SweepTarget)> = token_targets
+        .iter()
+        .filter(|(_, t)| t.admits_only)
+        .collect();
+    guarded.sort_by(|a, b| a.0.cmp(b.0));
+    for (token, target) in guarded {
+        let Some(address) = target.address.as_deref() else {
+            continue;
+        };
+        if default_norm == address {
+            bail!(
+                "Chain '{chain}': token_targets[{token}] admits only that token, but address \
+                 {address} is also the network default target, which the native coin and every \
+                 token without a target of its own use"
+            );
+        }
+        let mut others: Vec<&String> = allowed_tokens.iter().filter(|t| *t != token).collect();
+        others.sort();
+        for other in others {
+            if route(other).as_deref() == Some(address) {
+                bail!(
+                    "Chain '{chain}': token_targets[{token}] admits only that token, but token \
+                     {other} is also routed to {address}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_chain_name(name: &str) -> Result<()> {

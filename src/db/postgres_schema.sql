@@ -95,3 +95,22 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending
   ON webhook_deliveries (status, attempt_count, updated_at);
+
+-- F-002a (mirrors migrations/V4__sweep_coordinates_and_senders.sql). CREATE TABLE
+-- IF NOT EXISTS never adds columns to a table that already exists, so the new
+-- nullable columns are added explicitly.
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS from_address TEXT;
+ALTER TABLE erc20_deposits ADD COLUMN IF NOT EXISTS from_address TEXT;
+
+CREATE TABLE IF NOT EXISTS sweeps (
+  seq BIGSERIAL PRIMARY KEY,
+  chain TEXT NOT NULL,
+  tx_hash TEXT NOT NULL,
+  log_index BIGINT NOT NULL DEFAULT 0,
+  sweep_tx_hash TEXT NOT NULL,
+  sweep_block_number BIGINT NOT NULL,
+  sweep_block_hash TEXT NOT NULL,
+  sweep_log_index BIGINT NOT NULL,
+  sweep_amount TEXT NOT NULL,
+  UNIQUE (chain, tx_hash, log_index, sweep_tx_hash, sweep_log_index)
+);

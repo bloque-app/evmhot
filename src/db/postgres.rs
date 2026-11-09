@@ -7,7 +7,10 @@
 //! The `next_index` counter (BIP44 derivation index allocation) is the one
 //! place that needs an explicit atomicity argument; see
 //! [`PostgresBackend::register_account_auto`].
-use super::{DepositQueueCounts, Erc20Deposit, WebhookDeliveryRecord, WriteQueueError};
+use super::{
+    DepositQueueCounts, Erc20Deposit, Erc20Settlement, NewErc20Deposit, NewNativeDeposit,
+    OutboxEntry, SweepRecord, WebhookDeliveryRecord, WriteQueueError,
+};
 use anyhow::{anyhow, Context, Result};
 use postgres::{Client, NoTls, Row};
 use postgres_openssl::MakeTlsConnector;
@@ -311,8 +314,9 @@ impl PostgresBackend {
             &[],
         )?;
         let next_index: i64 = next_index_row.get(0);
-        let next_index_u32 = u32::try_from(next_index)
-            .map_err(|_| anyhow!("next_index counter overflowed u32 (REQ-RG-5)"))?;
+        let next_index_u32 = u32::try_from(next_index).map_err(|_| {
+            anyhow!("registration refused: derivation index space is exhausted (REQ-RG-5)")
+        })?;
 
         let address = derive_address(next_index_u32)?;
 
@@ -505,7 +509,7 @@ impl PostgresBackend {
     pub fn get_detected_erc20_deposits(&self, chain: &str) -> Result<Vec<Erc20Deposit>> {
         let mut guard = self.conn()?;
         let rows = guard.client().query(
-            "SELECT tx_hash, log_index, account_id, amount, token_address, token_symbol
+            "SELECT tx_hash, log_index, account_id, amount, token_address, token_symbol, from_address
              FROM erc20_deposits WHERE chain = $1 AND status = 'detected'",
             &[&chain],
         )?;
@@ -520,6 +524,7 @@ impl PostgresBackend {
                     amount: row.get(3),
                     token_address: row.get(4),
                     token_symbol: row.get(5),
+                    from_address: row.get(6),
                 }
             })
             .collect())
@@ -755,48 +760,215 @@ impl PostgresBackend {
         webhook_url: &str,
         payload: &str,
     ) -> Result<bool> {
+        let entry = OutboxEntry {
+            id: id.to_string(),
+            event: event.to_string(),
+            registration_id: registration_id.to_string(),
+            webhook_url: webhook_url.to_string(),
+            payload: payload.to_string(),
+        };
         let mut guard = self.conn()?;
-        let client = guard.client();
-        let mut tx = client.transaction()?;
-        let now = now_unix_secs();
-
-        let existing: Option<String> = tx
-            .query_opt(
-                "SELECT status FROM webhook_deliveries WHERE id = $1 AND event = $2",
-                &[&id, &event],
-            )?
-            .map(|r| r.get(0));
-
-        if existing.as_deref() == Some("delivered") {
-            tx.commit()?;
-            return Ok(false);
-        }
-
-        if existing.is_none() {
-            tx.execute(
-                "INSERT INTO webhook_deliveries
-                 (id, event, registration_id, webhook_url, payload, status, attempt_count,
-                  last_http_status, last_error, leased_until, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, 'pending', 0, NULL, NULL, NULL, $6)",
-                &[&id, &event, &registration_id, &webhook_url, &payload, &now],
-            )?;
-            tx.commit()?;
-            return Ok(true);
-        }
-
-        if existing.as_deref() == Some("failed") {
-            tx.commit()?;
-            return Ok(false);
-        }
-
-        tx.execute(
-            "UPDATE webhook_deliveries
-             SET webhook_url = $3, payload = $4, updated_at = $5
-             WHERE id = $1 AND event = $2 AND status = 'pending'",
-            &[&id, &event, &webhook_url, &payload, &now],
-        )?;
+        let mut tx = guard.client().transaction()?;
+        let notify = upsert_outbox(&mut tx, &entry)?;
         tx.commit()?;
-        Ok(true)
+        Ok(notify)
+    }
+
+    pub fn record_native_deposit_atomic(
+        &self,
+        deposit: &NewNativeDeposit,
+        outbox: Option<&OutboxEntry>,
+    ) -> Result<bool> {
+        let mut guard = self.conn()?;
+        let mut tx = guard.client().transaction()?;
+        let changes = tx.execute(
+            "INSERT INTO deposits (chain, tx_hash, account_id, amount, status, from_address)
+             VALUES ($1, $2, $3, $4, 'detected', $5)
+             ON CONFLICT (chain, tx_hash) DO NOTHING",
+            &[
+                &deposit.chain,
+                &deposit.tx_hash,
+                &deposit.account_id,
+                &deposit.amount,
+                &deposit.from_address,
+            ],
+        )?;
+        let is_new = changes == 1;
+        if is_new {
+            if let Some(entry) = outbox {
+                upsert_outbox(&mut tx, entry)?;
+            }
+        }
+        tx.commit()?;
+        Ok(is_new)
+    }
+
+    pub fn record_erc20_deposit_atomic(
+        &self,
+        deposit: &NewErc20Deposit,
+        outbox: Option<&OutboxEntry>,
+    ) -> Result<bool> {
+        let mut guard = self.conn()?;
+        let mut tx = guard.client().transaction()?;
+        let changes = tx.execute(
+            "INSERT INTO erc20_deposits
+             (chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status, from_address)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'detected', $8)
+             ON CONFLICT (chain, tx_hash, log_index) DO NOTHING",
+            &[
+                &deposit.chain,
+                &deposit.tx_hash,
+                &(deposit.log_index as i64),
+                &deposit.account_id,
+                &deposit.amount,
+                &deposit.token_address,
+                &deposit.token_symbol,
+                &deposit.from_address,
+            ],
+        )?;
+        let is_new = changes == 1;
+        if is_new {
+            if let Some(entry) = outbox {
+                upsert_outbox(&mut tx, entry)?;
+            }
+        }
+        tx.commit()?;
+        Ok(is_new)
+    }
+
+    pub fn complete_native_sweep(
+        &self,
+        chain: &str,
+        tx_hash: &str,
+        outbox: Option<&OutboxEntry>,
+    ) -> Result<bool> {
+        let mut guard = self.conn()?;
+        let mut tx = guard.client().transaction()?;
+        tx.execute(
+            "UPDATE deposits SET status = 'swept' WHERE chain = $1 AND tx_hash = $2",
+            &[&chain, &tx_hash],
+        )?;
+        let enqueued = match outbox {
+            Some(entry) => upsert_outbox(&mut tx, entry)?,
+            None => false,
+        };
+        tx.commit()?;
+        Ok(enqueued)
+    }
+
+    pub fn complete_erc20_sweep(
+        &self,
+        chain: &str,
+        settlements: &[Erc20Settlement],
+    ) -> Result<usize> {
+        let mut guard = self.conn()?;
+        let mut tx = guard.client().transaction()?;
+        let mut enqueued = 0;
+        for settlement in settlements {
+            let (tx_hash, log_index) = parse_local_key(&settlement.key)?;
+            tx.execute(
+                "UPDATE erc20_deposits SET status = 'swept'
+                 WHERE chain = $1 AND tx_hash = $2 AND log_index = $3",
+                &[&chain, &tx_hash, &log_index],
+            )?;
+            if let Some(entry) = &settlement.outbox {
+                if upsert_outbox(&mut tx, entry)? {
+                    enqueued += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(enqueued)
+    }
+
+    pub fn record_sweep(&self, chain: &str, keys: &[String], record: &SweepRecord) -> Result<()> {
+        let mut guard = self.conn()?;
+        let mut tx = guard.client().transaction()?;
+        for key in keys {
+            let (tx_hash, log_index) = parse_local_key(key)?;
+            tx.execute(
+                "INSERT INTO sweeps
+                 (chain, tx_hash, log_index, sweep_tx_hash, sweep_block_number,
+                  sweep_block_hash, sweep_log_index, sweep_amount)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT DO NOTHING",
+                &[
+                    &chain,
+                    &tx_hash,
+                    &log_index,
+                    &record.sweep_tx_hash,
+                    &(record.sweep_block_number as i64),
+                    &record.sweep_block_hash,
+                    &(record.sweep_log_index as i64),
+                    &record.sweep_amount,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_sweeps(&self, chain: &str, local_key: &str) -> Result<Vec<SweepRecord>> {
+        let (tx_hash, log_index) = parse_local_key(local_key)?;
+        let mut guard = self.conn()?;
+        let rows = guard.client().query(
+            "SELECT sweep_tx_hash, sweep_block_number, sweep_block_hash, sweep_log_index, sweep_amount
+             FROM sweeps WHERE chain = $1 AND tx_hash = $2 AND log_index = $3 ORDER BY seq",
+            &[&chain, &tx_hash, &log_index],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let block_number: i64 = r.get(1);
+                let log_index: i64 = r.get(3);
+                SweepRecord {
+                    sweep_tx_hash: r.get(0),
+                    sweep_block_number: block_number as u64,
+                    sweep_block_hash: r.get(2),
+                    sweep_log_index: log_index as u64,
+                    sweep_amount: r.get(4),
+                }
+            })
+            .collect())
+    }
+
+    pub fn get_deposit_from_address(&self, chain: &str, tx_hash: &str) -> Result<Option<String>> {
+        let mut guard = self.conn()?;
+        let row = guard.client().query_opt(
+            "SELECT from_address FROM deposits WHERE chain = $1 AND tx_hash = $2",
+            &[&chain, &tx_hash],
+        )?;
+        Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
+    }
+
+    pub fn mark_erc20_deposits_swept_for_keys(&self, chain: &str, keys: &[String]) -> Result<()> {
+        let mut guard = self.conn()?;
+        let mut tx = guard.client().transaction()?;
+        for key in keys {
+            let (tx_hash, log_index) = parse_local_key(key)?;
+            tx.execute(
+                "UPDATE erc20_deposits SET status = 'swept'
+                 WHERE chain = $1 AND tx_hash = $2 AND log_index = $3 AND status = 'detected'",
+                &[&chain, &tx_hash, &log_index],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_erc20_deposits_failed_for_keys(&self, chain: &str, keys: &[String]) -> Result<()> {
+        let mut guard = self.conn()?;
+        let mut tx = guard.client().transaction()?;
+        for key in keys {
+            let (tx_hash, log_index) = parse_local_key(key)?;
+            tx.execute(
+                "UPDATE erc20_deposits SET status = 'failed'
+                 WHERE chain = $1 AND tx_hash = $2 AND log_index = $3 AND status = 'detected'",
+                &[&chain, &tx_hash, &log_index],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn claim_webhook_delivery(
@@ -901,6 +1073,58 @@ impl PostgresBackend {
         )?;
         Ok(changes == 1)
     }
+}
+
+/// Inserts or refreshes a pending outbox row inside `tx`. Returns true when
+/// the worker should be notified.
+fn upsert_outbox(tx: &mut postgres::Transaction<'_>, entry: &OutboxEntry) -> Result<bool> {
+    let now = now_unix_secs();
+    let existing: Option<String> = tx
+        .query_opt(
+            "SELECT status FROM webhook_deliveries WHERE id = $1 AND event = $2",
+            &[&entry.id, &entry.event],
+        )?
+        .map(|r| r.get(0));
+
+    if existing.as_deref() == Some("delivered") {
+        return Ok(false);
+    }
+
+    if existing.is_none() {
+        tx.execute(
+            "INSERT INTO webhook_deliveries
+             (id, event, registration_id, webhook_url, payload, status, attempt_count,
+              last_http_status, last_error, leased_until, updated_at)
+             VALUES ($1, $2, $3, $4, $5, 'pending', 0, NULL, NULL, NULL, $6)",
+            &[
+                &entry.id,
+                &entry.event,
+                &entry.registration_id,
+                &entry.webhook_url,
+                &entry.payload,
+                &now,
+            ],
+        )?;
+        return Ok(true);
+    }
+
+    if existing.as_deref() == Some("failed") {
+        return Ok(false);
+    }
+
+    tx.execute(
+        "UPDATE webhook_deliveries
+         SET webhook_url = $3, payload = $4, updated_at = $5
+         WHERE id = $1 AND event = $2 AND status = 'pending'",
+        &[
+            &entry.id,
+            &entry.event,
+            &entry.webhook_url,
+            &entry.payload,
+            &now,
+        ],
+    )?;
+    Ok(true)
 }
 
 fn row_to_webhook_delivery(row: Row) -> WebhookDeliveryRecord {

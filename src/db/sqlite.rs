@@ -1,4 +1,7 @@
-use super::{DepositQueueCounts, Erc20Deposit, WebhookDeliveryRecord, WriteQueueError};
+use super::{
+    DepositQueueCounts, Erc20Deposit, Erc20Settlement, NewErc20Deposit, NewNativeDeposit,
+    OutboxEntry, SweepRecord, WebhookDeliveryRecord, WriteQueueError,
+};
 use anyhow::{anyhow, Result};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -292,6 +295,9 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/V1__initial.sql")),
         M::up(include_str!("../../migrations/V2__webhook_deliveries.sql")),
         M::up(include_str!("../../migrations/V3__next_index_counter.sql")),
+        M::up(include_str!(
+            "../../migrations/V4__sweep_coordinates_and_senders.sql"
+        )),
     ])
 }
 
@@ -634,6 +640,72 @@ fn downcast_result<T: 'static>(boxed: Box<dyn Any + Send>) -> Result<T> {
         .map_err(|_| anyhow!("writer returned an unexpected result type"))
 }
 
+/// Runs `f` inside a savepoint. Background writes already run inside the
+/// writer's batch transaction (and are re-run in autocommit if the batch is
+/// rolled back), so a plain `BEGIN` is not available here; a savepoint nests
+/// inside the batch and is its own transaction when run on its own. Either way
+/// `f`'s statements all commit or none do (REQ-WH-7).
+fn atomically<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    conn.execute_batch("SAVEPOINT evm_atomic")?;
+    match f(conn) {
+        Ok(value) => {
+            conn.execute_batch("RELEASE evm_atomic")?;
+            Ok(value)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO evm_atomic; RELEASE evm_atomic");
+            Err(e)
+        }
+    }
+}
+
+/// Inserts or refreshes a pending outbox row. Returns true when the worker
+/// should be notified.
+fn upsert_outbox(conn: &Connection, entry: &OutboxEntry) -> Result<bool> {
+    let now = now_unix_secs();
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT status FROM webhook_deliveries WHERE id = ?1 AND event = ?2",
+            params![entry.id, entry.event],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if existing.as_deref() == Some("delivered") {
+        return Ok(false);
+    }
+
+    if existing.is_none() {
+        conn.execute(
+            "INSERT INTO webhook_deliveries
+             (id, event, registration_id, webhook_url, payload, status, attempt_count,
+              last_http_status, last_error, leased_until, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, NULL, NULL, NULL, ?6)",
+            params![
+                entry.id,
+                entry.event,
+                entry.registration_id,
+                entry.webhook_url,
+                entry.payload,
+                now
+            ],
+        )?;
+        return Ok(true);
+    }
+
+    if existing.as_deref() == Some("failed") {
+        return Ok(false);
+    }
+
+    conn.execute(
+        "UPDATE webhook_deliveries
+         SET webhook_url = ?3, payload = ?4, updated_at = ?5
+         WHERE id = ?1 AND event = ?2 AND status = 'pending'",
+        params![entry.id, entry.event, entry.webhook_url, entry.payload, now],
+    )?;
+    Ok(true)
+}
+
 impl Db {
     /// Only reached directly by this module's own tests now — the crate's
     /// `db::Db` facade calls `with_pool_size`/`with_options` directly since
@@ -859,16 +931,21 @@ impl Db {
                 return Ok((index, address, false));
             }
 
-            let next_index: u32 = tx
+            // REQ-RG-5: derivation indices are 32-bit. Read the counter as a
+            // u64 so reaching 2^32 is a refusal, never a wrap.
+            let next_index: u64 = tx
                 .query_row(
                     "SELECT value FROM state WHERE key = 'next_index'",
                     [],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?
-                .map(|v| v.parse::<u32>())
+                .map(|v| v.parse::<u64>())
                 .transpose()?
                 .unwrap_or(0);
+            let next_index = u32::try_from(next_index).map_err(|_| {
+                anyhow!("registration refused: derivation index space is exhausted (REQ-RG-5)")
+            })?;
 
             let address = derive_address(next_index)?;
 
@@ -880,7 +957,7 @@ impl Db {
             tx.execute(
                 "INSERT INTO state (key, value) VALUES ('next_index', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![(next_index + 1).to_string()],
+                params![(u64::from(next_index) + 1).to_string()],
             )?;
             tx.commit()?;
 
@@ -1102,8 +1179,9 @@ impl Db {
     pub fn get_detected_erc20_deposits(&self, chain: &str) -> Result<Vec<Erc20Deposit>> {
         let conn = self.read.get()?;
         let mut stmt = conn.prepare(
-            "SELECT tx_hash, log_index, account_id, amount, token_address, token_symbol
-             FROM erc20_deposits WHERE chain = ?1 AND status = 'detected'",
+            "SELECT tx_hash, log_index, account_id, amount, token_address, token_symbol, from_address
+             FROM erc20_deposits WHERE chain = ?1 AND status = 'detected'
+             ORDER BY rowid",
         )?;
         let rows = stmt.query_map([chain], |row| {
             let tx_hash: String = row.get(0)?;
@@ -1114,6 +1192,7 @@ impl Db {
                 amount: row.get(3)?,
                 token_address: row.get(4)?,
                 token_symbol: row.get(5)?,
+                from_address: row.get(6)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1383,6 +1462,223 @@ impl Db {
         Ok(count.unwrap_or(0) as u64)
     }
 
+    pub fn record_native_deposit_atomic(
+        &self,
+        deposit: &NewNativeDeposit,
+        outbox: Option<&OutboxEntry>,
+    ) -> Result<bool> {
+        let deposit = deposit.clone();
+        let outbox = outbox.cloned();
+        self.with_write(move |conn| {
+            atomically(conn, |conn| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO deposits (chain, tx_hash, account_id, amount, status, from_address)
+                     VALUES (?1, ?2, ?3, ?4, 'detected', ?5)",
+                    params![
+                        deposit.chain,
+                        deposit.tx_hash,
+                        deposit.account_id,
+                        deposit.amount,
+                        deposit.from_address
+                    ],
+                )?;
+                let is_new = conn.changes() == 1;
+                if is_new {
+                    if let Some(entry) = &outbox {
+                        upsert_outbox(conn, entry)?;
+                    }
+                }
+                Ok(is_new)
+            })
+        })
+    }
+
+    pub fn record_erc20_deposit_atomic(
+        &self,
+        deposit: &NewErc20Deposit,
+        outbox: Option<&OutboxEntry>,
+    ) -> Result<bool> {
+        let deposit = deposit.clone();
+        let outbox = outbox.cloned();
+        self.with_write(move |conn| {
+            atomically(conn, |conn| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO erc20_deposits
+                     (chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status, from_address)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'detected', ?8)",
+                    params![
+                        deposit.chain,
+                        deposit.tx_hash,
+                        deposit.log_index as i64,
+                        deposit.account_id,
+                        deposit.amount,
+                        deposit.token_address,
+                        deposit.token_symbol,
+                        deposit.from_address
+                    ],
+                )?;
+                let is_new = conn.changes() == 1;
+                if is_new {
+                    if let Some(entry) = &outbox {
+                        upsert_outbox(conn, entry)?;
+                    }
+                }
+                Ok(is_new)
+            })
+        })
+    }
+
+    pub fn complete_native_sweep(
+        &self,
+        chain: &str,
+        tx_hash: &str,
+        outbox: Option<&OutboxEntry>,
+    ) -> Result<bool> {
+        let chain = chain.to_string();
+        let tx_hash = tx_hash.to_string();
+        let outbox = outbox.cloned();
+        self.with_write(move |conn| {
+            atomically(conn, |conn| {
+                conn.execute(
+                    "UPDATE deposits SET status = 'swept' WHERE chain = ?1 AND tx_hash = ?2",
+                    params![chain, tx_hash],
+                )?;
+                match &outbox {
+                    Some(entry) => upsert_outbox(conn, entry),
+                    None => Ok(false),
+                }
+            })
+        })
+    }
+
+    pub fn complete_erc20_sweep(
+        &self,
+        chain: &str,
+        settlements: &[Erc20Settlement],
+    ) -> Result<usize> {
+        let chain = chain.to_string();
+        let settlements = settlements.to_vec();
+        self.with_write(move |conn| {
+            atomically(conn, |conn| {
+                let mut enqueued = 0;
+                for settlement in &settlements {
+                    let (tx_hash, log_index) = parse_local_key(&settlement.key)?;
+                    conn.execute(
+                        "UPDATE erc20_deposits SET status = 'swept'
+                         WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3",
+                        params![chain, tx_hash, log_index],
+                    )?;
+                    if let Some(entry) = &settlement.outbox {
+                        if upsert_outbox(conn, entry)? {
+                            enqueued += 1;
+                        }
+                    }
+                }
+                Ok(enqueued)
+            })
+        })
+    }
+
+    pub fn record_sweep(&self, chain: &str, keys: &[String], record: &SweepRecord) -> Result<()> {
+        let chain = chain.to_string();
+        let keys = keys.to_vec();
+        let record = record.clone();
+        self.with_write(move |conn| {
+            atomically(conn, |conn| {
+                for key in &keys {
+                    let (tx_hash, log_index) = parse_local_key(key)?;
+                    conn.execute(
+                        "INSERT OR IGNORE INTO sweeps
+                         (chain, tx_hash, log_index, sweep_tx_hash, sweep_block_number,
+                          sweep_block_hash, sweep_log_index, sweep_amount)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            chain,
+                            tx_hash,
+                            log_index,
+                            record.sweep_tx_hash,
+                            record.sweep_block_number as i64,
+                            record.sweep_block_hash,
+                            record.sweep_log_index as i64,
+                            record.sweep_amount
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+        })
+    }
+
+    pub fn get_sweeps(&self, chain: &str, local_key: &str) -> Result<Vec<SweepRecord>> {
+        let (tx_hash, log_index) = parse_local_key(local_key)?;
+        let conn = self.read.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT sweep_tx_hash, sweep_block_number, sweep_block_hash, sweep_log_index, sweep_amount
+             FROM sweeps WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![chain, tx_hash, log_index], |row| {
+            let block_number: i64 = row.get(1)?;
+            let log_index: i64 = row.get(3)?;
+            Ok(SweepRecord {
+                sweep_tx_hash: row.get(0)?,
+                sweep_block_number: block_number as u64,
+                sweep_block_hash: row.get(2)?,
+                sweep_log_index: log_index as u64,
+                sweep_amount: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn get_deposit_from_address(&self, chain: &str, tx_hash: &str) -> Result<Option<String>> {
+        let conn = self.read.get()?;
+        let value: Option<Option<String>> = conn
+            .query_row(
+                "SELECT from_address FROM deposits WHERE chain = ?1 AND tx_hash = ?2",
+                params![chain, tx_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.flatten())
+    }
+
+    pub fn mark_erc20_deposits_swept_for_keys(&self, chain: &str, keys: &[String]) -> Result<()> {
+        let chain = chain.to_string();
+        let keys = keys.to_vec();
+        self.with_write(move |conn| {
+            atomically(conn, |conn| {
+                for key in &keys {
+                    let (tx_hash, log_index) = parse_local_key(key)?;
+                    conn.execute(
+                        "UPDATE erc20_deposits SET status = 'swept'
+                         WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3 AND status = 'detected'",
+                        params![chain, tx_hash, log_index],
+                    )?;
+                }
+                Ok(())
+            })
+        })
+    }
+
+    pub fn mark_erc20_deposits_failed_for_keys(&self, chain: &str, keys: &[String]) -> Result<()> {
+        let chain = chain.to_string();
+        let keys = keys.to_vec();
+        self.with_write(move |conn| {
+            atomically(conn, |conn| {
+                for key in &keys {
+                    let (tx_hash, log_index) = parse_local_key(key)?;
+                    conn.execute(
+                        "UPDATE erc20_deposits SET status = 'failed'
+                         WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3 AND status = 'detected'",
+                        params![chain, tx_hash, log_index],
+                    )?;
+                }
+                Ok(())
+            })
+        })
+    }
+
     /// Insert or refresh a pending delivery. Returns true when the worker should be notified.
     pub fn upsert_webhook_delivery(
         &self,
@@ -1397,43 +1693,14 @@ impl Db {
         let registration_id = registration_id.to_string();
         let webhook_url = webhook_url.to_string();
         let payload = payload.to_string();
-        self.with_write(move |conn| {
-            let now = now_unix_secs();
-            let existing: Option<String> = conn
-                .query_row(
-                    "SELECT status FROM webhook_deliveries WHERE id = ?1 AND event = ?2",
-                    params![id, event],
-                    |row| row.get(0),
-                )
-                .optional()?;
-
-            if existing.as_deref() == Some("delivered") {
-                return Ok(false);
-            }
-
-            if existing.is_none() {
-                conn.execute(
-                    "INSERT INTO webhook_deliveries
-                     (id, event, registration_id, webhook_url, payload, status, attempt_count,
-                      last_http_status, last_error, leased_until, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, NULL, NULL, NULL, ?6)",
-                    params![id, event, registration_id, webhook_url, payload, now],
-                )?;
-                return Ok(true);
-            }
-
-            if existing.as_deref() == Some("failed") {
-                return Ok(false);
-            }
-
-            conn.execute(
-                "UPDATE webhook_deliveries
-                 SET webhook_url = ?3, payload = ?4, updated_at = ?5
-                 WHERE id = ?1 AND event = ?2 AND status = 'pending'",
-                params![id, event, webhook_url, payload, now],
-            )?;
-            Ok(true)
-        })
+        let entry = OutboxEntry {
+            id,
+            event,
+            registration_id,
+            webhook_url,
+            payload,
+        };
+        self.with_write(move |conn| upsert_outbox(conn, &entry))
     }
 
     pub fn claim_webhook_delivery(
