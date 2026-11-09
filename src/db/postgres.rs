@@ -735,6 +735,19 @@ impl PostgresBackend {
         let mut guard = self.conn()?;
         let client = guard.client();
         let log_index = log_index as i64;
+        // A sweep still in flight could land: it is never abandoned from here.
+        let pattern = format!("%\"{tx_hash}:{log_index}\"%");
+        if let Some(row) = client.query_opt(
+            "SELECT tx_hash FROM sweep_intents
+             WHERE chain = $1 AND state = 'pending' AND keys LIKE $2 LIMIT 1",
+            &[&chain, &pattern],
+        )? {
+            let hash: Option<String> = row.get(0);
+            return Err(anyhow!(
+                "cannot retry: a sweep is still in flight (tx {})",
+                hash.as_deref().unwrap_or("not yet signed")
+            ));
+        }
         let changes = client.execute(
             "UPDATE erc20_deposits SET status = 'detected', review_kind = NULL
              WHERE chain = $1 AND tx_hash = $2 AND log_index = $3
@@ -743,14 +756,6 @@ impl PostgresBackend {
         )?;
         let updated = changes == 1;
         if updated {
-            // The operator has looked: intents that were waiting on this
-            // deposit no longer put it back into review.
-            let pattern = format!("%\"{tx_hash}:{log_index}\"%");
-            client.execute(
-                "UPDATE sweep_intents SET state = 'abandoned'
-                 WHERE chain = $1 AND state IN ('pending', 'review') AND keys LIKE $2",
-                &[&chain, &pattern],
-            )?;
             client.execute(
                 "DELETE FROM sweep_failures WHERE chain = $1 AND tx_hash = $2 AND log_index = $3",
                 &[&chain, &tx_hash, &log_index],
@@ -980,6 +985,21 @@ impl PostgresBackend {
         Ok(row.get(0))
     }
 
+    pub fn set_sweep_intent_signed(
+        &self,
+        id: i64,
+        nonce: u64,
+        tx_hash: &str,
+        raw_tx: &str,
+    ) -> Result<()> {
+        let mut guard = self.conn()?;
+        guard.client().execute(
+            "UPDATE sweep_intents SET nonce = $2, tx_hash = $3, raw_tx = $4 WHERE id = $1",
+            &[&id, &(nonce as i64), &tx_hash, &raw_tx],
+        )?;
+        Ok(())
+    }
+
     pub fn set_sweep_intent_tx(&self, id: i64, tx_hash: &str) -> Result<()> {
         let mut guard = self.conn()?;
         guard.client().execute(
@@ -1011,7 +1031,7 @@ impl PostgresBackend {
     pub fn pending_sweep_intents(&self, chain: &str, keys: &[String]) -> Result<Vec<SweepIntent>> {
         let mut guard = self.conn()?;
         let rows = guard.client().query(
-            "SELECT id, group_key, keys, part_index, amount, target, tx_hash, passes
+            "SELECT id, group_key, keys, part_index, amount, target, tx_hash, passes, nonce, raw_tx
              FROM sweep_intents WHERE chain = $1 AND state = 'pending' ORDER BY id",
             &[&chain],
         )?;
@@ -1021,6 +1041,7 @@ impl PostgresBackend {
                 let keys_json: String = r.get(2);
                 let part_index: i64 = r.get(3);
                 let passes: i64 = r.get(7);
+                let nonce: Option<i64> = r.get(8);
                 SweepIntent {
                     id: r.get(0),
                     group_key: r.get(1),
@@ -1029,6 +1050,8 @@ impl PostgresBackend {
                     amount: r.get(4),
                     target: r.get(5),
                     tx_hash: r.get(6),
+                    nonce: nonce.map(|n| n as u64),
+                    raw_tx: r.get(9),
                     passes: passes as u64,
                 }
             })

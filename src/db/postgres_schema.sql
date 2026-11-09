@@ -131,6 +131,8 @@ CREATE TABLE IF NOT EXISTS sweep_intents (
   target TEXT NOT NULL,
   state TEXT NOT NULL,
   tx_hash TEXT,
+  nonce BIGINT,
+  raw_tx TEXT,
   passes BIGINT NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sweep_intents_state ON sweep_intents (chain, state);

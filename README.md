@@ -72,15 +72,18 @@ block hash, block-level log index of the `Transfer` into the target, amount) fro
 reported.
 
 **Sweep intents and `needs_review`.** Before a sweep is signed, evmhot stores an intent (deposits, part, amount,
-target); its transaction hash is stored when it is sent. On each pass, an intent still pending is resolved from its
-hash's receipt before anything is planned; with no hash, or no receipt after 10 passes, the deposits go to
-`needs_review`. A deposit is also moved to `needs_review` (never auto-settled or auto-retried, no `deposit_swept`,
+target); it then signs the transaction locally with an explicit nonce and stores the nonce, hash and raw bytes before
+broadcasting, so a failed broadcast (a rate-limited public RPC, say) is not operator work. On each pass, a pending
+intent is resolved before anything is planned: a receipt settles it; no receipt and the nonce still free means the same
+bytes are rebroadcast, and after 10 such passes the intent is dropped and the group re-plans (a new sweep at that nonce
+replaces it); no receipt and the nonce used by another transaction sends the deposits to `needs_review`. An intent
+that was never signed (a crash before signing) is dropped. A deposit is also moved to `needs_review` (never auto-settled or auto-retried, no `deposit_swept`,
 `EVMHOT_ALERT kind=... network=... deposit=... tx=...` logged at ERROR, counted in the sweeper's queue log) when:
 `sweep_review` the receipt succeeded but has no matching `Transfer` or its value differs from the planned amount;
 `balance_shortfall` a `per_sender` pair holds less than every sender is still owed (so one sender's sweep can never
 spend another's funds); `no_sender` a deposit with no recorded sender sits on a `per_sender` target. `POST
 /admin/retry_sweeps` (with the operator token) is the only route that moves a `needs_review` or `failed` deposit back to
-`detected`.
+`detected`, and it refuses, naming the transaction, while any sweep intent of that deposit is still in flight.
 
 **Limits.** A split sends at most 10 parts per pass; the balance is re-read on the next pass. A dust remainder below
 `min` stays owed (`EVMHOT_ALERT kind=dust` warning): the deposits are not settled and a later deposit lifts it. At load,

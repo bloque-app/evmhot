@@ -135,6 +135,10 @@ pub struct SweepIntent {
     pub amount: String,
     pub target: String,
     pub tx_hash: Option<String>,
+    /// Nonce the sweep was signed with. `None` until it is signed.
+    pub nonce: Option<u64>,
+    /// Hex of the signed raw transaction, kept so it can be rebroadcast.
+    pub raw_tx: Option<String>,
     pub passes: u64,
 }
 
@@ -618,6 +622,20 @@ impl Db {
             DbInner::Postgres(p) => {
                 p.create_sweep_intent(chain, group_key, keys, part_index, amount, target)
             }
+        }
+    }
+
+    /// Stores the signed transaction (nonce, hash, raw bytes) before it is broadcast.
+    pub fn set_sweep_intent_signed(
+        &self,
+        id: i64,
+        nonce: u64,
+        tx_hash: &str,
+        raw_tx: &str,
+    ) -> Result<()> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.set_sweep_intent_signed(id, nonce, tx_hash, raw_tx),
+            DbInner::Postgres(p) => p.set_sweep_intent_signed(id, nonce, tx_hash, raw_tx),
         }
     }
 

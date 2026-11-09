@@ -15,6 +15,8 @@ CREATE TABLE sweep_intents (
   target TEXT NOT NULL,
   state TEXT NOT NULL,
   tx_hash TEXT,
+  nonce INTEGER,
+  raw_tx TEXT,
   passes INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_sweep_intents_state ON sweep_intents (chain, state);

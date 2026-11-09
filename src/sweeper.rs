@@ -5,6 +5,7 @@ use crate::{
     wallet::Wallet,
     webhook::WebhookDeliverer,
 };
+use alloy::eips::eip2718::Encodable2718;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{keccak256, Address, U256};
 use alloy::providers::{Provider, RootProvider};
@@ -270,10 +271,6 @@ impl Sweeper {
         };
         let signer = self.wallet.get_signer(derivation_index)?;
         let wallet = alloy::network::EthereumWallet::from(signer);
-        let sweep_provider = alloy::providers::ProviderBuilder::new()
-            .with_recommended_fillers()
-            .wallet(wallet)
-            .on_provider(&self.provider);
         let token_address = Address::from_str(&first.token_address)?;
         let from_address = Address::from_str(&address_str)?;
 
@@ -342,7 +339,7 @@ impl Sweeper {
 
         for subgroup in live {
             if let Err(e) = self
-                .sweep_subgroup(&sweep_provider, &address_str, &target, &subgroup)
+                .sweep_subgroup(&wallet, &address_str, &target, &subgroup)
                 .await
             {
                 self.handle_group_failure(&subgroup, &e).await?;
@@ -576,53 +573,105 @@ impl Sweeper {
         let mut waiting = false;
         for intent in pending {
             let Some(hash) = intent.tx_hash.clone() else {
-                self.send_to_review(&intent.keys, "sweep_review", None)
-                    .await?;
-                self.finish_intent(intent.id, "review").await?;
-                return Ok(IntentState::Review);
+                // Stopped between storing the intent and signing: nothing was
+                // ever signed or sent, so the group simply re-plans.
+                warn!(
+                    "[{}] sweep intent {} was never signed; dropping it",
+                    self.chain.name, intent.id
+                );
+                self.finish_intent(intent.id, "dropped").await?;
+                continue;
             };
-            let receipt = self
-                .provider
-                .get_transaction_receipt(alloy::primitives::TxHash::from_str(&hash)?)
-                .await?;
-            match receipt {
-                Some(receipt) => {
-                    let to = Address::from_str(&intent.target)?;
-                    let planned = U256::from_str(&intent.amount)?;
-                    match evaluate_receipt(&receipt, token, from, to, planned) {
-                        Verdict::Reverted => self.finish_intent(intent.id, "failed").await?,
-                        Verdict::Review(why) => {
-                            warn!("[{}] sweep {hash} needs review: {why}", self.chain.name);
+            let tx_hash = alloy::primitives::TxHash::from_str(&hash)?;
+            let mut receipt = self.provider.get_transaction_receipt(tx_hash).await?;
+            if receipt.is_none() {
+                let id = intent.id;
+                match (intent.nonce, intent.raw_tx.as_deref()) {
+                    (Some(nonce), Some(raw)) => {
+                        let latest = self.provider.get_transaction_count(from).await?;
+                        if latest > nonce {
+                            // It may have been mined between the two calls.
+                            receipt = self.provider.get_transaction_receipt(tx_hash).await?;
+                            if receipt.is_none() {
+                                // The nonce was used by another transaction.
+                                self.send_to_review(&intent.keys, "sweep_review", Some(&hash))
+                                    .await?;
+                                self.finish_intent(id, "review").await?;
+                                return Ok(IntentState::Review);
+                            }
+                        } else {
+                            let passes = self
+                                .db
+                                .blocking(move |db| db.bump_sweep_intent_passes(id))
+                                .await?;
+                            if passes >= MAX_INTENT_WAIT_PASSES {
+                                // Still unmined and the nonce is free: a new
+                                // sweep at this nonce replaces it, which is safe.
+                                warn!(
+                                    "[{}] sweep {hash} never landed after {passes} passes; dropping its intent",
+                                    self.chain.name
+                                );
+                                self.finish_intent(id, "dropped").await?;
+                                continue;
+                            }
+                            // Same bytes, same hash: rebroadcasting is idempotent.
+                            match alloy::primitives::hex::decode(raw) {
+                                Ok(bytes) => {
+                                    if let Err(e) = self.provider.send_raw_transaction(&bytes).await
+                                    {
+                                        warn!(
+                                            "[{}] rebroadcast of {hash} failed: {e:?}",
+                                            self.chain.name
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("[{}] stored raw tx unreadable: {e}", self.chain.name)
+                                }
+                            }
+                            waiting = true;
+                            continue;
+                        }
+                    }
+                    _ => {
+                        // Signed by an earlier version, without its raw bytes or nonce:
+                        // it cannot be rebroadcast or judged, so wait, then review.
+                        let passes = self
+                            .db
+                            .blocking(move |db| db.bump_sweep_intent_passes(id))
+                            .await?;
+                        if passes >= MAX_INTENT_WAIT_PASSES {
                             self.send_to_review(&intent.keys, "sweep_review", Some(&hash))
                                 .await?;
-                            self.finish_intent(intent.id, "review").await?;
+                            self.finish_intent(id, "review").await?;
                             return Ok(IntentState::Review);
                         }
-                        Verdict::Success(record) => {
-                            let chain_name = self.chain.name.clone();
-                            let keys = intent.keys.clone();
-                            let id = intent.id;
-                            self.db
-                                .blocking(move |db| {
-                                    db.settle_sweep_intent(&chain_name, id, &keys, &record, &[])
-                                })
-                                .await?;
-                        }
+                        waiting = true;
+                        continue;
                     }
                 }
-                None => {
-                    let id = intent.id;
-                    let passes = self
-                        .db
-                        .blocking(move |db| db.bump_sweep_intent_passes(id))
+            }
+            let Some(receipt) = receipt else { continue };
+            let to = Address::from_str(&intent.target)?;
+            let planned = U256::from_str(&intent.amount)?;
+            match evaluate_receipt(&receipt, token, from, to, planned) {
+                Verdict::Reverted => self.finish_intent(intent.id, "failed").await?,
+                Verdict::Review(why) => {
+                    warn!("[{}] sweep {hash} needs review: {why}", self.chain.name);
+                    self.send_to_review(&intent.keys, "sweep_review", Some(&hash))
                         .await?;
-                    if passes >= MAX_INTENT_WAIT_PASSES {
-                        self.send_to_review(&intent.keys, "sweep_review", Some(&hash))
-                            .await?;
-                        self.finish_intent(intent.id, "review").await?;
-                        return Ok(IntentState::Review);
-                    }
-                    waiting = true;
+                    self.finish_intent(intent.id, "review").await?;
+                    return Ok(IntentState::Review);
+                }
+                Verdict::Success(record) => {
+                    let chain_name = self.chain.name.clone();
+                    let keys = intent.keys.clone();
+                    let id = intent.id;
+                    self.db
+                        .blocking(move |db| {
+                            db.settle_sweep_intent(&chain_name, id, &keys, &record, &[])
+                        })
+                        .await?;
                 }
             }
         }
@@ -645,16 +694,13 @@ impl Sweeper {
     /// per pass, and each is its own `transfer` call with its own coordinate
     /// (REQ-SW-9, REQ-SW-10). A group is settled only by its recorded sweeps,
     /// and only when nothing is left owed (REQ-WH-4).
-    async fn sweep_subgroup<SP>(
+    async fn sweep_subgroup(
         &self,
-        provider: &SP,
+        wallet: &alloy::network::EthereumWallet,
         from_address_str: &str,
         target: &SweepTarget,
         group: &[Erc20Deposit],
-    ) -> Result<()>
-    where
-        SP: Provider<BoxTransport, alloy::network::Ethereum>,
-    {
+    ) -> Result<()> {
         let first = &group[0];
         let from_address = Address::from_str(from_address_str)?;
         let to_address = Address::from_str(
@@ -736,7 +782,7 @@ impl Sweeper {
         for (i, amount) in parts.into_iter().enumerate() {
             let result = self
                 .sweep_part(
-                    provider,
+                    wallet,
                     from_address_str,
                     token_address,
                     to_address,
@@ -808,9 +854,9 @@ impl Sweeper {
     /// transaction is signed, and its hash as soon as it is sent; the receipt is
     /// then checked (status, a matching `Transfer`, and its value).
     #[allow(clippy::too_many_arguments)]
-    async fn sweep_part<SP>(
+    async fn sweep_part(
         &self,
-        provider: &SP,
+        wallet: &alloy::network::EthereumWallet,
         from_address_str: &str,
         token_address: Address,
         to_address: Address,
@@ -818,10 +864,8 @@ impl Sweeper {
         keys: &[String],
         group_key: &str,
         part_index: u64,
-    ) -> Result<PartResult>
-    where
-        SP: Provider<BoxTransport, alloy::network::Ethereum>,
-    {
+    ) -> Result<PartResult> {
+        let provider = &self.provider;
         let from_address = Address::from_str(from_address_str)?;
         let transfer_call = IERC20::transferCall {
             to: to_address,
@@ -859,14 +903,9 @@ impl Sweeper {
             }
         }
 
-        let tx = TransactionRequest::default()
-            .with_to(token_address)
-            .with_input(call_data)
-            .with_gas_limit(gas_limit_with_buffer);
-
-        // The intent exists before anything is signed. If the send fails or the
-        // process stops here, the next pass finds a pending intent and sends the
-        // group to review rather than sweeping again.
+        // The intent exists before anything is signed. If the process stops
+        // before the signed transaction is stored, nothing was sent and the next
+        // pass drops the intent and re-plans.
         let intent_id = {
             let chain_name = self.chain.name.clone();
             let group_key = group_key.to_string();
@@ -887,14 +926,39 @@ impl Sweeper {
                 .await?
         };
 
-        let pending_tx = provider.send_transaction(tx).await?;
-        let tx_hash = pending_tx.tx_hash().to_string();
+        // Sign locally with an explicit nonce, and store the nonce, hash and raw
+        // bytes before broadcasting: whatever happens to the broadcast, the next
+        // pass can rebroadcast the same transaction or see that its nonce was used.
+        let nonce = provider
+            .get_transaction_count(from_address)
+            .block_id(alloy::eips::BlockNumberOrTag::Pending.into())
+            .await?;
+        let request = TransactionRequest::default()
+            .with_from(from_address)
+            .with_to(token_address)
+            .with_input(call_data)
+            .with_gas_limit(gas_limit_with_buffer)
+            .with_nonce(nonce)
+            .with_chain_id(self.chain.chain_id)
+            .with_max_fee_per_gas(fee_estimate.max_fee_per_gas)
+            .with_max_priority_fee_per_gas(fee_estimate.max_priority_fee_per_gas);
+        let envelope = request
+            .build(wallet)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to sign the sweep: {e}"))?;
+        let tx_hash = envelope.tx_hash().to_string();
+        let raw = envelope.encoded_2718();
         {
             let hash = tx_hash.clone();
+            let raw_hex = alloy::primitives::hex::encode_prefixed(&raw);
             self.db
-                .blocking(move |db| db.set_sweep_intent_tx(intent_id, &hash))
+                .blocking(move |db| db.set_sweep_intent_signed(intent_id, nonce, &hash, &raw_hex))
                 .await?;
         }
+
+        // A broadcast error leaves the intent pending, with its hash and bytes;
+        // the next pass resolves it.
+        let pending_tx = provider.send_raw_transaction(&raw).await?;
         let receipt = pending_tx.get_receipt().await?;
 
         match evaluate_receipt(&receipt, token_address, from_address, to_address, amount) {

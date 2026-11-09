@@ -75,17 +75,30 @@ struct Rpc {
     server: MockServer,
     /// What `balanceOf` answers, changeable between passes.
     balance: Arc<Mutex<u128>>,
-    sends: Arc<AtomicUsize>,
+    /// The address's latest (mined) nonce.
+    latest_nonce: Arc<Mutex<u64>>,
+    /// Real hashes of the distinct transactions the node accepted, in order.
+    accepted: Arc<Mutex<Vec<String>>>,
+    /// Broadcasts still to refuse (a failing public RPC).
+    fail_sends: Arc<AtomicUsize>,
+    /// Every `eth_sendRawTransaction` call, accepted or not.
+    send_calls: Arc<AtomicUsize>,
 }
 
 impl Rpc {
-    /// Standard node mocks for sweeping. `sends` are the hashes returned, in
-    /// order, to successive `eth_sendRawTransaction` calls; `receipts` are
-    /// looked up by transaction hash.
+    /// Standard node mocks for sweeping. Sweeps are signed locally, so their
+    /// hashes are real: the node learns each distinct raw transaction's hash on
+    /// first broadcast and maps it to the next name in `sends`; `receipts` are
+    /// keyed by those names (or by a literal hash) and answered with the real
+    /// hash. `hash(i)` is the real hash of the i-th accepted transaction.
     async fn start(balance: u128, sends: Vec<String>, receipts: Vec<(String, Value)>) -> Self {
         let server = MockServer::start().await;
         let balance = Arc::new(Mutex::new(balance));
-        let send_count = Arc::new(AtomicUsize::new(0));
+        let latest_nonce = Arc::new(Mutex::new(0u64));
+        let accepted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let fail_sends = Arc::new(AtomicUsize::new(0));
+        let send_calls = Arc::new(AtomicUsize::new(0));
+        let learned: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
 
         let bal = Arc::clone(&balance);
         Mock::given(method("POST"))
@@ -101,7 +114,6 @@ impl Rpc {
         for (needle, result) in [
             ("eth_estimateGas", json!("0x186a0")),
             ("eth_getBalance", json!("0x0DE0B6B3A7640000")),
-            ("eth_getTransactionCount", json!("0x00")),
             ("eth_chainId", json!("0x89")),
         ] {
             Mock::given(method("POST"))
@@ -112,6 +124,31 @@ impl Rpc {
                 .mount(&server)
                 .await;
         }
+        // The pending nonce counts the transactions the node accepted; the latest
+        // (mined) nonce is settable.
+        let acc_for_nonce = Arc::clone(&accepted);
+        Mock::given(method("POST"))
+            .and(body_json_contains("eth_getTransactionCount"))
+            .and(body_json_contains("pending"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = acc_for_nonce.lock().unwrap().len();
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": 1, "result": format!("0x{n:x}")
+                }))
+            })
+            .mount(&server)
+            .await;
+        let latest = Arc::clone(&latest_nonce);
+        Mock::given(method("POST"))
+            .and(body_json_contains("eth_getTransactionCount"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = *latest.lock().unwrap();
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": 1, "result": format!("0x{n:x}")
+                }))
+            })
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(body_json_contains("eth_feeHistory"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -126,28 +163,69 @@ impl Rpc {
             .mount(&server)
             .await;
 
-        let counter = Arc::clone(&send_count);
+        let (acc, fails, calls, learn) = (
+            Arc::clone(&accepted),
+            Arc::clone(&fail_sends),
+            Arc::clone(&send_calls),
+            Arc::clone(&learned),
+        );
         Mock::given(method("POST"))
             .and(body_json_contains("eth_sendRawTransaction"))
-            .respond_with(move |_: &wiremock::Request| {
-                let i = counter.fetch_add(1, Ordering::SeqCst);
-                let hash = sends[i.min(sends.len() - 1)].clone();
+            .respond_with(move |req: &wiremock::Request| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                let raw = body["params"][0].as_str().unwrap();
+                let bytes = alloy::primitives::hex::decode(raw).unwrap();
+                let real = alloy::primitives::keccak256(&bytes)
+                    .to_string()
+                    .to_lowercase();
+                let mut learned = learn.lock().unwrap();
+                if !learned.contains_key(&real) {
+                    if fails
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                    {
+                        return ResponseTemplate::new(200).set_body_json(json!({
+                            "jsonrpc": "2.0", "id": body["id"],
+                            "error": {"code": -32005, "message": "rate limited"}
+                        }));
+                    }
+                    let mut acc = acc.lock().unwrap();
+                    let name = sends[acc.len().min(sends.len() - 1)].clone();
+                    learned.insert(real.clone(), name);
+                    acc.push(real.clone());
+                }
                 ResponseTemplate::new(200)
-                    .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": hash}))
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": body["id"], "result": real}))
             })
             .mount(&server)
             .await;
 
-        let by_hash: HashMap<String, Value> = receipts
+        let by_name: HashMap<String, Value> = receipts
             .into_iter()
             .map(|(hash, receipt)| (hash.to_lowercase(), receipt))
             .collect();
+        let learn = Arc::clone(&learned);
         Mock::given(method("POST"))
             .and(body_json_contains("eth_getTransactionReceipt"))
             .respond_with(move |req: &wiremock::Request| {
                 let body: Value = serde_json::from_slice(&req.body).unwrap();
                 let wanted = body["params"][0].as_str().unwrap_or("").to_lowercase();
-                let result = by_hash.get(&wanted).cloned().unwrap_or(Value::Null);
+                let name = learn
+                    .lock()
+                    .unwrap()
+                    .get(&wanted)
+                    .cloned()
+                    .unwrap_or_else(|| wanted.clone())
+                    .to_lowercase();
+                let result = by_name
+                    .get(&name)
+                    .cloned()
+                    .map(|mut r| {
+                        r["transactionHash"] = json!(wanted);
+                        r
+                    })
+                    .unwrap_or(Value::Null);
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
             })
@@ -157,7 +235,10 @@ impl Rpc {
         Self {
             server,
             balance,
-            sends: send_count,
+            latest_nonce,
+            accepted,
+            fail_sends,
+            send_calls,
         }
     }
 
@@ -165,8 +246,27 @@ impl Rpc {
         *self.balance.lock().unwrap() = value;
     }
 
+    fn set_latest_nonce(&self, value: u64) {
+        *self.latest_nonce.lock().unwrap() = value;
+    }
+
+    fn fail_next_sends(&self, n: usize) {
+        self.fail_sends.store(n, Ordering::SeqCst);
+    }
+
+    /// Distinct transactions the node accepted.
     fn sent(&self) -> usize {
-        self.sends.load(Ordering::SeqCst)
+        self.accepted.lock().unwrap().len()
+    }
+
+    /// Every broadcast call, accepted or refused.
+    fn send_calls(&self) -> usize {
+        self.send_calls.load(Ordering::SeqCst)
+    }
+
+    /// Real hash of the i-th accepted transaction.
+    fn hash(&self, i: usize) -> String {
+        self.accepted.lock().unwrap()[i].clone()
     }
 
     /// Calldata of every `eth_estimateGas` request (one per sweep part).
@@ -457,7 +557,7 @@ async fn req_sw_10_coordinate_comes_from_receipt_log_index_not_tx_position() {
     assert_eq!(
         stored,
         vec![SweepRecord {
-            sweep_tx_hash: tx.clone(),
+            sweep_tx_hash: rpc.hash(0),
             sweep_block_number: 11,
             sweep_block_hash: hash32(11),
             sweep_log_index: 17,
@@ -466,9 +566,9 @@ async fn req_sw_10_coordinate_comes_from_receipt_log_index_not_tx_position() {
         }]
     );
     let payload = fx.swept_webhook("0xaaa:1").expect("deposit_swept enqueued");
-    assert_eq!(payload["sweep_tx_hash"], tx);
+    assert_eq!(payload["sweep_tx_hash"], rpc.hash(0));
     assert_eq!(payload["sweeps"].as_array().unwrap().len(), 1);
-    assert_eq!(payload["sweeps"][0]["sweep_tx_hash"], tx);
+    assert_eq!(payload["sweeps"][0]["sweep_tx_hash"], rpc.hash(0));
     assert_eq!(payload["sweeps"][0]["sweep_block_number"], 11);
     assert_eq!(payload["sweeps"][0]["sweep_block_hash"], hash32(11));
     assert_eq!(payload["sweeps"][0]["sweep_log_index"], 17);
@@ -844,10 +944,11 @@ async fn req_sw_7_above_maximum_splits_into_sweeps_with_one_webhook() {
         .collect();
     assert_eq!(blocks, [20, 21, 22]);
     assert_eq!(
-        payload["sweep_tx_hash"], t1,
+        payload["sweep_tx_hash"],
+        rpc.hash(0),
         "top level is the first entry's"
     );
-    assert_eq!(sweeps[0]["sweep_tx_hash"], t1);
+    assert_eq!(sweeps[0]["sweep_tx_hash"], rpc.hash(0));
     // One webhook for the deposit, not one per sweep.
     let rows = fx
         .db
@@ -910,7 +1011,14 @@ async fn req_sw_7_split_waits_for_its_last_sweep_and_resumes_after_a_failure() {
         .iter()
         .map(|s| s["sweep_tx_hash"].as_str().unwrap())
         .collect();
-    assert_eq!(hashes, [t1.as_str(), t3.as_str(), t4.as_str()]);
+    assert_eq!(
+        hashes,
+        [
+            rpc.hash(0).as_str(),
+            rpc.hash(2).as_str(),
+            rpc.hash(3).as_str()
+        ]
+    );
 }
 
 #[test]
@@ -1398,7 +1506,7 @@ async fn req_dt_10_unknown_symbol_deposit_is_detected_and_really_swept() {
         .swept_webhook(&key)
         .expect("deposit_swept for UNKNOWN token");
     assert_eq!(swept["token_symbol"], "UNKNOWN");
-    assert_eq!(swept["sweeps"][0]["sweep_tx_hash"], tx);
+    assert_eq!(swept["sweeps"][0]["sweep_tx_hash"], rpc.hash(0));
     assert_eq!(swept["sweeps"][0]["sweep_log_index"], 9);
 }
 
@@ -1776,23 +1884,34 @@ async fn review_pending_intent_is_resolved_from_its_receipt_and_settled() {
 }
 
 #[tokio::test]
-async fn review_pending_intent_without_a_hash_goes_to_review() {
+async fn crash_before_sign_is_dropped_and_the_group_replans_without_review() {
     let fx = fixture();
     fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    // An intent with no nonce, hash or bytes: the process stopped before signing.
     pending_intent(&fx, "0xaaa:1", "100", None);
-    let rpc = Rpc::start(100, vec![sweep_tx(105)], vec![]).await;
+    let tx = sweep_tx(105);
+    let rpc = Rpc::start(
+        100,
+        vec![tx.clone()],
+        vec![(
+            tx.clone(),
+            ok_receipt(&tx, 30, 2, TOKEN, &fx.addr, TARGET_A, 100),
+        )],
+    )
+    .await;
     fx.sweeper(&rpc, target_for(TOKEN, |_| {}))
         .process_deposits_once()
         .await
         .unwrap();
-    assert_eq!(rpc.sent(), 0, "it may have been sent: no second sweep");
-    assert_eq!(
-        fx.db
-            .get_review_kind(TEST_CHAIN, "0xaaa:1")
-            .unwrap()
-            .as_deref(),
-        Some("sweep_review")
-    );
+    // Nothing was ever sent, so no review: it is simply swept, once.
+    assert_eq!(rpc.sent(), 1);
+    assert_eq!(fx.detected(), 0);
+    assert!(fx
+        .db
+        .get_review_kind(TEST_CHAIN, "0xaaa:1")
+        .unwrap()
+        .is_none());
+    assert!(fx.swept_webhook("0xaaa:1").is_some());
 }
 
 #[tokio::test]
@@ -1936,7 +2055,8 @@ fn split_plan_limit_never_allocates_more_than_the_limit() {
 fn review_admin_retry_moves_needs_review_back_to_detected() {
     let fx = fixture();
     fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
-    pending_intent(&fx, "0xaaa:1", "100", None);
+    let id = pending_intent(&fx, "0xaaa:1", "100", None);
+    fx.db.finish_sweep_intent(id, "review").unwrap();
     fx.db
         .mark_erc20_deposits_needs_review_for_keys(
             TEST_CHAIN,
@@ -1949,12 +2069,6 @@ fn review_admin_retry_moves_needs_review_back_to_detected() {
     assert!(fx.db.retry_erc20_deposit(TEST_CHAIN, "0xaaa", 1).unwrap());
     assert_eq!(fx.detected(), 1);
     assert_eq!(fx.db.get_review_kind(TEST_CHAIN, "0xaaa:1").unwrap(), None);
-    // The intent that put it into review no longer waits on it.
-    assert!(fx
-        .db
-        .pending_sweep_intents(TEST_CHAIN, &["0xaaa:1".to_string()])
-        .unwrap()
-        .is_empty());
     // A deposit that is not in review or failed is untouched.
     assert!(!fx.db.retry_erc20_deposit(TEST_CHAIN, "0xaaa", 1).unwrap());
 }
@@ -1972,4 +2086,142 @@ async fn review_deposits_are_not_picked_up_by_the_sweeper() {
         .await
         .unwrap();
     assert_eq!(rpc.sent(), 0);
+}
+
+// ------------------------------------------------- broadcast failures
+
+#[tokio::test]
+async fn broadcast_error_then_next_pass_rebroadcasts_the_same_tx_and_settles() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let tx = sweep_tx(501);
+    let rpc = Rpc::start(
+        100,
+        vec![tx.clone()],
+        vec![(
+            tx.clone(),
+            ok_receipt(&tx, 60, 4, TOKEN, &fx.addr, TARGET_A, 100),
+        )],
+    )
+    .await;
+    rpc.fail_next_sends(1); // a rate-limited public RPC refuses the first broadcast
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |_| {}));
+
+    sweeper.process_deposits_once().await.unwrap();
+    // Not sent, not in review, not failed-out: the signed tx is stored.
+    assert_eq!(rpc.sent(), 0);
+    assert_eq!(fx.detected(), 1);
+    let pending = fx
+        .db
+        .pending_sweep_intents(TEST_CHAIN, &["0xaaa:1".to_string()])
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].tx_hash.is_some() && pending[0].raw_tx.is_some());
+    assert_eq!(pending[0].nonce, Some(0));
+    let signed_hash = pending[0].tx_hash.clone().unwrap();
+
+    // Next pass: no receipt, nonce still free -> rebroadcast the same bytes.
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(rpc.sent(), 1);
+    assert_eq!(rpc.hash(0), signed_hash, "same bytes, same hash");
+    assert_eq!(fx.detected(), 1);
+    // Then the receipt is there (the tokens have left the address) and it
+    // settles; nothing was swept twice.
+    rpc.set_balance(0);
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(rpc.sent(), 1);
+    assert_eq!(fx.detected(), 0);
+    let payload = fx.swept_webhook("0xaaa:1").unwrap();
+    assert_eq!(payload["sweeps"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["sweeps"][0]["sweep_tx_hash"], signed_hash);
+}
+
+#[tokio::test]
+async fn nonce_consumed_by_another_tx_goes_to_review() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let rpc = Rpc::start(100, vec![sweep_tx(502)], vec![]).await;
+    rpc.fail_next_sends(1);
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |_| {}));
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(fx.detected(), 1);
+    // Something else used the nonce; our tx has no receipt and can never land.
+    rpc.set_latest_nonce(1);
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(fx.detected(), 0);
+    assert_eq!(
+        fx.db
+            .get_review_kind(TEST_CHAIN, "0xaaa:1")
+            .unwrap()
+            .as_deref(),
+        Some("sweep_review")
+    );
+    assert_eq!(rpc.sent(), 0);
+    assert!(fx.swept_webhook("0xaaa:1").is_none());
+}
+
+#[tokio::test]
+async fn unmined_intent_is_dropped_after_the_wait_passes_and_replans_once() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let tx = sweep_tx(503);
+    let rpc = Rpc::start(
+        100,
+        vec![tx.clone()],
+        vec![(
+            tx.clone(),
+            ok_receipt(&tx, 61, 1, TOKEN, &fx.addr, TARGET_A, 100),
+        )],
+    )
+    .await;
+    // The first broadcast and the nine rebroadcasts all fail: it never lands.
+    rpc.fail_next_sends(10);
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |_| {}));
+    for _ in 0..10 {
+        sweeper.process_deposits_once().await.unwrap();
+    }
+    assert_eq!(rpc.sent(), 0);
+    assert_eq!(fx.detected(), 1);
+    // The tenth wait pass drops the intent; the group re-plans and sends once.
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(rpc.sent(), 1);
+    assert!(rpc.send_calls() >= 11);
+    assert_eq!(fx.detected(), 0);
+    assert!(fx
+        .db
+        .get_review_kind(TEST_CHAIN, "0xaaa:1")
+        .unwrap()
+        .is_none());
+    let payload = fx.swept_webhook("0xaaa:1").unwrap();
+    assert_eq!(payload["sweeps"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn retry_leaves_in_flight_intents_alone_and_names_the_tx() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let tx = sweep_tx(504);
+    let id = pending_intent(&fx, "0xaaa:1", "100", Some(&tx));
+    fx.db
+        .mark_erc20_deposits_failed_for_keys(TEST_CHAIN, &["0xaaa:1".to_string()])
+        .unwrap();
+    // The sweep could still land: retry refuses, naming the transaction.
+    let err = fx
+        .db
+        .retry_erc20_deposit(TEST_CHAIN, "0xaaa", 1)
+        .unwrap_err();
+    assert!(err.to_string().contains(&tx), "{err}");
+    assert_eq!(fx.detected(), 0);
+    assert_eq!(
+        fx.db
+            .pending_sweep_intents(TEST_CHAIN, &["0xaaa:1".to_string()])
+            .unwrap()
+            .len(),
+        1,
+        "the in-flight intent is untouched"
+    );
+    // Once the intent is resolved (here: review), retry releases the deposit.
+    fx.db.finish_sweep_intent(id, "review").unwrap();
+    assert!(fx.db.retry_erc20_deposit(TEST_CHAIN, "0xaaa", 1).unwrap());
+    assert_eq!(fx.detected(), 1);
 }
