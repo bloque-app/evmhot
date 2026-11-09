@@ -31,9 +31,11 @@ intent:
      10% (or to the current estimate, whichever is higher), stores its hash next to the earlier ones, and broadcasts
      it. A transaction held for other reasons is only rebroadcast.
    - With no receipt for any stored hash and the nonce used for 64 blocks, the nonce was used by something outside
-     evmhot, or a receipt is late: the deposits go to review (`A2`) and the intent stays watched. For 5,000 blocks every
-     pass reads its receipts; a late receipt records the sweep and releases the deposits (`kind=review_self_resolved`),
-     and an operator retry is refused meanwhile. The verdict counts blocks, not passes, because a load-balanced
+     evmhot, or a receipt is late: the deposits go to review (`A2`) and the intent stays watched. For 5,000 blocks from that
+     verdict every pass reads its receipts, each intent on its own so one bad hash never stops the network; a late
+     receipt that matches records the sweep and releases the deposits, with that address and token's
+     `balance_shortfall` deposits, in one transaction (`kind=review_self_resolved`). An operator retry is refused
+     meanwhile, and afterwards re-reads every stored hash before releasing anything. The verdict counts blocks, not passes, because a load-balanced
      provider can serve the nonce from a node ahead of the one serving receipts.
    - A transaction unmined with its nonce free raises `kind=sweep_stuck` once after 30 minutes.
    - A native sweep estimates its gas. A failed estimate or a revert counts toward `REQ-SW-4`'s 5 failures; the fifth

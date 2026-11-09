@@ -223,8 +223,9 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   any of its hashes settles or fails it; with no receipt and the nonce unused, the newest bytes are broadcast again, and
   an underpriced transaction that waited 10 passes is re-signed at the same nonce with both fee fields raised by at
   least 10% (or to the estimate); once the nonce has been used for 64 blocks with no receipt of ours, the deposits go to review and the
-  intent stays watched: for 5,000 blocks every pass reads its receipts, a late receipt records the sweep and releases
-  the deposits (`review_self_resolved`), and an operator retry is refused meanwhile. A sweep unmined with its nonce
+  intent stays watched: for 5,000 blocks from that verdict every pass reads its receipts, each intent on its own, a late receipt records the sweep and releases
+  the deposits in one transaction, together with that address and token's `balance_shortfall` deposits
+  (`review_self_resolved`, only when the receipt matches), and an operator retry is refused meanwhile. A sweep unmined with its nonce
   free raises `sweep_stuck` once after 30 minutes.
   Only an intent never signed is dropped.
 - `REQ-SW-14` A deposit enters `needs_review`, and is not swept until an operator releases it, when its sweep's
@@ -280,8 +281,11 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
 - `REQ-WH-10` A sweep target MAY declare a notify URL and the name of the environment variable holding its bearer
   token. Each token `deposit_swept` for a deposit settled into that target is then also delivered there: the same
   body, an outbox row of its own (`(id, "deposit_swept:notify")`) written in the same transaction, the target's own
-  token, and the delivery rules of `REQ-WH-5`. evmhot refuses to start when a notify URL's token is empty. The swap
+  token, and the delivery rules of `REQ-WH-5`, retried for at least two hours, then `notify_failed`. evmhot refuses to
+  start when a notify URL's token is empty. The swap
   service receives bezent's Safe sweeps this way (R12). (Amendment 0005.)
+- `REQ-CF-1` A `[[chains]]` table with a key evmhot does not know MUST be refused at load, so configuration never
+  claims behaviour the binary lacks. (Amendment 0005.)
 - `REQ-WH-11` The token `deposit_swept` body is published as a versioned contract in `contracts/deposit_swept/`
   (JSON Schema, fixtures, changelog); a test checks the payload evmhot builds against it. Consumers ignore unknown
   fields; an additive change bumps the minor version. (Amendment 0005.)
@@ -315,7 +319,9 @@ When the wallet is disabled, `register` and both `block_number` routes answer `5
 
 Both require the bearer token. The host service did not serve them in production. `retry_sweeps` moves a token or native
 deposit in `needs_review` or `failed` back to `detected` in one transaction, refuses while an intent covering it is
-pending, and closes its `review` intents (`closed_by_operator`), never re-opening one. What is owed is then computed
+pending, first re-reads the receipts of every stored hash of the deposit's intents (a matching success
+settles it, a non-matching success refuses the retry), and closes its `review` intents (`closed_by_operator`),
+never re-opening one. What is owed is then computed
 from recorded sweeps alone; retrying a review whose sweep in fact moved the funds is the operator's word that nothing
 more is owed (amendment 0004).
 
@@ -341,7 +347,7 @@ more is owed (amendment 0004).
 - `REQ-OB-4` An alert is a log line starting `EVMHOT_ALERT kind=<kind> network=<network>`, with the deposit's identity
   and transaction where there are some. Kinds: `sweep_review`, `balance_shortfall`, `no_sender`, `pair_blocked`
   (review or failed blockers only), `dust`, `settled_without_sweep`, `native_sweep_failed`, `review_self_resolved`,
-  `sweep_stuck`, and with `REQ-OB-1`/`REQ-OB-2` `lag` and `provider`. `dust` and `pair_blocked` are raised once per deposit
+  `sweep_stuck`, `notify_failed`, and with `REQ-OB-1`/`REQ-OB-2` `lag` and `provider`. `dust` and `pair_blocked` are raised once per deposit
   and blocking state. (Amendment 0004.)
 - `REQ-OB-3` Health reports the store's writer and lists the networks. **(not built)** It also reports whether each
   network's provider answers.

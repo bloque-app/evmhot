@@ -17,7 +17,9 @@ holding its bearer token. Each token `deposit_swept` for a deposit settled into 
 - the same body as the registration's webhook;
 - its own outbox row, keyed `(id, "deposit_swept:notify")`, written in the same transaction (`REQ-WH-7`);
 - `Authorization: Bearer <token>` with the target's token, never the webhook token;
-- the delivery rules of `REQ-WH-5`: at least once, retried, leased.
+- the delivery rules of `REQ-WH-5`: at least once, retried, leased; retried for at least two hours (swap may be
+  redeployed meanwhile), then `EVMHOT_ALERT kind=notify_failed`, and `POST /admin/retry_webhooks` with event
+  `deposit_swept:notify` resends it.
 
 evmhot refuses to start when a target has a `notify_url` and its token variable is empty. A failing notify delivery
 never holds up the registration's webhook, nor the other way round.
@@ -32,11 +34,16 @@ and a changelog, versioned. A test builds the payload with evmhot's own code and
 Consumers ignore unknown fields; an additive change bumps the minor version, any other the major. Version 1.0.0
 covers Polygon and Base alike.
 
+## A3 — Unknown configuration keys
+
+New `REQ-CF-1`: a `[[chains]]` table with a key evmhot does not know is refused at load. The production template had
+carried `detection` and `scan_native`, which this version silently ignored.
+
 ## Identifier ledger
 
 | Action | Identifiers |
 |---|---|
-| New | `REQ-WH-10`, `REQ-WH-11` |
+| New | `REQ-WH-10`, `REQ-WH-11`, `REQ-CF-1` |
 | Revised | none |
 | Withdrawn | none |
 
