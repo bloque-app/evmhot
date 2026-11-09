@@ -5,7 +5,7 @@ form lives outside this repository). Amendments cite these numbers.
 
 | # | Date | Ruling | Form item |
 |---|---|---|---|
-| R1 | 2026-11-08 | No sender list or registrar for bezent; a sweep never pushes addresses elsewhere. *The registrar part is replaced by R12.* | relayed by bezent's maintainers |
+| R1 | 2026-11-08 | No sender list or registrar for bezent; a sweep never pushes addresses elsewhere. *R12 adds a call to the swap service per sweep; evmhot still never calls bezent.* | relayed by bezent's maintainers |
 | R2 | 2026-11-09 | Build all of it: spec, code into `main`, pre-restart fixes, devops repository, deployment | `d-go-build` |
 | R3 | 2026-11-09 | Clients reach evmhot on a new internal hostname; their owners change the base URL at cutover | `d-hostname` |
 | R4 | 2026-11-09 | On restart, scan the detection gap offline first, then move the cursor | `d-gap` |
@@ -16,10 +16,10 @@ form lives outside this repository). Amendments cite these numbers.
 | R9 | 2026-11-09 | Polygon USDT0 and Base USDC also go to bezent's reserve; until bezent admits them they stay in their deposit addresses | `d-other-targets` |
 | R10 | 2026-11-09 | The previous USDC sweep target, an exchange deposit address, is retired | `d-usdc-target` |
 | R11 | 2026-11-09 | Questions to the owner go on the decision form only; reversible choices proceed on the recommended default | Pablo, all sessions |
-| R12 | 2026-11-09 | evmhot registers each sweep into bezent's Safe at bezent itself (`POST /v0/deposits`), not Mediums or Swaps | relayed by Bezent |
+| R12 | 2026-11-09 | On each sweep into bezent's Safe, evmhot calls the swap service's bUSDC path with the sweep's coordinate, tx hash, amount, deposit address and original sender; swap registers it at bezent with its own login. evmhot never calls bezent | bezent's form, 20:17Z, relayed by Bezent |
 | R13 | 2026-11-09 | One sweep per inbound transfer: "one single hot wallet routes to one single user" | relayed by Bezent |
 | R14 | 2026-11-09 | bUSDC is the only route; DUSD "no longer exists, and never will again" | relayed by the Standup Agent |
 | R15 | 2026-11-09 | bezent's DirectedDeposit is the on-chain router on Polygon; other networks don't use it | `d-router-directed` |
 | R16 | 2026-11-09 | Production runs on public RPC endpoints; safety comes from two independent nodes agreeing on one outcome | `a-rpc-keys` |
-| R17 | 2026-11-09 | Base USDC reaches Polygon over CCTP; who sends it (Swaps from a holder, or each deposit address burning to the Safe) is open on bezent's form | `d-cctp-who`, `a-base-holder` |
+| R17 | 2026-11-09 | Base USDC goes through Swaps: evmhot sweeps it to a Swaps holder on Base, and Swaps bridges it over CCTP to the Polygon Safe. The holder's address comes from Swaps; Base stays on hold until then | `d-cctp-who`; bezent's form, 20:20Z |
 | R18 | 2026-11-09 | Deposit addresses stay key-derived, so each is the same address on every network; on-chain sweeping uses EIP-7702 delegation, not contract addresses | chat |
