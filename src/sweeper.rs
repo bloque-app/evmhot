@@ -29,6 +29,29 @@ pub struct Sweeper {
     wallet: Wallet,
     provider: RootProvider<BoxTransport>,
     faucet: Arc<Faucet>,
+    /// Test-only: stop the pass with an error at a chosen point, to model a
+    /// process that dies mid-pass (the store is then picked up by a new sweeper).
+    #[cfg(test)]
+    crash_at: std::sync::Mutex<Option<CrashPoint>>,
+}
+
+/// Where a test may stop a pass, as if the process died there.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CrashPoint {
+    /// After the intent row is written, before anything is signed.
+    AfterIntentCreated,
+    /// After the signed transaction is stored, before it is broadcast.
+    AfterSigned,
+}
+
+/// How long to wait after a faucet top-up before reading the balance again.
+/// A static so tests can set it to zero.
+pub(crate) static FUNDING_SETTLE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(2000);
+
+fn funding_settle() -> Duration {
+    Duration::from_millis(FUNDING_SETTLE_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 use crate::traits::Service;
@@ -88,7 +111,25 @@ impl Sweeper {
             wallet,
             provider,
             faucet,
+            #[cfg(test)]
+            crash_at: std::sync::Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_crash(&self, point: Option<CrashPoint>) {
+        *self.crash_at.lock().unwrap() = point;
+    }
+
+    /// Fails once, at the armed point, in tests; free in production.
+    #[cfg(test)]
+    fn crash_if(&self, point: CrashPoint) -> Result<()> {
+        let mut armed = self.crash_at.lock().unwrap();
+        if *armed == Some(point) {
+            *armed = None;
+            return Err(anyhow::anyhow!("test crash at {point:?}"));
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -454,7 +495,7 @@ impl Sweeper {
         if balance <= gas_cost_with_buffer {
             match self.faucet.fund_new_address(from_address_str).await {
                 Ok(_) => {
-                    sleep(Duration::from_secs(2)).await;
+                    sleep(funding_settle()).await;
                     balance = provider.get_balance(from_address).await?;
                     if balance <= gas_cost_with_buffer {
                         return Err(anyhow::anyhow!(
@@ -1007,7 +1048,7 @@ impl Sweeper {
         if native_balance < estimated_gas_cost_with_buffer {
             match self.faucet.fund_new_address(from_address_str).await {
                 Ok(_) => {
-                    sleep(Duration::from_secs(2)).await;
+                    sleep(funding_settle()).await;
                     native_balance = provider.get_balance(from_address).await?;
                     if native_balance < estimated_gas_cost_with_buffer {
                         return Err(anyhow::anyhow!(
@@ -1037,6 +1078,8 @@ impl Sweeper {
                 .blocking(move |db| db.create_sweep_intent(&new))
                 .await?
         };
+        #[cfg(test)]
+        self.crash_if(CrashPoint::AfterIntentCreated)?;
 
         // Sign locally with an explicit nonce, and store the nonce, hash and raw
         // bytes before broadcasting: whatever happens to the broadcast, the next
@@ -1067,6 +1110,8 @@ impl Sweeper {
                 .blocking(move |db| db.set_sweep_intent_signed(intent_id, nonce, &hash, &raw_hex))
                 .await?;
         }
+        #[cfg(test)]
+        self.crash_if(CrashPoint::AfterSigned)?;
 
         // A broadcast error leaves the intent pending, with its hash and bytes;
         // the next pass resolves it.

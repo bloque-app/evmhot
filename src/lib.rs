@@ -14,6 +14,10 @@ mod webhook;
 #[cfg(test)]
 mod e2e_tests;
 #[cfg(test)]
+mod fake_chain;
+#[cfg(test)]
+mod prop_tests;
+#[cfg(test)]
 mod sweep_tests;
 #[cfg(test)]
 mod test_support;

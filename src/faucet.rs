@@ -95,7 +95,11 @@ impl Faucet {
                     return Err(e.into());
                 }
             };
-            pending.get_receipt().await?
+            // alloy 0.1 has no receipt timeout: bound the wait so one stuck top-up
+            // cannot freeze the sweeper.
+            tokio::time::timeout(std::time::Duration::from_secs(60), pending.get_receipt())
+                .await
+                .map_err(|_| anyhow::anyhow!("faucet top-up receipt timed out"))??
         };
 
         let tx_hash = receipt.transaction_hash.to_string();
