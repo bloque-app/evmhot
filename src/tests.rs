@@ -1846,6 +1846,56 @@ async fn test_webhook_attempt_stored_retries_until_success() {
 }
 
 #[tokio::test]
+async fn paused_delivery_holds_every_row_until_unpaused() {
+    let webhook_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&webhook_server)
+        .await;
+
+    let db_file = NamedTempFile::new().unwrap();
+    let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
+    let paused = WebhookDeliverer::new_for_test(db.clone(), None, 3, 10, 60, 50, 60)
+        .unwrap()
+        .with_delivery_paused(true);
+    paused
+        .enqueue(
+            &webhook_server.uri(),
+            "user1",
+            json!({"id": "polygon:0xabc:1", "event": "deposit_swept"}),
+        )
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        paused
+            .attempt_stored("polygon:0xabc:1", "deposit_swept")
+            .await
+            .unwrap();
+        paused.process_pending_batch().await.unwrap();
+    }
+    let row = db
+        .get_webhook_delivery("polygon:0xabc:1", "deposit_swept")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.attempt_count, 0, "a held delivery counts no attempt");
+    assert!(webhook_server.received_requests().await.unwrap().is_empty());
+
+    // The same store with delivery resumed sends it once.
+    let resumed = test_webhook_deliverer(db.clone());
+    resumed
+        .attempt_stored("polygon:0xabc:1", "deposit_swept")
+        .await
+        .unwrap();
+    let row = db
+        .get_webhook_delivery("polygon:0xabc:1", "deposit_swept")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "delivered");
+    assert_eq!(webhook_server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn test_webhook_attempt_stored_marks_failed_after_max_retries() {
     let webhook_server = MockServer::start().await;
     Mock::given(method("POST"))

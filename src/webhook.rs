@@ -34,6 +34,17 @@ pub struct WebhookDeliverer {
     lease_seconds: u64,
     client: reqwest::Client,
     notify: Arc<Notify>,
+    /// `WEBHOOK_DELIVERY_PAUSED`: every delivery stays `pending` in the outbox and no
+    /// HTTP request is made, so the restart can sweep while nothing downstream fires.
+    /// Unset it and restart to send everything held, in order.
+    paused: bool,
+}
+
+/// True when `name` is set to `1`, `true` or `yes` (any case).
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
 }
 
 /// Seconds between notify attempts: the minimum, or the worker's poll interval if
@@ -84,6 +95,7 @@ impl WebhookDeliverer {
             lease_seconds: config.webhook_lease_seconds,
             client,
             notify: Arc::new(Notify::new()),
+            paused: env_flag("WEBHOOK_DELIVERY_PAUSED"),
         })
     }
 
@@ -113,6 +125,7 @@ impl WebhookDeliverer {
             lease_seconds,
             client,
             notify: Arc::new(Notify::new()),
+            paused: false,
         })
     }
 
@@ -124,6 +137,17 @@ impl WebhookDeliverer {
             .map(|(u, t)| (u.to_string(), t.to_string()))
             .collect();
         self
+    }
+
+    /// Test helper: hold every delivery, as `WEBHOOK_DELIVERY_PAUSED` does.
+    #[cfg(test)]
+    pub fn with_delivery_paused(mut self, paused: bool) -> Self {
+        self.paused = paused;
+        self
+    }
+
+    pub fn delivery_paused(&self) -> bool {
+        self.paused
     }
 
     pub fn notify_worker(&self) {
@@ -184,6 +208,10 @@ impl WebhookDeliverer {
 
     /// Worker path: claim lease, perform one POST, record outcome.
     pub async fn attempt_stored(&self, id: &str, event: &str) -> Result<()> {
+        if self.paused {
+            // Held: the row stays `pending` with no attempt counted.
+            return Ok(());
+        }
         let record = {
             let id = id.to_string();
             let event = event.to_string();
@@ -412,6 +440,9 @@ impl Service for WebhookRetryService {
                 _ = sleep(Duration::from_secs(self.deliverer.poll_interval_secs())) => {}
             }
 
+            if self.deliverer.delivery_paused() {
+                continue;
+            }
             if let Err(e) = self.deliverer.process_pending_batch().await {
                 warn!("Webhook retry worker error: {e:?}");
             }

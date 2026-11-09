@@ -201,3 +201,10 @@ cargo test        # the Postgres backend tests need Docker; they skip when it is
 
 As a library: `HotWalletService::new(config)`, `start_background_services()`, `register`, `verify_transfer`,
 `get_block_number_async`, `set_block_number`, `retry_sweep`, `retry_webhook`.
+
+## Holding deliveries
+
+`WEBHOOK_DELIVERY_PAUSED=1` keeps every webhook and notify delivery `pending` in the outbox: no HTTP request is made
+and no attempt is counted, while detection and sweeps run as usual. evmhot logs
+`EVMHOT_ALERT kind=deliveries_paused` at start. Unset it and restart to send everything held, in order. The cutover
+uses it so the first sweeps reach the Safe before the services that consume `deposit_swept` are ready.

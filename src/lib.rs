@@ -368,6 +368,12 @@ impl HotWalletService {
     }
 
     pub async fn start_background_services(&self) -> anyhow::Result<()> {
+        if self.webhook_deliverer.delivery_paused() {
+            tracing::warn!(
+                "EVMHOT_ALERT kind=deliveries_paused network=- WEBHOOK_DELIVERY_PAUSED is set: every \
+                 webhook and notify delivery stays pending in the outbox until it is unset and evmhot restarts"
+            );
+        }
         let webhook_worker = WebhookRetryService::new(Arc::clone(&self.webhook_deliverer));
         tokio::spawn(async move {
             tracing::info!("Starting Webhook retry worker");
