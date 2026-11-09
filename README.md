@@ -59,7 +59,7 @@ or in `token_targets`, not both.
 
 | `token_targets` key | Meaning |
 |---|---|
-| `kind` | `"transfer"` (sweep to `address`) or `"hold"` (detect and notify, never sweep). Changing a held token to `"transfer"` releases its held deposits on the next pass. |
+| `kind` | `"transfer"` (sweep to `address`) or `"hold"` (detect and notify, never sweep). Changing a held token to `"transfer"` and restarting releases its held deposits on the first pass. |
 | `address` | Required for `transfer`; not allowed for `hold`. |
 | `min` | Smallest sweep, in the token's minor units. A balance below it (or, with `per_sender`, one sender's unswept total) waits for later deposits. |
 | `max` | Largest sweep. A larger amount is swept in several sweeps, each at most `max`; `deposit_swept` lists them all in `sweeps` and is sent once, after the last. A remainder below `min` is topped up from the previous part when both can stay in bounds, otherwise it stays in the deposit address. |

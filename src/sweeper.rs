@@ -663,6 +663,9 @@ impl Sweeper {
             stored.or((first.token_symbol == "UNKNOWN").then_some(18))
         };
 
+        // Only deposits with a recorded sweep are settled. A deposit that joined
+        // the group after the sweeps went out has none; it stays detected and
+        // is swept on a later pass, so it cannot hold the others back.
         let mut settlements = Vec::with_capacity(group.len());
         for deposit in group {
             let sweeps = {
@@ -673,10 +676,7 @@ impl Sweeper {
                     .await?
             };
             if sweeps.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "no sweep recorded for deposit {}",
-                    deposit.key
-                ));
+                continue;
             }
             let outbox = webhook_url.as_ref().map(|webhook_url| {
                 let webhook_id = format!("{}:{}", self.chain.name, deposit.key);
@@ -700,6 +700,12 @@ impl Sweeper {
                 key: deposit.key.clone(),
                 outbox,
             });
+        }
+        if settlements.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no sweep recorded for deposit {}",
+                first.key
+            ));
         }
 
         let enqueued = {

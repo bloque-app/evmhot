@@ -25,16 +25,23 @@ use tempfile::NamedTempFile;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// A placeholder token contract (not any real deployment).
-const TOKEN: &str = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+/// Placeholder token contracts (arbitrary addresses, not tied to any deployment).
+const TOKEN: &str = "0x00000000000000000000000000000000000c0de1";
 /// A second placeholder token.
-const OTHER_TOKEN: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+const OTHER_TOKEN: &str = "0x00000000000000000000000000000000000c0de2";
 /// Placeholder sweep targets.
 const TARGET_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 /// Placeholder senders.
 const SENDER_A: &str = "0x00000000000000000000000000000000000a11ce";
 const SENDER_B: &str = "0x0000000000000000000000000000000000000b0b";
 const UNREACHABLE_WEBHOOK: &str = "http://127.0.0.1:9/hook";
+
+fn checksum(address: &str) -> String {
+    use std::str::FromStr;
+    alloy::primitives::Address::from_str(address)
+        .unwrap()
+        .to_string()
+}
 
 fn sweep_tx(n: u64) -> String {
     hash32(0xf000 + n)
@@ -189,7 +196,8 @@ fn fixture() -> Fixture {
     let addr = wallet.derive_address(0).unwrap().to_string();
     db.register_account("user_1", 0, &addr, UNREACHABLE_WEBHOOK)
         .unwrap();
-    db.store_token_metadata(TEST_CHAIN, TOKEN, "USDT", 6, "Tether USD")
+    // The monitor looks metadata up by the checksummed address.
+    db.store_token_metadata(TEST_CHAIN, &checksum(TOKEN), "USDT", 6, "Test token")
         .unwrap();
     Fixture {
         _db_file: db_file,
@@ -1187,6 +1195,46 @@ async fn req_sw_12_per_sender_deposit_with_no_recorded_sender_is_swept_on_its_ow
     assert!(payload["from_address"].is_null());
 }
 
+#[tokio::test]
+async fn req_sw_7_a_deposit_that_joined_after_the_sweeps_does_not_block_settling_the_others() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    // A sweep for the first deposit went out in an earlier pass (crash before settling).
+    fx.db
+        .record_sweep(
+            TEST_CHAIN,
+            &["0xaaa:1".to_string()],
+            &SweepRecord {
+                sweep_tx_hash: sweep_tx(90),
+                sweep_block_number: 5,
+                sweep_block_hash: hash32(5),
+                sweep_log_index: 2,
+                sweep_amount: "100".into(),
+            },
+        )
+        .unwrap();
+    // A second deposit arrived since; the address now holds nothing.
+    fx.token_deposit("0xbbb", 2, "50", Some(SENDER_B));
+    let rpc = Rpc::start(0, vec![sweep_tx(91)], vec![]).await;
+    fx.sweeper(&rpc, |_| {})
+        .process_deposits_once()
+        .await
+        .unwrap();
+
+    assert!(
+        fx.swept_webhook("0xaaa:1").is_some(),
+        "the swept deposit is settled"
+    );
+    assert_eq!(fx.detected(), 1, "the newcomer waits for a later pass");
+    assert!(fx.swept_webhook("0xbbb:2").is_none());
+    assert_eq!(
+        fx.db
+            .get_sweep_failure_count(TEST_CHAIN, "0xaaa:1")
+            .unwrap(),
+        0
+    );
+}
+
 // ---------------------------------------------------------------- REQ-SW-9
 
 #[tokio::test]
@@ -1314,7 +1362,13 @@ async fn req_dt_10_unknown_symbol_deposit_is_detected_and_really_swept() {
 async fn req_dt_10_long_symbol_token_is_detected_and_swept() {
     let fx = fixture();
     fx.db
-        .store_token_metadata(TEST_CHAIN, TOKEN, "A_VERY_LONG_SYMBOL", 6, "Long")
+        .store_token_metadata(
+            TEST_CHAIN,
+            &checksum(TOKEN),
+            "A_VERY_LONG_SYMBOL",
+            6,
+            "Long",
+        )
         .unwrap();
     let logs = json!({
         "jsonrpc": "2.0", "id": 1,

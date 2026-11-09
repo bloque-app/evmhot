@@ -53,7 +53,8 @@ min_deposit_native = "0"
 # admits_only = true       # optional: this address admits only this token (startup refuses a conflict)
 # per_sender = true        # optional: each sweep covers one sender's deposits (a refund address per sweep)
 #
-# To hold a token until its target is ready, then release it by changing the kind:
+# To hold a token until its target is ready, then release it (change the kind to "transfer", add the
+# address, and restart; held deposits are swept on the first pass):
 # [chains.token_targets."0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"]
 # kind = "hold"
 
