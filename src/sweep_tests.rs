@@ -85,6 +85,12 @@ struct Rpc {
     send_calls: Arc<AtomicUsize>,
     /// The base fee `eth_feeHistory` reports.
     base_fee: Arc<Mutex<u128>>,
+    /// The block number `eth_blockNumber` reports.
+    block: Arc<Mutex<u64>>,
+    /// While set, receipts are not served (an indexer behind the nonce).
+    hide_receipts: Arc<std::sync::atomic::AtomicBool>,
+    /// While set, `eth_estimateGas` for a plain native transfer reverts.
+    native_estimate_fails: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Rpc {
@@ -113,8 +119,38 @@ impl Rpc {
             })
             .mount(&server)
             .await;
+        let native_fails = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let nf = Arc::clone(&native_fails);
+        Mock::given(method("POST"))
+            .and(body_json_contains("eth_estimateGas"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                let is_token_call = body.contains("\"input\"") || body.contains("\"data\"");
+                if !is_token_call && nf.load(Ordering::SeqCst) {
+                    return ResponseTemplate::new(200).set_body_json(json!({
+                        "jsonrpc": "2.0", "id": 1,
+                        "error": {"code": 3, "message": "execution reverted"}
+                    }));
+                }
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": 1, "result": "0x186a0"
+                }))
+            })
+            .mount(&server)
+            .await;
+        let block = Arc::new(Mutex::new(1000u64));
+        let block_for_mock = Arc::clone(&block);
+        Mock::given(method("POST"))
+            .and(body_json_contains("eth_blockNumber"))
+            .respond_with(move |_: &wiremock::Request| {
+                let b = *block_for_mock.lock().unwrap();
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": 1, "result": format!("0x{b:x}")
+                }))
+            })
+            .mount(&server)
+            .await;
         for (needle, result) in [
-            ("eth_estimateGas", json!("0x186a0")),
             ("eth_getBalance", json!("0x0DE0B6B3A7640000")),
             ("eth_chainId", json!("0x89")),
         ] {
@@ -236,10 +272,17 @@ impl Rpc {
             .map(|(hash, receipt)| (hash.to_lowercase(), receipt))
             .collect();
         let learn = Arc::clone(&learned);
+        let hidden = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hidden_for_mock = Arc::clone(&hidden);
         Mock::given(method("POST"))
             .and(body_json_contains("eth_getTransactionReceipt"))
             .respond_with(move |req: &wiremock::Request| {
                 let body: Value = serde_json::from_slice(&req.body).unwrap();
+                if hidden_for_mock.load(Ordering::SeqCst) {
+                    return ResponseTemplate::new(200).set_body_json(
+                        json!({"jsonrpc": "2.0", "id": body["id"], "result": Value::Null}),
+                    );
+                }
                 let wanted = body["params"][0].as_str().unwrap_or("").to_lowercase();
                 let name = learn
                     .lock()
@@ -270,7 +313,22 @@ impl Rpc {
             fail_sends,
             send_calls,
             base_fee,
+            block,
+            hide_receipts: hidden,
+            native_estimate_fails: native_fails,
         }
+    }
+
+    fn set_block(&self, block: u64) {
+        *self.block.lock().unwrap() = block;
+    }
+
+    fn hide_receipts(&self, hidden: bool) {
+        self.hide_receipts.store(hidden, Ordering::SeqCst);
+    }
+
+    fn native_estimate_fails(&self, fails: bool) {
+        self.native_estimate_fails.store(fails, Ordering::SeqCst);
     }
 
     fn set_base_fee(&self, wei: u128) {
@@ -1909,7 +1967,9 @@ async fn review_landed_but_unrecorded_is_never_silently_settled() {
     // Only when something else used the nonce does it go to review.
     let sent_before = rpc.sent();
     rpc.set_latest_nonce(1);
-    sweeper.process_deposits_n(2).await.unwrap();
+    sweeper.process_deposits_once().await.unwrap();
+    rpc.set_block(1000 + 70);
+    sweeper.process_deposits_once().await.unwrap();
     assert_eq!(
         fx.db
             .get_review_kind(TEST_CHAIN, "0xaaa:1")
@@ -2213,7 +2273,12 @@ async fn nonce_consumed_by_another_tx_goes_to_review() {
     // indexing can lag the nonce, so one pass is not enough to conclude it.
     rpc.set_latest_nonce(1);
     sweeper.process_deposits_once().await.unwrap();
-    assert_eq!(fx.detected(), 1, "waits a second pass before concluding");
+    assert_eq!(fx.detected(), 1, "not concluded on first sight");
+    // The verdict is by elapsed blocks, not passes: many passes at one block
+    // conclude nothing.
+    sweeper.process_deposits_n(5).await.unwrap();
+    assert_eq!(fx.detected(), 1);
+    rpc.set_block(1000 + 70);
     sweeper.process_deposits_once().await.unwrap();
     assert_eq!(fx.detected(), 0);
     assert_eq!(
@@ -2932,11 +2997,22 @@ async fn native_sweep_whose_nonce_was_used_by_another_goes_to_review() {
     let sweeper = fx.sweeper(&rpc, |_| {});
     sweeper.process_deposits_once().await.unwrap();
     rpc.set_latest_nonce(1);
-    sweeper.process_deposits_n(2).await.unwrap();
+    sweeper.process_deposits_once().await.unwrap();
+    rpc.set_block(1000 + 70);
+    sweeper.process_deposits_once().await.unwrap();
     let counts = fx.db.deposit_queue_counts(TEST_CHAIN).unwrap();
     assert_eq!(counts.native_needs_review, 1);
     assert_eq!(counts.native_detected, 0);
-    // Only the retry route moves it back; its review intent is closed.
+    // The verdict is still watched for a late receipt, so the retry route
+    // refuses; once the watch ends, it moves the deposit back and closes the intent.
+    assert!(fx.db.retry_native_deposit(TEST_CHAIN, "0xnative1").is_err());
+    let watched = fx
+        .db
+        .sweep_intents_in_state(TEST_CHAIN, "review_gone")
+        .unwrap();
+    fx.db
+        .move_sweep_intent(watched[0].id, "review_gone", "review")
+        .unwrap();
     assert!(fx.db.retry_native_deposit(TEST_CHAIN, "0xnative1").unwrap());
     assert_eq!(
         fx.db
@@ -3240,4 +3316,251 @@ fn notify_url_needs_a_token_in_the_environment_or_startup_fails() {
         "notify_url = \"ftp://x\"\nnotify_token_env = \"EVMHOT_TEST_NOTIFY_TOKEN_SET\""
     ))
     .is_err());
+}
+
+// ------------------------------------------------------ third review's findings
+
+#[tokio::test]
+async fn a_native_treasury_that_reverts_is_counted_then_reviewed_not_retried_forever() {
+    // The estimate fails (a contract treasury that reverts), so nothing is sent
+    // and no gas is spent; the failures are counted, and the fifth goes to review.
+    let fx = fixture();
+    native_deposit(&fx, "0xnative1");
+    let rpc = Rpc::start(0, vec![sweep_tx(1001)], vec![]).await;
+    rpc.native_estimate_fails(true);
+    let sweeper = fx.sweeper(&rpc, |_| {});
+    sweeper.process_deposits_n(4).await.unwrap();
+    assert_eq!(
+        fx.db
+            .deposit_queue_counts(TEST_CHAIN)
+            .unwrap()
+            .native_needs_review,
+        0
+    );
+    sweeper.process_deposits_once().await.unwrap();
+    let counts = fx.db.deposit_queue_counts(TEST_CHAIN).unwrap();
+    assert_eq!(counts.native_needs_review, 1);
+    assert_eq!(counts.native_detected, 0);
+    assert_eq!(rpc.sent(), 0, "no transaction, so no gas, was spent");
+    // And it stays there.
+    sweeper.process_deposits_n(3).await.unwrap();
+    assert_eq!(rpc.sent(), 0);
+}
+
+#[tokio::test]
+async fn a_native_sweep_that_reverts_on_chain_counts_toward_review() {
+    let fx = fixture();
+    native_deposit(&fx, "0xnative1");
+    // Every attempt reverts on chain.
+    let hs: Vec<String> = (0..6).map(|i| sweep_tx(1010 + i)).collect();
+    let receipts = hs
+        .iter()
+        .map(|h| {
+            (
+                h.clone(),
+                receipt_json(h, 11, 0, &fx.addr, TEST_TREASURY, false, vec![]),
+            )
+        })
+        .collect();
+    let rpc = Rpc::start(0, hs, receipts).await;
+    let sweeper = fx.sweeper(&rpc, |_| {});
+    sweeper.process_deposits_n(12).await.unwrap();
+    let counts = fx.db.deposit_queue_counts(TEST_CHAIN).unwrap();
+    assert_eq!(
+        counts.native_needs_review, 1,
+        "five reverts end the retrying"
+    );
+    assert!(rpc.sent() <= 5, "{} sweeps were sent", rpc.sent());
+}
+
+#[tokio::test]
+async fn a_false_nonce_used_verdict_heals_when_the_receipt_shows_up() {
+    // Our transaction landed, but the node that answers for receipts is behind
+    // the one that answers for the nonce. After 64 blocks the sweep is reviewed
+    // as lost; then the receipt appears.
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let t = sweep_tx(1021);
+    let rpc = Rpc::start(
+        100,
+        vec![t.clone()],
+        vec![(
+            t.clone(),
+            ok_receipt(&t, 130, 2, TOKEN, &fx.addr, TARGET_A, 100),
+        )],
+    )
+    .await;
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |_| {}));
+    rpc.hide_receipts(true);
+    sweeper.process_deposits_once().await.unwrap(); // sent
+    rpc.set_latest_nonce(1); // it landed, as far as the nonce shows
+    rpc.set_balance(0);
+    sweeper.process_deposits_once().await.unwrap();
+    rpc.set_block(1000 + 70);
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(
+        fx.db
+            .get_review_kind(TEST_CHAIN, "0xaaa:1")
+            .unwrap()
+            .as_deref(),
+        Some("sweep_review")
+    );
+    // Retry is refused while the verdict is still being re-checked.
+    assert!(fx.db.retry_erc20_deposit(TEST_CHAIN, "0xaaa", 1).is_err());
+
+    // The receipt shows up: it is recorded and settled through the usual path.
+    rpc.hide_receipts(false);
+    sweeper.process_deposits_n(2).await.unwrap();
+    assert_eq!(fx.detected(), 0);
+    assert_eq!(fx.db.get_review_kind(TEST_CHAIN, "0xaaa:1").unwrap(), None);
+    let payload = fx
+        .swept_webhook("0xaaa:1")
+        .expect("deposit_swept after the heal");
+    assert_eq!(payload["sweeps"].as_array().unwrap().len(), 1);
+    // Said once, so an operator reading the log knows the review undid itself.
+    assert!(!fx
+        .db
+        .alert_once(TEST_CHAIN, "0xaaa:1", "review_self_resolved")
+        .unwrap());
+    assert_eq!(rpc.sent(), 1, "nothing was swept twice");
+}
+
+#[test]
+fn highest_landed_nonce_counts_operator_closed_and_watched_intents() {
+    let fx = fixture();
+    for (n, state) in [
+        (3u64, "closed_by_operator"),
+        (5, "review_gone"),
+        (9, "dropped"),
+    ] {
+        let id = fx
+            .db
+            .create_sweep_intent(&crate::db::NewSweepIntent {
+                chain: TEST_CHAIN.into(),
+                account_id: "user_1".into(),
+                address: fx.addr.to_lowercase(),
+                token_address: checksum(TOKEN),
+                group_key: "g".into(),
+                keys: vec!["0xaaa:1".into()],
+                part_index: 0,
+                amount: "1".into(),
+                target: checksum(TARGET_A),
+            })
+            .unwrap();
+        fx.db
+            .set_sweep_intent_signed(
+                id,
+                n,
+                &crate::db::IntentTx {
+                    hash: sweep_tx(1030 + n),
+                    raw: "0x".into(),
+                    max_fee: "1".into(),
+                    max_priority: "1".into(),
+                },
+            )
+            .unwrap();
+        fx.db.finish_sweep_intent(id, state).unwrap();
+    }
+    // dropped ones never landed; the others may have.
+    assert_eq!(
+        fx.db
+            .highest_landed_intent_nonce(TEST_CHAIN, "user_1")
+            .unwrap(),
+        Some(5)
+    );
+}
+
+#[tokio::test]
+async fn a_signed_intent_with_unreadable_transactions_is_never_dropped() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let id = pending_intent(&fx, "0xaaa:1", "100", Some(&sweep_tx(1041)));
+    rusqlite::Connection::open(fx._db_file.path())
+        .unwrap()
+        .execute(
+            "UPDATE sweep_intents SET txs = 'not json' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    let rpc = Rpc::start(100, vec![sweep_tx(1042)], vec![]).await;
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |_| {}));
+    // The damage surfaces as an error, and nothing is dropped or re-planned.
+    assert!(sweeper.process_deposits_once().await.is_err());
+    assert_eq!(fx.detected(), 1);
+    assert_eq!(rpc.sent(), 0);
+    assert_eq!(
+        fx.db
+            .all_pending_sweep_intents(TEST_CHAIN)
+            .map(|v| v.len())
+            .unwrap_or(0),
+        0
+    );
+    let state: String = rusqlite::Connection::open(fx._db_file.path())
+        .unwrap()
+        .query_row("SELECT state FROM sweep_intents WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(state, "pending");
+}
+
+#[tokio::test]
+async fn a_held_transaction_raises_sweep_stuck_once() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let rpc = Rpc::start(100, vec![sweep_tx(1051)], vec![]).await; // never lands
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |_| {}));
+    sweeper.set_stuck_after_passes(4);
+    sweeper.process_deposits_n(4).await.unwrap();
+    // Not yet: it has waited three passes.
+    assert!(fx
+        .db
+        .alert_once(TEST_CHAIN, "0xaaa:1", "sweep_stuck")
+        .unwrap());
+    // (that call recorded it; clear by using a second deposit's key below)
+    let fx = fixture();
+    fx.token_deposit("0xbbb", 2, "100", Some(SENDER_A));
+    let rpc = Rpc::start(100, vec![sweep_tx(1052)], vec![]).await;
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |_| {}));
+    sweeper.set_stuck_after_passes(4);
+    sweeper.process_deposits_n(6).await.unwrap();
+    assert!(!fx
+        .db
+        .alert_once(TEST_CHAIN, "0xbbb:2", "sweep_stuck")
+        .unwrap());
+    assert_eq!(
+        rpc.sent(),
+        1,
+        "it is rebroadcast, not replaced by a new plan"
+    );
+}
+
+#[test]
+fn a_faucet_receipt_timeout_is_a_transient_funding_error() {
+    assert!(crate::sweeper::is_transient_funding_error_for_tests(
+        "faucet top-up receipt timed out"
+    ));
+}
+
+#[tokio::test]
+async fn deposits_without_a_sender_are_reserved_in_the_same_pass() {
+    // 100 is owed to a deposit with no recorded sender (it goes to review), 200 to
+    // a known sender. The address holds 200: the known sender's sweep would spend
+    // the other's tokens, so it is a shortfall right away, not one pass late.
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", None);
+    fx.token_deposit("0xbbb", 2, "200", Some(SENDER_A));
+    let rpc = Rpc::start(200, vec![sweep_tx(1061)], vec![]).await;
+    fx.sweeper(&rpc, target_for(TOKEN, |t| t.per_sender = true))
+        .process_deposits_once()
+        .await
+        .unwrap();
+    assert_eq!(rpc.sent(), 0);
+    assert_eq!(
+        fx.db
+            .get_review_kind(TEST_CHAIN, "0xbbb:2")
+            .unwrap()
+            .as_deref(),
+        Some("balance_shortfall")
+    );
 }

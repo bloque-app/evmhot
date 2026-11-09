@@ -1423,6 +1423,44 @@ fn assert_order_intents_and_review(db: &Db) {
     assert!(db.pending_sweep_intents("base", &group).unwrap().is_empty());
     assert_eq!(db.get_sweeps("base", "0xccc:1").unwrap(), vec![rec]);
 
+    // F-002a review: the first block a nonce was seen used sticks; intents are
+    // listed by state; a watched verdict moves on; a wrongly reviewed deposit is
+    // released.
+    let gid = db
+        .create_sweep_intent(&evmhot::db::NewSweepIntent {
+            chain: "base".to_string(),
+            account_id: "acct-a".to_string(),
+            address: "0xaddr-a".to_string(),
+            token_address: "0xtoken1".to_string(),
+            group_key: "g2".to_string(),
+            keys: vec!["0xeee:2".to_string()],
+            part_index: 0,
+            amount: "1".to_string(),
+            target: "0xtarget".to_string(),
+        })
+        .unwrap();
+    assert_eq!(db.note_nonce_used_block(gid, 500).unwrap(), 500);
+    assert_eq!(db.note_nonce_used_block(gid, 900).unwrap(), 500);
+    db.finish_sweep_intent(gid, "review_gone").unwrap();
+    assert_eq!(
+        db.sweep_intents_in_state("base", "review_gone")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(db.all_pending_sweep_intents("base").unwrap().is_empty());
+    db.mark_erc20_deposits_needs_review_for_keys("base", &["0xeee:2".to_string()], "sweep_review")
+        .unwrap();
+    assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 4);
+    db.release_review_deposits_for_keys("base", &["0xeee:2".to_string()], false)
+        .unwrap();
+    assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 5);
+    db.move_sweep_intent(gid, "review_gone", "review").unwrap();
+    assert!(db
+        .sweep_intents_in_state("base", "review_gone")
+        .unwrap()
+        .is_empty());
+
     // needs_review is out of the detected queue, counted, and retried only by
     // the retry call.
     let review = vec!["0xaaa:3".to_string()];

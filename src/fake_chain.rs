@@ -65,6 +65,8 @@ pub enum MinedKind {
         value: u128,
         success: bool,
     },
+    /// A transaction from outside evmhot that used the address's nonce.
+    Outside,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +105,8 @@ pub struct Chain {
     mined_nonce: HashMap<Address, u64>,
     mempool: Vec<Held>,
     evicted: Vec<Held>,
+    /// Replaced transactions that the network still has and may mine first.
+    ghosts: Vec<Held>,
     receipts: HashMap<B256, (Value, u64)>,
     pub mined: Vec<Mined>,
     log_in_block: u64,
@@ -114,7 +118,13 @@ pub struct Chain {
     pub p_delay: u64,
     pub p_evict: u64,
     /// Whether receipts show up one step after mining.
-    pub receipt_lag: bool,
+    /// How many steps after mining a receipt becomes visible (the nonce is
+    /// visible at once: two views of the chain).
+    pub receipt_lag_steps: u64,
+    /// Percent chance a replaced transaction stays mineable.
+    pub p_ghost: u64,
+    /// Native transfers to these addresses revert (a contract treasury).
+    pub revert_native_to: std::collections::HashSet<Address>,
     pub rng: Rng,
     pub broadcast_calls: u64,
 }
@@ -135,6 +145,7 @@ impl Chain {
             mined_nonce: HashMap::new(),
             mempool: Vec::new(),
             evicted: Vec::new(),
+            ghosts: Vec::new(),
             receipts: HashMap::new(),
             mined: Vec::new(),
             log_in_block: 0,
@@ -142,7 +153,9 @@ impl Chain {
             accept_on_error: 50,
             p_delay: 30,
             p_evict: 15,
-            receipt_lag: false,
+            receipt_lag_steps: 0,
+            p_ghost: 0,
+            revert_native_to: std::collections::HashSet::new(),
             rng: Rng::new(seed),
             broadcast_calls: 0,
         }
@@ -171,11 +184,30 @@ impl Chain {
     }
 
     fn admit(&mut self, held: Held) {
-        // Replace whatever is held at (from, nonce).
-        self.mempool
-            .retain(|h| !(h.from == held.from && h.nonce == held.nonce));
-        self.evicted
-            .retain(|h| !(h.from == held.from && h.nonce == held.nonce));
+        // Replace whatever is held at (from, nonce). The network may still have
+        // the old one and mine it first.
+        let (from, nonce) = (held.from, held.nonce);
+        let mut replaced: Vec<Held> = Vec::new();
+        self.mempool.retain(|h| {
+            let same = h.from == from && h.nonce == nonce;
+            if same {
+                replaced.push(h.clone());
+            }
+            !same
+        });
+        self.evicted.retain(|h| {
+            let same = h.from == from && h.nonce == nonce;
+            if same {
+                replaced.push(h.clone());
+            }
+            !same
+        });
+        for mut old in replaced {
+            if old.from != self.faucet && self.rng.chance(self.p_ghost) {
+                old.land_at_step = self.step + self.rng.below(4);
+                self.ghosts.push(old);
+            }
+        }
         let mut held = held;
         if held.from == self.faucet {
             held.land_at_step = 0; // the faucet's top-ups are mined at once
@@ -313,10 +345,41 @@ impl Chain {
                     i += 1;
                 }
             }
+            // Replaced transactions the network still holds.
+            let mut j = 0;
+            while j < self.ghosts.len() {
+                let g = &self.ghosts[j];
+                if g.nonce == self.latest_nonce(g.from)
+                    && g.land_at_step <= self.step
+                    && g.max_fee >= self.base_fee
+                {
+                    let g = self.ghosts.remove(j);
+                    self.execute(g);
+                    landed = true;
+                } else {
+                    j += 1;
+                }
+            }
             if !landed {
                 break;
             }
         }
+    }
+
+    /// A transaction from outside evmhot takes an address's next nonce: whatever
+    /// was held at it can never land.
+    pub fn outside_tx(&mut self, a: Address) {
+        let n = self.latest_nonce(a);
+        self.mempool.retain(|h| !(h.from == a && h.nonce == n));
+        self.evicted.retain(|h| !(h.from == a && h.nonce == n));
+        self.ghosts.retain(|h| !(h.from == a && h.nonce == n));
+        *self.mined_nonce.entry(a).or_insert(0) += 1;
+        self.mined.push(Mined {
+            hash: format!("0xoutside{}_{}", a, n),
+            from: a,
+            nonce: n,
+            kind: MinedKind::Outside,
+        });
     }
 
     /// One block: some held transactions may be evicted, the rest land if ready.
@@ -340,6 +403,11 @@ impl Chain {
             eprintln!("execute {} from {} nonce {}", h.hash, h.from, h.nonce);
         }
         *self.mined_nonce.entry(h.from).or_insert(0) += 1;
+        // Nothing else can land at this nonce now.
+        let (f, n) = (h.from, h.nonce);
+        self.mempool.retain(|x| !(x.from == f && x.nonce == n));
+        self.evicted.retain(|x| !(x.from == f && x.nonce == n));
+        self.ghosts.retain(|x| !(x.from == f && x.nonce == n));
         let is_token = h.to == self.token && h.input.len() == 4 + 64;
         let mut logs = Vec::new();
         let (kind, success, gas) = if is_token {
@@ -366,7 +434,7 @@ impl Chain {
             )
         } else {
             let bal = *self.native_bal.get(&h.from).unwrap_or(&0);
-            let ok = bal >= h.value;
+            let ok = bal >= h.value && !self.revert_native_to.contains(&h.to);
             if ok {
                 *self.native_bal.entry(h.from).or_insert(0) -= h.value;
                 *self.native_bal.entry(h.to).or_insert(0) += h.value;
@@ -394,8 +462,8 @@ impl Chain {
             success,
             logs,
         );
-        let visible = if self.receipt_lag && h.from != self.faucet {
-            self.step + 1
+        let visible = if h.from != self.faucet {
+            self.step + self.receipt_lag_steps
         } else {
             self.step
         };
@@ -504,6 +572,11 @@ impl Chain {
                         return Err((3, "execution reverted".into()));
                     }
                     return Ok(json!("0x186a0"));
+                }
+                if let Ok(to) = addr(&params[0]["to"]) {
+                    if self.revert_native_to.contains(&to) {
+                        return Err((3, "execution reverted".into()));
+                    }
                 }
                 Ok(json!("0x5208"))
             }

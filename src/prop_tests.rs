@@ -107,6 +107,10 @@ struct Case {
     next_id: u64,
     trace: Vec<String>,
     sweeper: Sweeper,
+    /// Deposits recorded without any tokens arriving (REQ-SW-3 territory).
+    unfunded: HashSet<String>,
+    /// Tokens credited on the chain per deposit address.
+    credited: HashMap<Address, u128>,
 }
 
 fn build_sweeper(case_uri: &str, db: &Db, shape: Shape) -> Sweeper {
@@ -156,7 +160,15 @@ async fn new_case(seed: u64) -> Case {
     }
     db.store_token_metadata(TEST_CHAIN, &checksum(TOKEN), "TKN", 6, "Test token")
         .unwrap();
-    chain.receipt_lag = rng.chance(40);
+    // Receipts lag the nonce by up to three steps; replaced transactions often
+    // stay mineable; some cases have a contract treasury that reverts native sweeps.
+    chain.receipt_lag_steps = rng.below(4);
+    chain.p_ghost = rng.below(60);
+    if rng.chance(25) {
+        chain
+            .revert_native_to
+            .insert(Address::from_str(test_support::TEST_TREASURY).unwrap());
+    }
     chain.p_delay = 20 + rng.below(30);
     chain.p_evict = rng.below(25);
     chain.accept_on_error = rng.below(100);
@@ -178,6 +190,8 @@ async fn new_case(seed: u64) -> Case {
         next_id: 1,
         trace: Vec::new(),
         sweeper,
+        unfunded: HashSet::new(),
+        credited: HashMap::new(),
     }
 }
 
@@ -231,13 +245,19 @@ impl Case {
                 None,
             )
             .unwrap();
-        *self
-            .chain
-            .lock()
-            .unwrap()
-            .token_bal
-            .entry(addr)
-            .or_insert(0) += amount;
+        // One deposit in ten is recorded without its tokens ever arriving.
+        if self.rng.chance(10) {
+            self.unfunded.insert(format!("{tx}:{}", id % 5));
+        } else {
+            *self
+                .chain
+                .lock()
+                .unwrap()
+                .token_bal
+                .entry(addr)
+                .or_insert(0) += amount;
+            *self.credited.entry(addr).or_insert(0) += amount;
+        }
         self.note(format!(
             "token deposit {reg} {amount} from {sender:?} ({tx})"
         ));
@@ -409,8 +429,13 @@ impl Case {
                 if state == "pending" {
                     *open_per_account.entry(account.clone()).or_insert(0) += 1;
                 }
-                // A dropped intent can no longer account for a transaction.
-                if state != "dropped" {
+                // Only an intent that can still resolve may account for a mined
+                // transaction. A review or closed-by-operator one has given up on
+                // its hashes, so one of them landing would be an unrecorded sweep.
+                if matches!(
+                    state.as_str(),
+                    "pending" | "failed" | "succeeded" | "review_gone"
+                ) {
                     live_intent_hashes.extend(hashes.iter().cloned());
                 }
                 intent_hashes.insert(id, hashes);
@@ -428,8 +453,28 @@ impl Case {
         for m in &chain.mined {
             mined_by_hash.insert(m.hash.to_lowercase(), m);
         }
+        // Chain-side totals: what left each address never exceeds what it received.
+        let mut moved: HashMap<Address, u128> = HashMap::new();
         for m in &chain.mined {
-            if !deposit_addrs.contains_key(&m.from) {
+            if let MinedKind::Token {
+                amount,
+                success: true,
+                ..
+            } = &m.kind
+            {
+                *moved.entry(m.from).or_insert(0) += amount;
+            }
+        }
+        for (a, out) in &moved {
+            if deposit_addrs.contains_key(a) && *out > *self.credited.get(a).unwrap_or(&0) {
+                self.fail(&format!(
+                    "{a} moved {out} tokens but was credited {}",
+                    self.credited.get(a).unwrap_or(&0)
+                ));
+            }
+        }
+        for m in &chain.mined {
+            if !deposit_addrs.contains_key(&m.from) || matches!(m.kind, MinedKind::Outside) {
                 continue;
             }
             let h = m.hash.to_lowercase();
@@ -469,6 +514,17 @@ impl Case {
             }
         }
 
+        // Deposits an operator closed intents for.
+        let mut closed_keys: HashSet<String> = HashSet::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT keys FROM sweep_intents WHERE state = 'closed_by_operator'")
+                .unwrap();
+            for r in stmt.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+                let keys: Vec<String> = serde_json::from_str(&r.unwrap()).unwrap_or_default();
+                closed_keys.extend(keys);
+            }
+        }
         // Deposits.
         struct Dep {
             key: String,
@@ -516,6 +572,17 @@ impl Case {
             let rec = recorded.get(&d.key);
             if d.status == "swept" {
                 let Some(rec) = rec else {
+                    // Allowed only for a deposit whose tokens never arrived (the
+                    // bounded zero-balance rule) or one an operator closed out.
+                    if self.unfunded.contains(&d.key) || closed_keys.contains(&d.key) {
+                        if swept_webhooks.contains_key(&id) {
+                            self.fail(&format!(
+                                "deposit {} settled silently but has an event",
+                                d.key
+                            ));
+                        }
+                        continue;
+                    }
                     self.fail(&format!("deposit {} settled with no recorded sweep", d.key));
                 };
                 let Some(w) = swept_webhooks.get(&id) else {
@@ -648,7 +715,7 @@ impl Case {
             c.p_delay = 0;
             c.p_evict = 0;
         }
-        for _ in 0..80 {
+        for _ in 0..140 {
             self.pass(None).await;
             self.chain.lock().unwrap().mine();
             self.chain.lock().unwrap().step += 1;
@@ -664,7 +731,7 @@ impl Case {
             .unwrap();
         if open != 0 {
             let mut stmt = conn
-                .prepare("SELECT id, account_id, token_address, keys, nonce, passes, gone_passes, tx_hash FROM sweep_intents WHERE state = 'pending'")
+                .prepare("SELECT id, account_id, token_address, keys, nonce, passes, gone_block, tx_hash FROM sweep_intents WHERE state = 'pending'")
                 .unwrap();
             let rows: Vec<String> = stmt
                 .query_map([], |r| {
@@ -694,6 +761,84 @@ impl Case {
             self.fail(&format!(
                 "{open} intents still open after settling: {rows:?}; {nonces:?}; held {held:?}"
             ));
+        }
+        // Every deposit left in review states a reason that the chain agrees with.
+        {
+            let chain = self.chain.lock().unwrap();
+            let outside_nonces: HashSet<(Address, u64)> = chain
+                .mined
+                .iter()
+                .filter(|m| matches!(m.kind, MinedKind::Outside))
+                .map(|m| (m.from, m.nonce))
+                .collect();
+            let by_reg: HashMap<String, Address> = self.accounts.iter().cloned().collect();
+            let mut stmt = conn
+                .prepare("SELECT account_id, keys, state, nonce FROM sweep_intents WHERE state IN ('review', 'review_gone')")
+                .unwrap();
+            let reviewed: Vec<(String, Vec<String>, String, Option<i64>)> = stmt
+                .query_map([], |r| {
+                    let keys: String = r.get(1)?;
+                    Ok((
+                        r.get(0)?,
+                        serde_json::from_str(&keys).unwrap_or_default(),
+                        r.get(2)?,
+                        r.get(3)?,
+                    ))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            for (reg, keys, state, nonce) in &reviewed {
+                let addr = by_reg[reg];
+                let nonce = nonce.unwrap_or(-1) as u64;
+                if !outside_nonces.contains(&(addr, nonce)) {
+                    drop(chain);
+                    self.fail(&format!(
+                        "{state} intent for {keys:?} (nonce {nonce}) but no outside transaction used it"
+                    ));
+                }
+            }
+            let mut stmt = conn
+                .prepare("SELECT tx_hash, log_index, review_kind, from_address FROM erc20_deposits WHERE status = 'needs_review'")
+                .unwrap();
+            let rows: Vec<(String, i64, Option<String>, Option<String>)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            for (tx, log, kind, sender) in rows {
+                let key = format!("{tx}:{log}");
+                let ok = match kind.as_deref() {
+                    Some("no_sender") => sender.is_none(),
+                    Some("balance_shortfall") => self.shape.owed_mode(),
+                    Some("sweep_review") => reviewed.iter().any(|(_, k, _, _)| k.contains(&key)),
+                    _ => false,
+                };
+                if !ok {
+                    drop(chain);
+                    self.fail(&format!("deposit {key} left in review for {kind:?}, which the chain does not bear out"));
+                }
+            }
+            let mut stmt = conn
+                .prepare("SELECT tx_hash, review_kind FROM deposits WHERE status = 'needs_review'")
+                .unwrap();
+            let native: Vec<(String, Option<String>)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            for (tx, kind) in native {
+                let ok = match kind.as_deref() {
+                    Some("sweep_review") => reviewed.iter().any(|(_, k, _, _)| k.contains(&tx)),
+                    // The treasury is a contract that reverts every native sweep.
+                    Some("native_sweep_failed") => !chain.revert_native_to.is_empty(),
+                    _ => false,
+                };
+                if !ok {
+                    drop(chain);
+                    self.fail(&format!("native deposit {tx} left in review for {kind:?}, which the chain does not bear out"));
+                }
+            }
         }
         // A deposit still detected must be blocked by a deposit in review/failed
         // on its address (whole-balance targets); owed modes reserve instead.
@@ -751,7 +896,12 @@ async fn run_case(seed: u64, steps: usize) {
         match roll {
             0..=24 => case.deposit_token(),
             25..=33 => case.deposit_native(),
-            34..=63 => {
+            61..=63 => {
+                let (_, addr) = case.accounts[case.rng.below(2) as usize].clone();
+                case.chain.lock().unwrap().outside_tx(addr);
+                case.note(format!("outside tx takes {addr}'s next nonce"));
+            }
+            34..=60 => {
                 let crash = if case.rng.chance(12) {
                     Some(if case.rng.chance(50) {
                         CrashPoint::AfterIntentCreated
