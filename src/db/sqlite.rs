@@ -1962,6 +1962,27 @@ impl Db {
         Ok(out)
     }
 
+    pub fn sweep_intent_history_for_keys(
+        &self,
+        chain: &str,
+        keys: &[String],
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let conn = self.read.get()?;
+        let mut out = Vec::new();
+        for key in keys {
+            let mut stmt = conn.prepare(
+                "SELECT state, tx_hash FROM sweep_intents WHERE chain = ?1 AND keys LIKE ?2 ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![chain, format!("%\"{key}\"%")], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn blocking_erc20_deposits(
         &self,
         chain: &str,

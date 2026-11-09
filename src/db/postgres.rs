@@ -1232,6 +1232,27 @@ impl PostgresBackend {
         Ok(out)
     }
 
+    pub fn sweep_intent_history_for_keys(
+        &self,
+        chain: &str,
+        keys: &[String],
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let mut guard = self.conn()?;
+        let mut out = Vec::new();
+        for key in keys {
+            let pattern = format!("%\"{key}\"%");
+            let rows = guard.client().query(
+                "SELECT state, tx_hash FROM sweep_intents WHERE chain = $1 AND keys LIKE $2 ORDER BY id",
+                &[&chain, &pattern],
+            )?;
+            out.extend(
+                rows.into_iter()
+                    .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1))),
+            );
+        }
+        Ok(out)
+    }
+
     pub fn blocking_erc20_deposits(
         &self,
         chain: &str,

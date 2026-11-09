@@ -543,6 +543,7 @@ impl Sweeper {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_intent(
         &self,
         reg: &str,
@@ -789,7 +790,7 @@ impl Sweeper {
             value = value.saturating_sub(extra);
         } else {
             // A higher fee needs more gas in the address.
-            self.ensure_gas(address_str, address, old.gas_limit as u128, max_fee)
+            self.ensure_gas(address_str, address, old.gas_limit, max_fee)
                 .await?;
         }
         let alloy::primitives::TxKind::Call(to) = old.to else {
@@ -1018,16 +1019,16 @@ impl Sweeper {
             // intent that could have moved funds. Failed and dropped intents did
             // not; a closed-by-operator one is the operator's word that it did
             // not matter.
-            let intent_states = {
+            let history = {
                 let chain_name = self.chain.name.clone();
                 let keys = keys.clone();
                 self.db
-                    .blocking(move |db| db.sweep_intent_states_for_keys(&chain_name, &keys))
+                    .blocking(move |db| db.sweep_intent_history_for_keys(&chain_name, &keys))
                     .await?
             };
-            let could_have_moved = intent_states
+            let could_have_moved = history
                 .iter()
-                .any(|st| st != "failed" && st != "dropped" && st != "closed_by_operator");
+                .any(|(st, _)| st != "failed" && st != "dropped" && st != "closed_by_operator");
             if token_balance.is_zero() && !owed_mode && !could_have_moved {
                 let retry_count = {
                     let chain_name = self.chain.name.clone();
@@ -1044,6 +1045,23 @@ impl Sweeper {
                             db.mark_erc20_deposits_swept_for_keys(&chain_name, &keys)
                         })
                         .await?;
+                    // Settled with no sweep on record. With no intent history that
+                    // is the plain REQ-SW-3 case; with any (a closed-by-operator
+                    // review, say) the funds may really have moved, and nobody
+                    // is told by a `deposit_swept`: so say it, once.
+                    if !history.is_empty() {
+                        let hashes: Vec<&str> =
+                            history.iter().filter_map(|(_, h)| h.as_deref()).collect();
+                        let tx = if hashes.is_empty() {
+                            "-".to_string()
+                        } else {
+                            hashes.join(",")
+                        };
+                        for key in group.iter().map(|d| &d.key) {
+                            self.alert_once_with_tx(key, "settled_without_sweep", &tx)
+                                .await?;
+                        }
+                    }
                 }
             }
             return Ok(Outcome::Idle);
@@ -1085,6 +1103,7 @@ impl Sweeper {
 
     /// One `transfer(target, amount)` call: intent first, then signed with an
     /// explicit nonce, stored, broadcast. The receipt is read on a later pass.
+    #[allow(clippy::too_many_arguments)]
     async fn send_erc20_part(
         &self,
         reg: &str,
@@ -1232,6 +1251,10 @@ impl Sweeper {
 
     /// Logs an alert marker once per (deposit, kind); later passes only debug.
     async fn alert_once(&self, key: &str, kind: &str) -> Result<()> {
+        self.alert_once_with_tx(key, kind, "-").await
+    }
+
+    async fn alert_once_with_tx(&self, key: &str, kind: &str, tx: &str) -> Result<()> {
         let first = {
             let chain_name = self.chain.name.clone();
             let (key, kind) = (key.to_string(), kind.to_string());
@@ -1241,7 +1264,7 @@ impl Sweeper {
         };
         if first {
             error!(
-                "EVMHOT_ALERT kind={kind} network={} deposit={}:{key} tx=-",
+                "EVMHOT_ALERT kind={kind} network={} deposit={}:{key} tx={tx}",
                 self.chain.name, self.chain.name
             );
         } else {

@@ -205,18 +205,21 @@ impl Rpc {
                     let mut acc = acc.lock().unwrap();
                     let name = sends[acc.len().min(sends.len() - 1)].clone();
                     // A token sweep that will succeed takes its amount off the balance.
-                    if let Ok(env) = <alloy::consensus::TxEnvelope as alloy::eips::eip2718::Decodable2718>::decode_2718(&mut &bytes[..]) {
-                        if let alloy::consensus::TxEnvelope::Eip1559(signed) = &env {
-                            let input = signed.tx().input.to_vec();
-                            let ok = by_name_for_send
-                                .get(&name.to_lowercase())
-                                .map(|r| r["status"] == "0x1")
-                                .unwrap_or(true);
-                            if ok && input.len() == 4 + 64 {
-                                let amount = u128::from_be_bytes(input[4 + 32 + 16..4 + 64].try_into().unwrap());
-                                let mut b = balance_for_send.lock().unwrap();
-                                *b = b.saturating_sub(amount);
-                            }
+                    if let Ok(alloy::consensus::TxEnvelope::Eip1559(signed)) =
+                        <alloy::consensus::TxEnvelope as alloy::eips::eip2718::Decodable2718>::decode_2718(
+                            &mut &bytes[..],
+                        )
+                    {
+                        let input = signed.tx().input.to_vec();
+                        let ok = by_name_for_send
+                            .get(&name.to_lowercase())
+                            .map(|r| r["status"] == "0x1")
+                            .unwrap_or(true);
+                        if ok && input.len() == 4 + 64 {
+                            let amount =
+                                u128::from_be_bytes(input[4 + 32 + 16..4 + 64].try_into().unwrap());
+                            let mut b = balance_for_send.lock().unwrap();
+                            *b = b.saturating_sub(amount);
                         }
                     }
                     learned.insert(real.clone(), name);
@@ -2683,6 +2686,12 @@ async fn retried_review_closes_its_intents_and_never_re_pends_them() {
     sweeper.process_deposits_once().await.unwrap();
     assert_eq!(fx.detected(), 0);
     assert!(fx.swept_webhook("0xaaa:1").is_none());
+    // Not silent: the alert for a settle with no sweep behind it was raised (and
+    // recorded, so it is raised once).
+    assert!(!fx
+        .db
+        .alert_once(TEST_CHAIN, "0xaaa:1", "settled_without_sweep")
+        .unwrap());
 }
 
 #[tokio::test]

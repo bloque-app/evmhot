@@ -665,6 +665,19 @@ impl Db {
         }
     }
 
+    /// State and newest transaction hash of every intent (any state) that
+    /// touches any of the keys, oldest first.
+    pub fn sweep_intent_history_for_keys(
+        &self,
+        chain: &str,
+        keys: &[String],
+    ) -> Result<Vec<(String, Option<String>)>> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.sweep_intent_history_for_keys(chain, keys),
+            DbInner::Postgres(p) => p.sweep_intent_history_for_keys(chain, keys),
+        }
+    }
+
     /// States of every intent (any state) that touches any of the keys.
     pub fn sweep_intent_states_for_keys(
         &self,
