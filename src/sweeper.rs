@@ -260,7 +260,9 @@ impl Sweeper {
         let first = &pair[0];
         let registration_id = first.account_id.clone();
         let target = self.chain.target_for_token(&first.token_address);
-        let per_sender = target.per_sender;
+        // per_sender and per_transfer both sweep what a group is owed, not the
+        // balance: a sender's deposits, or one deposit.
+        let owed_mode = target.per_sender || target.per_transfer;
 
         let (derivation_index, address_str, _webhook_url) = {
             let reg_id = registration_id.clone();
@@ -275,7 +277,7 @@ impl Sweeper {
         let from_address = Address::from_str(&address_str)?;
 
         let mut subgroups: Vec<Vec<Erc20Deposit>> = Vec::new();
-        if per_sender {
+        if owed_mode {
             let mut by_sender: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
             let mut no_sender: Vec<String> = Vec::new();
@@ -284,6 +286,7 @@ impl Sweeper {
                     // REQ-SW-12: a deposit with no recorded sender has no
                     // refund address, so it is never swept by this target.
                     None => no_sender.push(deposit.key.clone()),
+                    Some(_) if target.per_transfer => subgroups.push(vec![deposit]),
                     Some(from) => {
                         let sender = from.to_lowercase();
                         match by_sender.get(&sender) {
@@ -320,7 +323,7 @@ impl Sweeper {
             return Ok(());
         }
 
-        if per_sender {
+        if owed_mode {
             // One sender's sweep must never spend another sender's funds: if the
             // address cannot cover what every sender is still owed, nothing is
             // swept and an operator looks.
@@ -714,7 +717,7 @@ impl Sweeper {
 
         let token_balance = get_token_balance(&self.provider, token_address, from_address).await?;
         let recorded = self.recorded_sweeps(&keys).await?;
-        let sweepable = if target.per_sender {
+        let sweepable = if target.per_sender || target.per_transfer {
             // REQ-SW-12: one sender's share, not the whole balance.
             self.remaining_owed(group).await?.min(token_balance)
         } else {

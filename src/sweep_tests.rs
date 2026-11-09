@@ -393,6 +393,7 @@ fn target_for(
             max: None,
             admits_only: false,
             per_sender: false,
+            per_transfer: false,
         };
         build(&mut target);
         chain.token_targets.insert(token, target);
@@ -833,6 +834,7 @@ async fn req_sw_6_hold_detects_and_notifies_but_never_sweeps_then_releases() {
                 max: None,
                 admits_only: false,
                 per_sender: false,
+                per_transfer: false,
             },
         );
     };
@@ -2224,4 +2226,186 @@ async fn retry_leaves_in_flight_intents_alone_and_names_the_tx() {
     fx.db.finish_sweep_intent(id, "review").unwrap();
     assert!(fx.db.retry_erc20_deposit(TEST_CHAIN, "0xaaa", 1).unwrap());
     assert_eq!(fx.detected(), 1);
+}
+
+// ------------------------------------------------------------ per_transfer
+
+#[tokio::test]
+async fn per_transfer_two_deposits_from_the_same_sender_get_two_sweeps() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    fx.token_deposit("0xbbb", 2, "200", Some(SENDER_A));
+    let (t1, t2) = (sweep_tx(601), sweep_tx(602));
+    let rpc = Rpc::start(
+        300,
+        vec![t1.clone(), t2.clone()],
+        vec![
+            (
+                t1.clone(),
+                ok_receipt(&t1, 70, 1, TOKEN, &fx.addr, TARGET_A, 100),
+            ),
+            (
+                t2.clone(),
+                ok_receipt(&t2, 71, 1, TOKEN, &fx.addr, TARGET_A, 200),
+            ),
+        ],
+    )
+    .await;
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |t| t.per_transfer = true));
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(
+        rpc.sent(),
+        2,
+        "one sweep per inbound transfer, same sender or not"
+    );
+    let calldata = rpc.estimate_bodies().await;
+    let amount_hex = |n: u64| format!("{n:064x}");
+    assert!(calldata.iter().any(|b| b.contains(&amount_hex(100))));
+    assert!(calldata.iter().any(|b| b.contains(&amount_hex(200))));
+    assert!(calldata.iter().all(|b| !b.contains(&amount_hex(300))));
+    let a = fx.swept_webhook("0xaaa:1").unwrap();
+    let b = fx.swept_webhook("0xbbb:2").unwrap();
+    assert_eq!(a["sweeps"].as_array().unwrap().len(), 1);
+    assert_eq!(b["sweeps"].as_array().unwrap().len(), 1);
+    assert_eq!(a["sweeps"][0]["sweep_amount"], "100");
+    assert_eq!(b["sweeps"][0]["sweep_amount"], "200");
+    assert_ne!(a["sweep_tx_hash"], b["sweep_tx_hash"]);
+}
+
+#[tokio::test]
+async fn per_transfer_split_deposit_keeps_all_parts_for_that_deposit() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "250", Some(SENDER_A));
+    fx.token_deposit("0xbbb", 2, "50", Some(SENDER_A));
+    let hs: Vec<String> = (0..4).map(|i| sweep_tx(610 + i)).collect();
+    let amounts = [100u128, 100, 50, 50];
+    let receipts = hs
+        .iter()
+        .zip(amounts)
+        .enumerate()
+        .map(|(i, (h, a))| {
+            (
+                h.clone(),
+                ok_receipt(h, 80 + i as u64, 1, TOKEN, &fx.addr, TARGET_A, a),
+            )
+        })
+        .collect();
+    let rpc = Rpc::start(300, hs, receipts).await;
+    let sweeper = fx.sweeper(
+        &rpc,
+        target_for(TOKEN, |t| {
+            t.per_transfer = true;
+            t.max = Some(U256::from(100u64));
+        }),
+    );
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(rpc.sent(), 4);
+    let first = fx.swept_webhook("0xaaa:1").unwrap();
+    let second = fx.swept_webhook("0xbbb:2").unwrap();
+    let amounts_of = |p: &Value| -> Vec<String> {
+        p["sweeps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["sweep_amount"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(amounts_of(&first), ["100", "100", "50"]);
+    assert_eq!(amounts_of(&second), ["50"]);
+    assert_ne!(first["sweeps"][0], second["sweeps"][0]);
+}
+
+#[tokio::test]
+async fn per_transfer_shortfall_goes_to_review() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    fx.token_deposit("0xbbb", 2, "200", Some(SENDER_A));
+    let rpc = Rpc::start(100, vec![sweep_tx(620)], vec![]).await; // owes 300, holds 100
+    fx.sweeper(&rpc, target_for(TOKEN, |t| t.per_transfer = true))
+        .process_deposits_once()
+        .await
+        .unwrap();
+    assert_eq!(rpc.sent(), 0);
+    for key in ["0xaaa:1", "0xbbb:2"] {
+        assert_eq!(
+            fx.db.get_review_kind(TEST_CHAIN, key).unwrap().as_deref(),
+            Some("balance_shortfall")
+        );
+    }
+}
+
+#[tokio::test]
+async fn per_transfer_no_sender_goes_to_review() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", None);
+    let rpc = Rpc::start(100, vec![sweep_tx(621)], vec![]).await;
+    fx.sweeper(&rpc, target_for(TOKEN, |t| t.per_transfer = true))
+        .process_deposits_once()
+        .await
+        .unwrap();
+    assert_eq!(rpc.sent(), 0);
+    assert_eq!(
+        fx.db
+            .get_review_kind(TEST_CHAIN, "0xaaa:1")
+            .unwrap()
+            .as_deref(),
+        Some("no_sender")
+    );
+}
+
+#[test]
+fn per_transfer_min_above_the_detection_minimum_is_refused_at_load() {
+    let cfg = |min_line: &str, detection: &str| {
+        chains_toml(
+            &format!(
+                r#"
+min_deposit_default = "{detection}"
+
+[chains.token_targets."{TOKEN}"]
+kind = "transfer"
+address = "{TARGET_A}"
+per_transfer = true
+{min_line}
+"#
+            ),
+            TEST_TREASURY,
+        )
+    };
+    // A deposit of 500 would be stored but could never be swept alone.
+    let err = parse_chains_toml(&cfg("min = \"1000\"", "500"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("per_transfer") && err.contains("detection"),
+        "{err}"
+    );
+    // At or below the detection minimum is fine, and so is no minimum.
+    assert!(parse_chains_toml(&cfg("min = \"500\"", "500")).is_ok());
+    assert!(parse_chains_toml(&cfg("", "0")).is_ok());
+    // A per-token detection minimum counts too.
+    let per_token = chains_toml(
+        &format!(
+            r#"
+[chains.min_deposits]
+"{TOKEN}" = "2000"
+
+[chains.token_targets."{TOKEN}"]
+kind = "transfer"
+address = "{TARGET_A}"
+per_transfer = true
+min = "1500"
+"#
+        ),
+        TEST_TREASURY,
+    );
+    let chains = parse_chains_toml(&per_token).unwrap();
+    assert!(chains[0].target_for_token(TOKEN).per_transfer);
+    // per_transfer and per_sender together are refused.
+    let both = chains_toml(
+        &format!(
+            "[chains.token_targets.\"{TOKEN}\"]\nkind = \"transfer\"\naddress = \"{TARGET_A}\"\nper_transfer = true\nper_sender = true\n"
+        ),
+        TEST_TREASURY,
+    );
+    assert!(parse_chains_toml(&both).is_err());
 }

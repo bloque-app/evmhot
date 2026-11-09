@@ -73,7 +73,7 @@ native deposit carries no sweep fields. A token deposit adds:
 - `deposit_swept` is sent once, after the deposit's last sweep succeeded and was verified on its receipt; until then
   only `deposit_detected` has been sent. A reverted sweep produces no event.
 - Several deposits settled by one sweep (a whole-balance sweep) each get their own event, all naming the same entry. With
-  `per_sender` a sweep covers one sender's deposits only.
+  `per_sender` a sweep covers one sender's deposits only; with `per_transfer`, one deposit only.
 - A deposit whose sweep cannot be shown (its receipt has no `Transfer` from the deposit address to the target, or the
   value differs from the planned amount) is moved to `needs_review` and gets **no** `deposit_swept`; evmhot logs
   `EVMHOT_ALERT kind=sweep_review network=<n> deposit=<id> tx=<hash>` and an operator decides

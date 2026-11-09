@@ -51,7 +51,8 @@ min_deposit_native = "0"
 # min = "1000000"          # optional, token minor units: a balance below this waits
 # max = "50000000000"      # optional: a larger amount is swept in several sweeps, each at most this
 # admits_only = true       # optional: this address admits only this token (startup refuses a conflict)
-# per_sender = true        # optional: each sweep covers one sender's deposits (a refund address per sweep)
+# per_transfer = true      # optional: each inbound deposit is swept on its own (use this for a Safe-style target)
+# per_sender = true        # optional, instead of per_transfer: each sweep covers one sender's deposits
 #
 # To hold a token until its target is ready, then release it (change the kind to "transfer", add the
 # address, and restart; held deposits are swept on the first pass):

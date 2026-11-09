@@ -57,6 +57,10 @@ pub struct TokenTargetRaw {
     /// Each sweep needs one refund address: never mix senders (REQ-SW-12).
     #[serde(default)]
     pub per_sender: bool,
+    /// Each inbound deposit is swept on its own, never combined with another,
+    /// not even from the same sender.
+    #[serde(default)]
+    pub per_transfer: bool,
 }
 
 /// A validated sweep target for one token.
@@ -69,6 +73,7 @@ pub struct SweepTarget {
     pub max: Option<U256>,
     pub admits_only: bool,
     pub per_sender: bool,
+    pub per_transfer: bool,
 }
 
 impl SweepTarget {
@@ -80,6 +85,7 @@ impl SweepTarget {
             max: None,
             admits_only: false,
             per_sender: false,
+            per_transfer: false,
         }
     }
 }
@@ -293,6 +299,9 @@ impl ChainConfig {
                 if target.per_sender {
                     line.push_str(" per_sender");
                 }
+                if target.per_transfer {
+                    line.push_str(" per_transfer");
+                }
                 lines.push(line);
                 continue;
             }
@@ -480,6 +489,27 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
                 .as_deref()
                 .map(|v| parse_u256_str(v, &format!("{field}.max")))
                 .transpose()?;
+            if table.per_transfer && table.per_sender {
+                bail!("{field}: per_transfer and per_sender cannot both be set (per_transfer is the stricter)");
+            }
+            if table.per_transfer {
+                // Every stored deposit must be sweepable alone: none may be
+                // below the target's minimum (REQ-DT-4 skips what is below the
+                // detection minimum, so only that is ever stored).
+                let detection_min = per_token
+                    .get(&token_norm)
+                    .copied()
+                    .unwrap_or(min_deposit_default);
+                if let Some(min) = min {
+                    if min > detection_min {
+                        bail!(
+                            "{field}: per_transfer needs min ({min}) at or below the token's detection \
+                             minimum ({detection_min}; min_deposits or min_deposit_default), or a \
+                             deposit could be stored that can never be swept alone"
+                        );
+                    }
+                }
+            }
             if max == Some(U256::ZERO) {
                 bail!("{field}.max must be greater than zero");
             }
@@ -504,6 +534,7 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
                         || table.max.is_some()
                         || table.admits_only
                         || table.per_sender
+                        || table.per_transfer
                     {
                         bail!(
                             "{field}: kind \"hold\" takes no address, bounds or flags; \
@@ -522,6 +553,7 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
                     max,
                     admits_only: table.admits_only,
                     per_sender: table.per_sender,
+                    per_transfer: table.per_transfer,
                 },
             );
         }
