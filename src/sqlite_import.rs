@@ -74,6 +74,8 @@ pub struct SweepRow {
     pub sweep_block_hash: String,
     pub sweep_log_index: i64,
     pub sweep_amount: String,
+    /// `None` for sweeps recorded before the target was stored.
+    pub sweep_target: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -282,11 +284,16 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
     snapshot.webhook_deliveries = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
     if table_exists(&conn, "sweeps")? {
-        let mut stmt = conn.prepare(
+        let target_expr = if table_has_column(&conn, "sweeps", "sweep_target")? {
+            "sweep_target"
+        } else {
+            "NULL"
+        };
+        let mut stmt = conn.prepare(&format!(
             "SELECT chain, tx_hash, log_index, sweep_tx_hash, sweep_block_number,
-                    sweep_block_hash, sweep_log_index, sweep_amount
-             FROM sweeps ORDER BY seq",
-        )?;
+                    sweep_block_hash, sweep_log_index, sweep_amount, {target_expr}
+             FROM sweeps ORDER BY seq"
+        ))?;
         let rows = stmt.query_map([], |r| {
             Ok(SweepRow {
                 chain: r.get(0)?,
@@ -297,6 +304,7 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
                 sweep_block_hash: r.get(5)?,
                 sweep_log_index: r.get(6)?,
                 sweep_amount: r.get(7)?,
+                sweep_target: r.get(8)?,
             })
         })?;
         snapshot.sweeps = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -456,8 +464,8 @@ pub fn migrate_snapshot_to_postgres(
         let changes = tx.execute(
             "INSERT INTO sweeps
              (chain, tx_hash, log_index, sweep_tx_hash, sweep_block_number,
-              sweep_block_hash, sweep_log_index, sweep_amount)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+              sweep_block_hash, sweep_log_index, sweep_amount, sweep_target)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT DO NOTHING",
             &[
                 &row.chain,
@@ -468,6 +476,7 @@ pub fn migrate_snapshot_to_postgres(
                 &row.sweep_block_hash,
                 &row.sweep_log_index,
                 &row.sweep_amount,
+                &row.sweep_target,
             ],
         )?;
         summary.sweeps.1 += changes as usize;

@@ -1,6 +1,6 @@
 use super::{
     DepositQueueCounts, Erc20Deposit, Erc20Settlement, NewErc20Deposit, NewNativeDeposit,
-    OutboxEntry, SweepRecord, WebhookDeliveryRecord, WriteQueueError,
+    OutboxEntry, SweepIntent, SweepRecord, WebhookDeliveryRecord, WriteQueueError,
 };
 use anyhow::{anyhow, Result};
 use r2d2::Pool;
@@ -297,6 +297,9 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/V3__next_index_counter.sql")),
         M::up(include_str!(
             "../../migrations/V4__sweep_coordinates_and_senders.sql"
+        )),
+        M::up(include_str!(
+            "../../migrations/V5__sweep_intents_and_review.sql"
         )),
     ])
 }
@@ -1404,11 +1407,17 @@ impl Db {
             [chain],
             |row| row.get(0),
         )?;
+        let erc20_needs_review: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM erc20_deposits WHERE chain = ?1 AND status = 'needs_review'",
+            [chain],
+            |row| row.get(0),
+        )?;
         Ok(DepositQueueCounts {
             native_detected: native_detected as u64,
             native_failed: native_failed as u64,
             erc20_detected: erc20_detected as u64,
             erc20_failed: erc20_failed as u64,
+            erc20_needs_review: erc20_needs_review as u64,
         })
     }
 
@@ -1432,12 +1441,20 @@ impl Db {
         let tx_hash = tx_hash.to_string();
         self.with_write_priority(move |conn| {
             conn.execute(
-                "UPDATE erc20_deposits SET status = 'detected'
-                 WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3 AND status = 'failed'",
+                "UPDATE erc20_deposits SET status = 'detected', review_kind = NULL
+                 WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3
+                   AND status IN ('failed', 'needs_review')",
                 params![chain, tx_hash, log_index as i64],
             )?;
             let updated = conn.changes() == 1;
             if updated {
+                // The operator has looked: intents that were waiting on this
+                // deposit no longer put it back into review.
+                conn.execute(
+                    "UPDATE sweep_intents SET state = 'abandoned'
+                     WHERE chain = ?1 AND state IN ('pending', 'review') AND keys LIKE ?2",
+                    params![chain, format!("%\"{tx_hash}:{}\"%", log_index as i64)],
+                )?;
                 conn.execute(
                     "DELETE FROM sweep_failures
                      WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3",
@@ -1590,8 +1607,8 @@ impl Db {
                     conn.execute(
                         "INSERT OR IGNORE INTO sweeps
                          (chain, tx_hash, log_index, sweep_tx_hash, sweep_block_number,
-                          sweep_block_hash, sweep_log_index, sweep_amount)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                          sweep_block_hash, sweep_log_index, sweep_amount, sweep_target)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                         params![
                             chain,
                             tx_hash,
@@ -1600,7 +1617,8 @@ impl Db {
                             record.sweep_block_number as i64,
                             record.sweep_block_hash,
                             record.sweep_log_index as i64,
-                            record.sweep_amount
+                            record.sweep_amount,
+                            record.sweep_target
                         ],
                     )?;
                 }
@@ -1613,7 +1631,8 @@ impl Db {
         let (tx_hash, log_index) = parse_local_key(local_key)?;
         let conn = self.read.get()?;
         let mut stmt = conn.prepare(
-            "SELECT sweep_tx_hash, sweep_block_number, sweep_block_hash, sweep_log_index, sweep_amount
+            "SELECT sweep_tx_hash, sweep_block_number, sweep_block_hash, sweep_log_index, sweep_amount,
+                    sweep_target
              FROM sweeps WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3 ORDER BY seq",
         )?;
         let rows = stmt.query_map(params![chain, tx_hash, log_index], |row| {
@@ -1625,10 +1644,197 @@ impl Db {
                 sweep_block_hash: row.get(2)?,
                 sweep_log_index: log_index as u64,
                 sweep_amount: row.get(4)?,
+                sweep_target: row.get(5)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn create_sweep_intent(
+        &self,
+        chain: &str,
+        group_key: &str,
+        keys: &[String],
+        part_index: u64,
+        amount: &str,
+        target: &str,
+    ) -> Result<i64> {
+        let chain = chain.to_string();
+        let group_key = group_key.to_string();
+        let keys = serde_json::to_string(keys)?;
+        let amount = amount.to_string();
+        let target = target.to_string();
+        self.with_write(move |conn| {
+            conn.execute(
+                "INSERT INTO sweep_intents
+                 (chain, group_key, keys, part_index, amount, target, state, tx_hash, passes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, 0)",
+                params![chain, group_key, keys, part_index as i64, amount, target],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    pub fn set_sweep_intent_tx(&self, id: i64, tx_hash: &str) -> Result<()> {
+        let tx_hash = tx_hash.to_string();
+        self.with_write(move |conn| {
+            conn.execute(
+                "UPDATE sweep_intents SET tx_hash = ?2 WHERE id = ?1",
+                params![id, tx_hash],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn finish_sweep_intent(&self, id: i64, state: &str) -> Result<()> {
+        let state = state.to_string();
+        self.with_write(move |conn| {
+            conn.execute(
+                "UPDATE sweep_intents SET state = ?2 WHERE id = ?1 AND state = 'pending'",
+                params![id, state],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn bump_sweep_intent_passes(&self, id: i64) -> Result<u64> {
+        self.with_write(move |conn| {
+            conn.execute(
+                "UPDATE sweep_intents SET passes = passes + 1 WHERE id = ?1",
+                params![id],
+            )?;
+            let passes: i64 = conn.query_row(
+                "SELECT passes FROM sweep_intents WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )?;
+            Ok(passes as u64)
+        })
+    }
+
+    pub fn pending_sweep_intents(&self, chain: &str, keys: &[String]) -> Result<Vec<SweepIntent>> {
+        let conn = self.read.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, group_key, keys, part_index, amount, target, tx_hash, passes
+             FROM sweep_intents WHERE chain = ?1 AND state = 'pending' ORDER BY id",
+        )?;
+        let rows = stmt.query_map([chain], |r| {
+            let keys_json: String = r.get(2)?;
+            let part_index: i64 = r.get(3)?;
+            let passes: i64 = r.get(7)?;
+            Ok(SweepIntent {
+                id: r.get(0)?,
+                group_key: r.get(1)?,
+                keys: serde_json::from_str(&keys_json).unwrap_or_default(),
+                part_index: part_index as u64,
+                amount: r.get(4)?,
+                target: r.get(5)?,
+                tx_hash: r.get(6)?,
+                passes: passes as u64,
+            })
+        })?;
+        let all = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(all
+            .into_iter()
+            .filter(|i| i.keys.iter().any(|k| keys.contains(k)))
+            .collect())
+    }
+
+    pub fn settle_sweep_intent(
+        &self,
+        chain: &str,
+        id: i64,
+        keys: &[String],
+        record: &SweepRecord,
+        settlements: &[Erc20Settlement],
+    ) -> Result<usize> {
+        let chain = chain.to_string();
+        let keys = keys.to_vec();
+        let record = record.clone();
+        let settlements = settlements.to_vec();
+        self.with_write(move |conn| {
+            atomically(conn, |conn| {
+                conn.execute(
+                    "UPDATE sweep_intents SET state = 'succeeded' WHERE id = ?1",
+                    params![id],
+                )?;
+                for key in &keys {
+                    let (tx_hash, log_index) = parse_local_key(key)?;
+                    conn.execute(
+                        "INSERT OR IGNORE INTO sweeps
+                         (chain, tx_hash, log_index, sweep_tx_hash, sweep_block_number,
+                          sweep_block_hash, sweep_log_index, sweep_amount, sweep_target)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            chain,
+                            tx_hash,
+                            log_index,
+                            record.sweep_tx_hash,
+                            record.sweep_block_number as i64,
+                            record.sweep_block_hash,
+                            record.sweep_log_index as i64,
+                            record.sweep_amount,
+                            record.sweep_target
+                        ],
+                    )?;
+                }
+                let mut enqueued = 0;
+                for settlement in &settlements {
+                    let (tx_hash, log_index) = parse_local_key(&settlement.key)?;
+                    conn.execute(
+                        "UPDATE erc20_deposits SET status = 'swept'
+                         WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3",
+                        params![chain, tx_hash, log_index],
+                    )?;
+                    if let Some(entry) = &settlement.outbox {
+                        if upsert_outbox(conn, entry)? {
+                            enqueued += 1;
+                        }
+                    }
+                }
+                Ok(enqueued)
+            })
+        })
+    }
+
+    pub fn mark_erc20_deposits_needs_review_for_keys(
+        &self,
+        chain: &str,
+        keys: &[String],
+        kind: &str,
+    ) -> Result<()> {
+        let chain = chain.to_string();
+        let keys = keys.to_vec();
+        let kind = kind.to_string();
+        self.with_write(move |conn| {
+            atomically(conn, |conn| {
+                for key in &keys {
+                    let (tx_hash, log_index) = parse_local_key(key)?;
+                    conn.execute(
+                        "UPDATE erc20_deposits SET status = 'needs_review', review_kind = ?4
+                         WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3
+                           AND status = 'detected'",
+                        params![chain, tx_hash, log_index, kind],
+                    )?;
+                }
+                Ok(())
+            })
+        })
+    }
+
+    pub fn get_review_kind(&self, chain: &str, local_key: &str) -> Result<Option<String>> {
+        let (tx_hash, log_index) = parse_local_key(local_key)?;
+        let conn = self.read.get()?;
+        let value: Option<Option<String>> = conn
+            .query_row(
+                "SELECT review_kind FROM erc20_deposits
+                 WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3",
+                params![chain, tx_hash, log_index],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(value.flatten())
     }
 
     pub fn get_deposit_from_address(&self, chain: &str, tx_hash: &str) -> Result<Option<String>> {
@@ -1976,6 +2182,7 @@ mod tests {
                 native_failed: 0,
                 erc20_detected: 0,
                 erc20_failed: 1,
+                erc20_needs_review: 0,
             }
         );
     }

@@ -1079,6 +1079,7 @@ fn assert_f002a_store_cycle(db: &Db) {
         sweep_block_hash: "0xblock".to_string(),
         sweep_log_index: log,
         sweep_amount: "10".to_string(),
+        sweep_target: Some("0xtarget".to_string()),
     };
     let keys = vec!["0xt1:3".to_string()];
     db.record_sweep("base", &keys, &rec("0xs1", 4)).unwrap();
@@ -1316,4 +1317,95 @@ fn postgres_req_rg_5_registration_at_2_pow_32_is_refused() {
             )
             .unwrap();
     });
+}
+
+/// Detected deposits come back in insertion order (the first of a group keys
+/// its counters), intents settle atomically, and the retry route moves
+/// `needs_review` back to `detected`. Same on both backends.
+fn assert_order_intents_and_review(db: &Db) {
+    // Inserted in reverse hash order, so a primary-key order would differ.
+    for (i, tx) in ["0xfff", "0xccc", "0xeee", "0xaaa", "0xddd"]
+        .iter()
+        .enumerate()
+    {
+        db.record_erc20_deposit_atomic(&f002a_token_deposit(tx, i as u64, Some("0xs")), None)
+            .unwrap();
+    }
+    let keys: Vec<String> = db
+        .get_detected_erc20_deposits("base")
+        .unwrap()
+        .into_iter()
+        .map(|d| d.key)
+        .collect();
+    assert_eq!(
+        keys,
+        ["0xfff:0", "0xccc:1", "0xeee:2", "0xaaa:3", "0xddd:4"]
+    );
+
+    let group = vec!["0xfff:0".to_string(), "0xccc:1".to_string()];
+    let id = db
+        .create_sweep_intent("base", "gk", &group, 0, "20", "0xtarget")
+        .unwrap();
+    assert!(db.pending_sweep_intents("base", &group).unwrap().len() == 1);
+    assert!(db
+        .pending_sweep_intents("base", &["0xaaa:3".to_string()])
+        .unwrap()
+        .is_empty());
+    db.set_sweep_intent_tx(id, "0xhash").unwrap();
+    assert_eq!(db.bump_sweep_intent_passes(id).unwrap(), 1);
+    let pending = db.pending_sweep_intents("base", &group).unwrap();
+    assert_eq!(pending[0].tx_hash.as_deref(), Some("0xhash"));
+    assert_eq!(pending[0].keys, group);
+
+    let rec = evmhot::db::SweepRecord {
+        sweep_tx_hash: "0xhash".to_string(),
+        sweep_block_number: 3,
+        sweep_block_hash: "0xb".to_string(),
+        sweep_log_index: 9,
+        sweep_amount: "20".to_string(),
+        sweep_target: Some("0xtarget".to_string()),
+    };
+    db.settle_sweep_intent("base", id, &group, &rec, &[])
+        .unwrap();
+    assert!(db.pending_sweep_intents("base", &group).unwrap().is_empty());
+    assert_eq!(db.get_sweeps("base", "0xccc:1").unwrap(), vec![rec]);
+
+    // needs_review is out of the detected queue, counted, and retried only by
+    // the retry call.
+    let review = vec!["0xaaa:3".to_string()];
+    db.mark_erc20_deposits_needs_review_for_keys("base", &review, "sweep_review")
+        .unwrap();
+    assert_eq!(
+        db.get_review_kind("base", "0xaaa:3").unwrap().as_deref(),
+        Some("sweep_review")
+    );
+    assert_eq!(
+        db.deposit_queue_counts("base").unwrap().erc20_needs_review,
+        1
+    );
+    assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 4);
+    assert!(db.retry_erc20_deposit("base", "0xaaa", 3).unwrap());
+    assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 5);
+    assert_eq!(db.get_review_kind("base", "0xaaa:3").unwrap(), None);
+}
+
+#[test]
+fn sqlite_detected_order_intents_and_review() {
+    let tmp = NamedTempFile::new().unwrap();
+    let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+    seed_account(&db);
+    assert_order_intents_and_review(&db);
+}
+
+#[test]
+fn postgres_detected_order_is_stable() {
+    if !docker_available() {
+        eprintln!("skipping postgres_detected_order_is_stable: Docker not available");
+        return;
+    }
+    let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let (_container, url) = start_postgres();
+    let db = connect_pg(&url, None, None);
+    seed_account(&db);
+    assert_order_intents_and_review(&db);
 }

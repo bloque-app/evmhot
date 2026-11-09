@@ -9,7 +9,7 @@
 //! [`PostgresBackend::register_account_auto`].
 use super::{
     DepositQueueCounts, Erc20Deposit, Erc20Settlement, NewErc20Deposit, NewNativeDeposit,
-    OutboxEntry, SweepRecord, WebhookDeliveryRecord, WriteQueueError,
+    OutboxEntry, SweepIntent, SweepRecord, WebhookDeliveryRecord, WriteQueueError,
 };
 use anyhow::{anyhow, Context, Result};
 use postgres::{Client, NoTls, Row};
@@ -511,7 +511,8 @@ impl PostgresBackend {
         let mut guard = self.conn()?;
         let rows = guard.client().query(
             "SELECT tx_hash, log_index, account_id, amount, token_address, token_symbol, from_address
-             FROM erc20_deposits WHERE chain = $1 AND status = 'detected'",
+             FROM erc20_deposits WHERE chain = $1 AND status = 'detected'
+             ORDER BY seq",
             &[&chain],
         )?;
         Ok(rows
@@ -705,11 +706,18 @@ impl PostgresBackend {
                 &[&chain],
             )?
             .get(0);
+        let erc20_needs_review: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM erc20_deposits WHERE chain = $1 AND status = 'needs_review'",
+                &[&chain],
+            )?
+            .get(0);
         Ok(DepositQueueCounts {
             native_detected: native_detected as u64,
             native_failed: native_failed as u64,
             erc20_detected: erc20_detected as u64,
             erc20_failed: erc20_failed as u64,
+            erc20_needs_review: erc20_needs_review as u64,
         })
     }
 
@@ -728,12 +736,21 @@ impl PostgresBackend {
         let client = guard.client();
         let log_index = log_index as i64;
         let changes = client.execute(
-            "UPDATE erc20_deposits SET status = 'detected'
-             WHERE chain = $1 AND tx_hash = $2 AND log_index = $3 AND status = 'failed'",
+            "UPDATE erc20_deposits SET status = 'detected', review_kind = NULL
+             WHERE chain = $1 AND tx_hash = $2 AND log_index = $3
+               AND status IN ('failed', 'needs_review')",
             &[&chain, &tx_hash, &log_index],
         )?;
         let updated = changes == 1;
         if updated {
+            // The operator has looked: intents that were waiting on this
+            // deposit no longer put it back into review.
+            let pattern = format!("%\"{tx_hash}:{log_index}\"%");
+            client.execute(
+                "UPDATE sweep_intents SET state = 'abandoned'
+                 WHERE chain = $1 AND state IN ('pending', 'review') AND keys LIKE $2",
+                &[&chain, &pattern],
+            )?;
             client.execute(
                 "DELETE FROM sweep_failures WHERE chain = $1 AND tx_hash = $2 AND log_index = $3",
                 &[&chain, &tx_hash, &log_index],
@@ -890,8 +907,8 @@ impl PostgresBackend {
             tx.execute(
                 "INSERT INTO sweeps
                  (chain, tx_hash, log_index, sweep_tx_hash, sweep_block_number,
-                  sweep_block_hash, sweep_log_index, sweep_amount)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                  sweep_block_hash, sweep_log_index, sweep_amount, sweep_target)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                  ON CONFLICT DO NOTHING",
                 &[
                     &chain,
@@ -902,6 +919,7 @@ impl PostgresBackend {
                     &record.sweep_block_hash,
                     &(record.sweep_log_index as i64),
                     &record.sweep_amount,
+                    &record.sweep_target,
                 ],
             )?;
         }
@@ -913,7 +931,8 @@ impl PostgresBackend {
         let (tx_hash, log_index) = parse_local_key(local_key)?;
         let mut guard = self.conn()?;
         let rows = guard.client().query(
-            "SELECT sweep_tx_hash, sweep_block_number, sweep_block_hash, sweep_log_index, sweep_amount
+            "SELECT sweep_tx_hash, sweep_block_number, sweep_block_hash, sweep_log_index, sweep_amount,
+                    sweep_target
              FROM sweeps WHERE chain = $1 AND tx_hash = $2 AND log_index = $3 ORDER BY seq",
             &[&chain, &tx_hash, &log_index],
         )?;
@@ -928,9 +947,177 @@ impl PostgresBackend {
                     sweep_block_hash: r.get(2),
                     sweep_log_index: log_index as u64,
                     sweep_amount: r.get(4),
+                    sweep_target: r.get(5),
                 }
             })
             .collect())
+    }
+
+    pub fn create_sweep_intent(
+        &self,
+        chain: &str,
+        group_key: &str,
+        keys: &[String],
+        part_index: u64,
+        amount: &str,
+        target: &str,
+    ) -> Result<i64> {
+        let keys = serde_json::to_string(keys)?;
+        let mut guard = self.conn()?;
+        let row = guard.client().query_one(
+            "INSERT INTO sweep_intents
+             (chain, group_key, keys, part_index, amount, target, state, tx_hash, passes)
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', NULL, 0) RETURNING id",
+            &[
+                &chain,
+                &group_key,
+                &keys,
+                &(part_index as i64),
+                &amount,
+                &target,
+            ],
+        )?;
+        Ok(row.get(0))
+    }
+
+    pub fn set_sweep_intent_tx(&self, id: i64, tx_hash: &str) -> Result<()> {
+        let mut guard = self.conn()?;
+        guard.client().execute(
+            "UPDATE sweep_intents SET tx_hash = $2 WHERE id = $1",
+            &[&id, &tx_hash],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_sweep_intent(&self, id: i64, state: &str) -> Result<()> {
+        let mut guard = self.conn()?;
+        guard.client().execute(
+            "UPDATE sweep_intents SET state = $2 WHERE id = $1 AND state = 'pending'",
+            &[&id, &state],
+        )?;
+        Ok(())
+    }
+
+    pub fn bump_sweep_intent_passes(&self, id: i64) -> Result<u64> {
+        let mut guard = self.conn()?;
+        let row = guard.client().query_one(
+            "UPDATE sweep_intents SET passes = passes + 1 WHERE id = $1 RETURNING passes",
+            &[&id],
+        )?;
+        let passes: i64 = row.get(0);
+        Ok(passes as u64)
+    }
+
+    pub fn pending_sweep_intents(&self, chain: &str, keys: &[String]) -> Result<Vec<SweepIntent>> {
+        let mut guard = self.conn()?;
+        let rows = guard.client().query(
+            "SELECT id, group_key, keys, part_index, amount, target, tx_hash, passes
+             FROM sweep_intents WHERE chain = $1 AND state = 'pending' ORDER BY id",
+            &[&chain],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let keys_json: String = r.get(2);
+                let part_index: i64 = r.get(3);
+                let passes: i64 = r.get(7);
+                SweepIntent {
+                    id: r.get(0),
+                    group_key: r.get(1),
+                    keys: serde_json::from_str(&keys_json).unwrap_or_default(),
+                    part_index: part_index as u64,
+                    amount: r.get(4),
+                    target: r.get(5),
+                    tx_hash: r.get(6),
+                    passes: passes as u64,
+                }
+            })
+            .filter(|i| i.keys.iter().any(|k| keys.contains(k)))
+            .collect())
+    }
+
+    pub fn settle_sweep_intent(
+        &self,
+        chain: &str,
+        id: i64,
+        keys: &[String],
+        record: &SweepRecord,
+        settlements: &[Erc20Settlement],
+    ) -> Result<usize> {
+        let mut guard = self.conn()?;
+        let mut tx = guard.client().transaction()?;
+        tx.execute(
+            "UPDATE sweep_intents SET state = 'succeeded' WHERE id = $1",
+            &[&id],
+        )?;
+        for key in keys {
+            let (tx_hash, log_index) = parse_local_key(key)?;
+            tx.execute(
+                "INSERT INTO sweeps
+                 (chain, tx_hash, log_index, sweep_tx_hash, sweep_block_number,
+                  sweep_block_hash, sweep_log_index, sweep_amount, sweep_target)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT DO NOTHING",
+                &[
+                    &chain,
+                    &tx_hash,
+                    &log_index,
+                    &record.sweep_tx_hash,
+                    &(record.sweep_block_number as i64),
+                    &record.sweep_block_hash,
+                    &(record.sweep_log_index as i64),
+                    &record.sweep_amount,
+                    &record.sweep_target,
+                ],
+            )?;
+        }
+        let mut enqueued = 0;
+        for settlement in settlements {
+            let (tx_hash, log_index) = parse_local_key(&settlement.key)?;
+            tx.execute(
+                "UPDATE erc20_deposits SET status = 'swept'
+                 WHERE chain = $1 AND tx_hash = $2 AND log_index = $3",
+                &[&chain, &tx_hash, &log_index],
+            )?;
+            if let Some(entry) = &settlement.outbox {
+                if upsert_outbox(&mut tx, entry)? {
+                    enqueued += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(enqueued)
+    }
+
+    pub fn mark_erc20_deposits_needs_review_for_keys(
+        &self,
+        chain: &str,
+        keys: &[String],
+        kind: &str,
+    ) -> Result<()> {
+        let mut guard = self.conn()?;
+        let mut tx = guard.client().transaction()?;
+        for key in keys {
+            let (tx_hash, log_index) = parse_local_key(key)?;
+            tx.execute(
+                "UPDATE erc20_deposits SET status = 'needs_review', review_kind = $4
+                 WHERE chain = $1 AND tx_hash = $2 AND log_index = $3 AND status = 'detected'",
+                &[&chain, &tx_hash, &log_index, &kind],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_review_kind(&self, chain: &str, local_key: &str) -> Result<Option<String>> {
+        let (tx_hash, log_index) = parse_local_key(local_key)?;
+        let mut guard = self.conn()?;
+        let row = guard.client().query_opt(
+            "SELECT review_kind FROM erc20_deposits
+             WHERE chain = $1 AND tx_hash = $2 AND log_index = $3",
+            &[&chain, &tx_hash, &log_index],
+        )?;
+        Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
     }
 
     pub fn get_deposit_from_address(&self, chain: &str, tx_hash: &str) -> Result<Option<String>> {

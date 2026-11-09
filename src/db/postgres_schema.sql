@@ -114,3 +114,23 @@ CREATE TABLE IF NOT EXISTS sweeps (
   sweep_amount TEXT NOT NULL,
   UNIQUE (chain, tx_hash, log_index, sweep_tx_hash, sweep_log_index)
 );
+
+-- F-002a review fixes (mirrors migrations/V5__sweep_intents_and_review.sql), plus a
+-- sequence on erc20_deposits so detected deposits are read in insertion order.
+ALTER TABLE sweeps ADD COLUMN IF NOT EXISTS sweep_target TEXT;
+ALTER TABLE erc20_deposits ADD COLUMN IF NOT EXISTS review_kind TEXT;
+ALTER TABLE erc20_deposits ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
+
+CREATE TABLE IF NOT EXISTS sweep_intents (
+  id BIGSERIAL PRIMARY KEY,
+  chain TEXT NOT NULL,
+  group_key TEXT NOT NULL,
+  keys TEXT NOT NULL,
+  part_index BIGINT NOT NULL,
+  amount TEXT NOT NULL,
+  target TEXT NOT NULL,
+  state TEXT NOT NULL,
+  tx_hash TEXT,
+  passes BIGINT NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sweep_intents_state ON sweep_intents (chain, state);

@@ -37,6 +37,8 @@ pub struct DepositQueueCounts {
     pub native_failed: u64,
     pub erc20_detected: u64,
     pub erc20_failed: u64,
+    /// Token deposits an operator must look at (`needs_review`).
+    pub erc20_needs_review: u64,
 }
 
 impl DepositQueueCounts {
@@ -45,6 +47,7 @@ impl DepositQueueCounts {
             || self.native_failed > 0
             || self.erc20_detected > 0
             || self.erc20_failed > 0
+            || self.erc20_needs_review > 0
     }
 }
 
@@ -116,6 +119,23 @@ pub struct SweepRecord {
     /// Block-level log index of the `Transfer` into the target, from the receipt.
     pub sweep_log_index: u64,
     pub sweep_amount: String,
+    /// The address the `Transfer` went to. `None` for sweeps recorded before
+    /// the target was stored.
+    pub sweep_target: Option<String>,
+}
+
+/// A sweep part that is about to be, or has been, sent. Persisted before the
+/// transaction is signed so a part that lands unrecorded is found again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SweepIntent {
+    pub id: i64,
+    pub group_key: String,
+    pub keys: Vec<String>,
+    pub part_index: u64,
+    pub amount: String,
+    pub target: String,
+    pub tx_hash: Option<String>,
+    pub passes: u64,
 }
 
 /// A token deposit to mark swept, with the `deposit_swept` outbox row that
@@ -578,6 +598,95 @@ impl Db {
         match self.inner.as_ref() {
             DbInner::Sqlite(s) => s.get_sweeps(chain, local_key),
             DbInner::Postgres(p) => p.get_sweeps(chain, local_key),
+        }
+    }
+
+    /// Persists a pending sweep intent before the transaction is signed.
+    pub fn create_sweep_intent(
+        &self,
+        chain: &str,
+        group_key: &str,
+        keys: &[String],
+        part_index: u64,
+        amount: &str,
+        target: &str,
+    ) -> Result<i64> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => {
+                s.create_sweep_intent(chain, group_key, keys, part_index, amount, target)
+            }
+            DbInner::Postgres(p) => {
+                p.create_sweep_intent(chain, group_key, keys, part_index, amount, target)
+            }
+        }
+    }
+
+    pub fn set_sweep_intent_tx(&self, id: i64, tx_hash: &str) -> Result<()> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.set_sweep_intent_tx(id, tx_hash),
+            DbInner::Postgres(p) => p.set_sweep_intent_tx(id, tx_hash),
+        }
+    }
+
+    /// Moves a pending intent to a terminal state (`failed`, `review`).
+    pub fn finish_sweep_intent(&self, id: i64, state: &str) -> Result<()> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.finish_sweep_intent(id, state),
+            DbInner::Postgres(p) => p.finish_sweep_intent(id, state),
+        }
+    }
+
+    /// Counts one more pass without a receipt and returns the total.
+    pub fn bump_sweep_intent_passes(&self, id: i64) -> Result<u64> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.bump_sweep_intent_passes(id),
+            DbInner::Postgres(p) => p.bump_sweep_intent_passes(id),
+        }
+    }
+
+    /// Pending intents that touch any of the given deposit keys.
+    pub fn pending_sweep_intents(&self, chain: &str, keys: &[String]) -> Result<Vec<SweepIntent>> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.pending_sweep_intents(chain, keys),
+            DbInner::Postgres(p) => p.pending_sweep_intents(chain, keys),
+        }
+    }
+
+    /// One transaction: the intent becomes `succeeded`, its sweep is recorded
+    /// against its deposits, and (for the last part) the deposits are marked
+    /// swept with their `deposit_swept` outbox rows (REQ-WH-7). Returns how
+    /// many outbox rows were written.
+    pub fn settle_sweep_intent(
+        &self,
+        chain: &str,
+        id: i64,
+        keys: &[String],
+        record: &SweepRecord,
+        settlements: &[Erc20Settlement],
+    ) -> Result<usize> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.settle_sweep_intent(chain, id, keys, record, settlements),
+            DbInner::Postgres(p) => p.settle_sweep_intent(chain, id, keys, record, settlements),
+        }
+    }
+
+    /// Moves token deposits to `needs_review` (never auto-settled or retried).
+    pub fn mark_erc20_deposits_needs_review_for_keys(
+        &self,
+        chain: &str,
+        keys: &[String],
+        kind: &str,
+    ) -> Result<()> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.mark_erc20_deposits_needs_review_for_keys(chain, keys, kind),
+            DbInner::Postgres(p) => p.mark_erc20_deposits_needs_review_for_keys(chain, keys, kind),
+        }
+    }
+
+    pub fn get_review_kind(&self, chain: &str, local_key: &str) -> Result<Option<String>> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.get_review_kind(chain, local_key),
+            DbInner::Postgres(p) => p.get_review_kind(chain, local_key),
         }
     }
 
