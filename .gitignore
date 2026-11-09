@@ -14,3 +14,7 @@ backups/
 
 # Logs
 *.log
+
+# Session state and private links (never tracked)
+STATE.md
+.scratch/
