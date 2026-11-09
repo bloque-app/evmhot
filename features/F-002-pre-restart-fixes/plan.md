@@ -12,6 +12,10 @@ it needs.
 
 - Mark swept only on a successful receipt; a reverted sweep is a failure (`REQ-SW-5`).
 - Record and report the sweep coordinate and amount (`REQ-SW-10`, `REQ-WH-4`); new nullable columns, so old rows stay valid.
+- Record each deposit's sender and send it as `from_address` (`REQ-WH-9`); per-sender sweeps for targets that need a
+  refund address (`REQ-SW-12`).
+- Outbox write in the state change's transaction (`REQ-WH-7`); separate webhook and operator tokens (`REQ-WH-8`);
+  refuse registration at 2^31 (`REQ-RG-5`); provider check in health (`REQ-OB-3`).
 - Detection height per network: `finalized`, `safe` or offset (`REQ-DT-8`).
 - Target bounds, chunking above the maximum, holding below the minimum (`REQ-SW-7`); single-token targets checked at
   load (`REQ-SW-8`).

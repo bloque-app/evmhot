@@ -1,0 +1,10 @@
+{
+  "extraKnownMarketplaces": {
+    "swimmingoncode": {
+      "source": { "source": "github", "repo": "swimmingoncode/narthex" }
+    }
+  },
+  "enabledPlugins": {
+    "narthex@swimmingoncode": true
+  }
+}

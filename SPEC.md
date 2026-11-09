@@ -16,7 +16,7 @@ yet are marked **(not built)**, and `PLAN.md` §4 names the feature that builds 
 | Version | Date | Change |
 |---|---|---|
 | 0.1.0 | 2026-11-09 | The service as it ran: registration, detection, sweeps, faucet, webhooks, store, API |
-| 0.2.0 | 2026-11-09 | Amendment 0001: sweep target kinds and bounds, the sweep coordinate, finality per chain, lag and provider alerts, sweep outcome check |
+| 0.2.0 | 2026-11-09 | Amendment 0001: sweep target kinds and bounds, the sweep coordinate, finality per network, sweep outcome check, lag and provider alerts, atomic outbox, separate tokens, counter ceiling; withdraws the symbol filter |
 
 ### Normative language
 
@@ -42,6 +42,11 @@ admitted tokens, moves each deposit's funds to a configured sweep target, and te
 saw and what it moved. One address serves every configured network. The service holds the keys of the deposit
 addresses (a hot wallet) and of a faucet that pays the sweeps' gas.
 
+evmhot comes in two forms with the same behaviour: a **library** that another program embeds, and a
+**self-contained service** that runs on its own, with its own HTTP surface, store, configuration and deployment. This
+specification binds both; §9 is the service's surface. In 0.1.0 only the library form ran in production, embedded in
+a host service.
+
 ### 1.2 In scope
 
 - Registration: a stable deposit address per registration id.
@@ -50,7 +55,8 @@ addresses (a hot wallet) and of a faucet that pays the sweeps' gas.
 - Gas: funding a deposit address from the faucet just in time for its sweep.
 - Notification: a webhook per detected deposit and per swept deposit, delivered at least once.
 - Verification: answering whether a given transaction moved a given amount to a given address.
-- Running self-hosted, with its own store, configuration and deployment.
+- Running as a self-contained service, with its own store, configuration and deployment, and being embeddable as a
+  library.
 
 ### 1.3 Out of scope
 
@@ -120,6 +126,8 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
 - `REQ-RG-3` The counter MUST start above every derivation index already in the store. Indices are not contiguous:
   older registrations used hashed indices up to 2^31.
 - `REQ-RG-4` Registration funds nothing. Gas is funded at sweep time (§6.3).
+- `REQ-RG-5` **(not built)** Derivation indices are non-hardened, so below 2^31. When the counter reaches 2^31,
+  registration MUST be refused with an error; it MUST NOT wrap or overflow.
 
 ## 6. Deposits and sweeps
 
@@ -127,26 +135,36 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
 
 - `REQ-DT-1` For each network, the monitor processes blocks in order from the cursor to the detection height, and
   advances the cursor only after a block's deposits are stored.
-- `REQ-DT-2` A token deposit is a `Transfer` log of an admitted token whose recipient is a deposit address. Its
-  identity is `(network, transaction hash, block-level log index)`.
+- `REQ-DT-2` A token deposit is a `Transfer` log of an admitted token whose recipient is a deposit address and whose
+  sender is not the faucet. Its identity is `(network, transaction hash, block-level log index)`.
 - `REQ-DT-3` A native deposit is a transaction with value whose recipient is a deposit address and whose sender is
   not the faucet. Its identity is `(network, transaction hash)`.
-- `REQ-DT-4` A deposit below the configured minimum for its token is recorded as ignored and is not swept.
-- `REQ-DT-5` Far behind the detection height, the monitor MAY process ranges of blocks with one ranged log query per
-  range, splitting a range the provider refuses. The outcome MUST equal block-by-block processing.
+- `REQ-DT-4` A deposit below the configured minimum for its token is skipped: it is not stored, not notified and not
+  swept.
+- `REQ-DT-5` More than 10 blocks behind the detection height, the monitor processes ranges of blocks with one ranged
+  log query per range, splitting a range the provider refuses, while still fetching every block for native
+  deposits. The outcome MUST equal block-by-block processing.
 - `REQ-DT-6` Processing a block twice records nothing new (`INV-2`).
+- `REQ-DT-9` A network with no stored cursor starts at the current detection height. Deposits made before that are
+  not detected.
+- `REQ-DT-10` **Withdrawn by amendment 0001.** In 0.1.0 a token transfer whose symbol was longer than five characters
+  was dropped before it was stored: no deposit, no webhook. A token whose `symbol()` call failed was named `UNKNOWN`
+  and dropped the same way. Admission is by contract address only (`REQ-DT-2`); the symbol is metadata.
 
 ### 6.2 Sweeps
 
-- `REQ-SW-1` A sweep moves the deposit address's **whole** balance of the token, not the deposit's amount. Several
-  deposits of one token to one address can therefore be settled by one sweep; each of them is then marked swept by
-  that sweep.
+- `REQ-SW-1` In 0.1.0 a sweep moves the deposit address's **whole** balance of the token, not the deposit's amount.
+  Several deposits of one token to one address can therefore be settled by one sweep; each of them is then marked swept
+  by that sweep. `REQ-SW-12` overrides this for targets that need a refund address.
 - `REQ-SW-2` A sweep goes to the token's sweep target on that network. A token with no target of its own uses the
   network's default target. The native coin always uses the default target.
-- `REQ-SW-3` A deposit whose address holds a zero balance of the token is retried a bounded number of times and then
-  marked swept with no sweep transaction.
-- `REQ-SW-4` A sweep that fails with a funding error waits for the faucet and is retried; a sweep that fails
-  permanently is recorded as failed and can be retried by an operator.
+- `REQ-SW-3` A token deposit whose address holds a zero balance of the token is retried for 10 passes and then marked
+  swept with no sweep transaction. Native deposits have no such rule.
+- `REQ-SW-4` A sweep that fails with a funding error waits for the faucet and is retried. A token sweep that fails
+  otherwise counts the failure; after 5 consecutive failures, or at once on a decoding error, the deposit is recorded as
+  failed and can be retried by an operator. A native sweep that fails is retried on every pass.
+- `REQ-SW-11` A native sweep sends the balance minus the cost of 21,000 gas at the current maximum fee plus 10%. A
+  balance at or below that cost is not swept.
 - `REQ-SW-5` **(not built)** A deposit MUST be marked swept only after its sweep's receipt shows success. A reverted
   sweep is recorded as failed.
 
@@ -171,6 +189,10 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   token to it MUST be refused at load time, and the process MUST NOT start.
 - `REQ-SW-9` **(not built)** Each sweep into a target emits exactly one token `Transfer` into it.
 
+- `REQ-SW-12` **(not built)** A target MAY declare that each sweep needs one refund address. For such a target, a
+  sweep MUST NOT combine deposits from different senders: each sweep covers one inbound transfer, or several from the
+  same sender. Deposits from one sender below the target's minimum MAY accumulate until together they reach it.
+
 ### 6.5 The sweep coordinate (amendment 0001)
 
 - `REQ-SW-10` **(not built)** For each sweep evmhot records, and reports in `deposit_swept`, the sweep's
@@ -188,37 +210,58 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
 ## 8. Webhooks
 
 - `REQ-WH-1` Two events: `deposit_detected` and `deposit_swept`. Each is sent to the registration's webhook URL as an
-  HTTP POST with a JSON body, with a bearer token if one is configured.
+  HTTP POST with a JSON body, with a bearer token if one is configured. In 0.1.0 that token is the same one the admin
+  routes accept (`REQ-WH-8`).
 - `REQ-WH-2` Every webhook carries an `id` that identifies the deposit: `<network>:<tx hash>` for a native deposit,
   `<network>:<tx hash>:<log index>` for a token deposit. `(id, event)` is unique.
-- `REQ-WH-3` Fields: `id`, `chain`, `chain_id`, `event`, `account_id` (the deposit address), `registration_id`,
-  `tx_hash`, `amount` (minor units, decimal string), `token_type` (`native` or `erc20`), and for tokens
-  `token_symbol`, `token_address`, `token_decimals`.
-- `REQ-WH-4` `deposit_swept` adds `sweep_tx_hash`. **(not built)** It also adds the sweep coordinate of `REQ-SW-10`:
+- `REQ-WH-3` Fields of both events: `id`, `chain`, `chain_id`, `event`, `account_id` (the deposit address),
+  `registration_id`, `amount` (minor units, decimal string), `token_type` (`native` or `erc20`), and for tokens
+  `token_symbol`, `token_address`, `token_decimals`. The deposit's transaction hash is `tx_hash` in `deposit_detected`
+  and `original_tx_hash` in `deposit_swept`.
+- `REQ-WH-4` A token `deposit_swept` adds `sweep_tx_hash`; a native one carries no sweep fields.
+- `REQ-WH-9` **(not built)** Every deposit records the sender of its inbound transfer, and both events carry it as
+  `from_address`. A consumer uses it as the refund address. **(not built)** It also adds the sweep coordinate of `REQ-SW-10`:
   `sweep_block_number`, `sweep_block_hash`, `sweep_log_index` and `sweep_amount`. Several deposits settled by one
   sweep produce one `deposit_swept` each, all naming the same sweep coordinate.
-- `REQ-WH-5` Delivery is at least once. Webhooks are written to the outbox in the same step as the state change
-  they report. A worker delivers them, retrying non-2xx answers up to a configured number of attempts, and leases
-  each attempt so that two workers never post the same delivery at once.
+- `REQ-WH-5` Once a webhook is in the outbox, delivery is at least once: a worker delivers it, retrying non-2xx answers
+  up to a configured number of attempts, and leases each attempt so that two workers never post the same delivery at
+  once. In 0.1.0 the outbox write happens after the state change it reports, and a failed write is only logged.
+- `REQ-WH-7` **(not built)** The outbox write MUST be in the same transaction as the state change it reports, so a
+  stored deposit or sweep always has its webhook.
+- `REQ-WH-8` **(not built)** The bearer token sent to webhook URLs and the operator token MUST be different secrets.
+  The operator token MUST never be sent to a webhook URL.
 - `REQ-WH-6` A receiver MUST treat `(id, event)` as its idempotency key.
 
 ## 9. HTTP surface
 
-All bodies are JSON. The surface is meant for an internal network; §12 states what it does not protect.
+All bodies are JSON unless stated. The surface is meant for an internal network; §12 states what it does not protect.
 
-| Method and path | Request | Response | Notes |
-|---|---|---|---|
-| `GET /health` | | `200` with a status text | `500` if the store or a provider is unreachable |
-| `POST /register` | `{id, webhook_url}` | `{address, funding_tx?}` (`funding_tx` is never set: `REQ-RG-4`) | `REQ-RG-1`. `503` if the store's write queue is full |
-| `POST /verify_transfer` | `{chain, tx_hash, to_address, amount, token_type, token_address?, token_symbol?}` | `{status: "success", actual_to, actual_amount, token_type, token_symbol?, block_number?}` or `{status: "error", message, token_type?, block_number?}` | Reads the chain; writes nothing |
-| `GET /block_number?chain=` | | `{chain, block_number}` | The cursor |
-| `POST /block_number` | `{chain, block_number}` | `{chain, block_number}` | Moves the cursor. An operator action |
-| `POST /admin/retry_sweeps` | `{chain, tx_hash, log_index?}` | `{retried, token_type}` | Bearer token required |
-| `POST /admin/retry_webhooks` | `{id, event}` | `{retried, status}` | Bearer token required |
+### 9.1 The `/evm` surface clients use
 
-- `REQ-API-1` In the deployment that ran, a host service mounted `/health`, `/register`, `/verify_transfer` and both
-  `/block_number` routes under the prefix `/evm`. A standalone evmhot MUST serve the same paths under `/evm` with the
-  same request and response shapes, so that existing clients only change their base URL.
+In the deployment that ran, a host service served these routes. Each acts on one **default network** (configured)
+where it takes no network.
+
+| Method and path | Request | Response |
+|---|---|---|
+| `GET /evm/health` | | `200 {status, enabled}`; `status` is `"error"` when the check fails, `"disabled"` when the wallet is off |
+| `POST /evm/register` | `{id, webhook_url}` | `{address, funding_tx}`; `funding_tx` is always null (`REQ-RG-4`). `503` while the store's write queue is full |
+| `POST /evm/verify_transfer` | `{chain, tx_hash, to_address, amount, token_type, token_address?, token_symbol?}` | `{status: "success", actual_to, actual_amount, token_type, token_symbol?, block_number?}` or `{status: "error", message, token_type?, block_number?}`. Reads the chain; writes nothing |
+| `GET /evm/block_number` | | `{block_number}`: the default network's cursor |
+| `POST /evm/block_number` | `{block_number}` | `{block_number}`: moves the default network's cursor. An operator action |
+
+When the wallet is disabled, every route but health answers `503`. Errors are a status code with a plain-text body.
+
+### 9.2 Operator routes
+
+| Method and path | Request | Response |
+|---|---|---|
+| `POST /admin/retry_sweeps` | `{chain, tx_hash, log_index?}` | `{retried, token_type}` |
+| `POST /admin/retry_webhooks` | `{id, event}` | `{retried, status}` |
+
+Both require the bearer token. The host service did not serve them in production.
+
+- `REQ-API-1` A standalone evmhot MUST serve §9.1 under `/evm` with exactly those shapes, so that existing clients only
+  change their base URL. It MAY also serve per-network forms of `block_number` that take a `chain`.
 - `REQ-API-2` **(not built)** `POST /block_number` MUST require the operator's bearer token.
 
 ## 10. Store
@@ -236,7 +279,8 @@ All bodies are JSON. The surface is meant for an internal network; §12 states w
   raise an alert when that lag exceeds a configured bound.
 - `REQ-OB-2` **(not built)** A provider answer that says the caller is rate-limited or over quota MUST be retried with
   growing back-off, and MUST raise an alert when it persists.
-- `REQ-OB-3` `GET /health` reports the store and each network's provider.
+- `REQ-OB-3` Health reports the store's writer and lists the networks. **(not built)** It also reports whether each
+  network's provider answers.
 
 ## 12. Invariants
 
@@ -248,8 +292,13 @@ All bodies are JSON. The surface is meant for an internal network; §12 states w
   transaction (`REQ-SW-5`).
 - `INV-6` **(not built)** No sweep sends a token to a target that does not admit it (`REQ-SW-8`).
 
-What the HTTP surface does not protect: `/register` and `/verify_transfer` are unauthenticated and rely on the network
-they are served on.
+What this version does not protect, stated plainly:
+
+- `/register` and `/verify_transfer` are unauthenticated and rely on the network they are served on. Any caller there can
+  register an id and choose its webhook URL, so evmhot will post to any address that caller names.
+- Reorganisations are not handled: the detection height is the only protection (`REQ-DT-7`, `REQ-DT-8`).
+- Moving a cursor backwards replays detection; `INV-2` stops duplicate deposits, and delivered webhooks are not sent
+  again.
 
 ## 13. Known differences from 0.1.0 (what ran)
 
@@ -261,8 +310,11 @@ The service as it ran differs from this version where a requirement is marked **
 - There was no lag alert, no back-off on rate limits and no alert on quota exhaustion (`REQ-OB-1`, `REQ-OB-2`).
 - Sweep targets were addresses only, with no bounds or token admission checks (`REQ-SW-6` to `REQ-SW-9`).
 - `POST /block_number` was unauthenticated (`REQ-API-2`).
-- A token deposit whose symbol was longer than five characters was marked swept without a sweep. This was a filter for
-  spoofed tokens and is withdrawn: admission is by contract address only (`REQ-DT-2`).
+- Token transfers with a symbol longer than five characters, or with no readable symbol, were dropped (`REQ-DT-10`,
+  withdrawn).
+- The outbox write was not atomic with the state change (`REQ-WH-7`).
+- The webhook bearer token was also the operator token (`REQ-WH-8`).
+- Health did not check providers (`REQ-OB-3`), and the derivation counter had no ceiling check (`REQ-RG-5`).
 
 ## 14. Open questions
 

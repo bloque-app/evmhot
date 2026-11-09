@@ -13,6 +13,13 @@ Bloque's EVM hot wallet for deposits: a deposit address per registration, detect
 those addresses, sweeps to configured targets, gas from a faucet, and webhooks to the registering service. Its role
 ends at the sweep and the webhook: what a consumer does with a swept deposit is out of scope (`SPEC.md` §1.3).
 
+## Where things are
+
+`OVERVIEW.md` (plain digest) · `SPEC.md` (behaviour) · `amendments/` (every change) · `PLAN.md` (how, DEC/F/M) ·
+`features/F-NNN-*/` (work) · `notes/RULINGS.md` (the owner's rulings, R1…) · `REFERENCES.md` (outside sources) ·
+`STATE.md` (gitignored session state; private links go there, never in tracked files). The method is narthex's
+(`REFERENCES.md`); its guard hook is enabled in `.claude/settings.json`.
+
 ## Spec-driven development
 
 The chain is `SPEC.md` → `amendments/` → `PLAN.md` → `features/F-NNN-*/` → issue → PR. Changes flow **down**, never up.
@@ -67,10 +74,12 @@ Identifier families are in `SPEC.md` §0. Never renumber; add. Tasks are `T-<fea
 - **Secrets.** Never commit a secret. Workflows reference secrets only as `${{ secrets.NAME }}`; tests pass on public
   fallbacks.
 - **Production.** No production change and no fund movement without the owner's explicit approval for that step.
+- **Questions.** Never ask the owner in chat or with a dialog. Questions go on the decision form; a reversible choice
+  proceeds on the recommended default (R11).
 
 ## Decisions
 
-Rulings are recorded in `amendments/`, citing the decision they apply; @pandres95 keeps the working decision form
+Rulings are numbered in `notes/RULINGS.md` and applied through `amendments/`, citing the decision they apply; @pandres95 keeps the working decision form
 outside this repository. Never apply an unruled decision, not even provisionally.
 
 ## Conventions

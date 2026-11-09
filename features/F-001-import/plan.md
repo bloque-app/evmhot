@@ -12,8 +12,8 @@ surface its clients use, and CI publishes its image.
 
 - Replace `src/` with the crate that ran: multi-network config (`chains.toml`), Postgres store and migrations, the
   outbox worker, the batched catch-up, per-token sweep targets, and route logging at boot.
-- A standalone server that serves `/evm/health`, `/evm/register`, `/evm/verify_transfer`, `GET|POST
-  /evm/block_number` with the host service's exact shapes, and the admin routes.
+- A standalone server that serves `SPEC.md` §9.1 under `/evm` with the host service's exact shapes (health as
+  `{status, enabled}`; `block_number` on the default network), and the admin routes of §9.2.
 - The counter seed: on an existing store with no counter, seed `MAX(derivation_index) + 1`, never 0 (`REQ-RG-3`).
 - Dockerfile, CI (fmt, clippy, tests against Postgres), image publishing to GHCR.
 - Close the stale pull requests that led to the vendored copy as superseded.

@@ -7,3 +7,5 @@
 - T-002-05 Lag metric, rate-limit back-off, alerts (`REQ-OB-1`, `REQ-OB-2`).
 - T-002-06 Ranged steady-state logs; native-scan switch.
 - T-002-07 Operator token on `POST /evm/block_number`; withdraw the symbol filter.
+- T-002-08 Sender column and `from_address`; per-sender sweeps (`REQ-WH-9`, `REQ-SW-12`).
+- T-002-09 Atomic outbox; separate tokens; counter ceiling; provider health (`REQ-WH-7`, `REQ-WH-8`, `REQ-RG-5`, `REQ-OB-3`).

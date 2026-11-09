@@ -10,7 +10,10 @@ addresses, credentials) live in the private devops repository, never here.
 
 ## 1. Shape of the system
 
-- One Rust binary, `evmhot`, using `alloy` for chain access, `axum` for HTTP and Postgres for the store.
+- One Rust crate with two products: the `evmhot` **library** (the wallet service a host program embeds) and the
+  `evmhot` **binary**, a self-contained service around it. From this iteration on, the service is the primary way evmhot
+  runs; the library stays embeddable and is what the service is built from.
+- `alloy` for chain access, `axum` for HTTP, Postgres for the store.
 - One process serves every configured network. Each network runs a monitor task and a sweeper task. A webhook worker
   task delivers the outbox.
 - Networks today: Polygon and Base. Admitted tokens per network come from configuration.
@@ -26,11 +29,17 @@ The code that ran in production was a copy of evmhot vendored into another Bloqu
 (per-token sweep targets, and route logging at boot). That copy, not the old `main`, is the baseline. F-001 brings it
 into this repository; the stale branches and pull requests that led to it are closed as superseded.
 
+### DEC-10 Library and service
+
+The crate keeps a library API (start the service, register, verify a transfer, read and move a cursor, retry) with no
+HTTP in it. The binary adds the HTTP surface of `SPEC.md` §9, configuration loading, health and metrics, and graceful
+shutdown. A host that embeds the library serves its own routes; the service's routes are not the library's concern.
+
 ### DEC-2 Store
 
 Postgres. The schema is the one that ran (registrations, deposits, token deposits, sweep bookkeeping, outbox,
-state). The derivation counter is seeded above the highest stored index (`REQ-RG-3`); the Postgres backend's seed had
-started at 0, which F-001 fixes. evmhot moves to a database of its own, keeping every row (`REQ-ST-2`); the old one
+state). The derivation counter is seeded above the highest stored index (`REQ-RG-3`); F-001 makes the Postgres
+backend's seed do so. evmhot moves to a database of its own, keeping every row (`REQ-ST-2`); the old one
 is snapshotted first.
 
 ### DEC-3 HTTP surface
@@ -54,8 +63,9 @@ Polygon detects on `finalized` (measured about 4 s behind the newest block). Bas
 ### DEC-6 Sweep targets
 
 Configured per network and token in `chains.toml`. Polygon native USDC goes to bezent's reserve, a `transfer` target
-that admits only that token, with bezent's per-transfer bounds (`REQ-SW-7`, `REQ-SW-8`). Other tokens keep their
-own targets, set by the operator per the decision form. `directed_deposit` (F-004) follows bezent's contract.
+that admits only that token, needs a refund address per sweep, and has bezent's per-transfer bounds (`REQ-SW-7`,
+`REQ-SW-8`, `REQ-SW-12`). Polygon USDT0 is held in its deposit addresses until bezent admits it into the same reserve.
+Base USDC is held until a bridge leg to Polygon exists (R6). `directed_deposit` (F-004) follows bezent's contract.
 
 ### DEC-7 Keys
 
@@ -89,7 +99,7 @@ unannounced.
 | Feature | What | Requirements |
 |---|---|---|
 | F-001 import | The code that ran, as this repository's `main`: the crate, a standalone `/evm/*` server, the counter seed fix, Dockerfile, CI, image | `REQ-API-1`, `REQ-RG-3` and every requirement not marked (not built) |
-| F-002 pre-restart fixes | Sweep outcome, sweep coordinate, finality per network, target bounds and admission, lag and provider alerts with back-off, ranged steady-state logs, operator route auth, withdraw the symbol filter | `REQ-SW-5`, `REQ-SW-7` to `REQ-SW-10`, `REQ-WH-4`, `REQ-DT-8`, `REQ-OB-1`, `REQ-OB-2`, `REQ-API-2`, `INV-5`, `INV-6` |
+| F-002 pre-restart fixes | Sweep outcome, sweep coordinate, senders and per-sender sweeps, finality per network, target bounds and admission, atomic outbox, separate tokens, counter ceiling, lag and provider alerts with back-off, ranged steady-state logs, operator route auth, provider health, withdraw the symbol filter | `REQ-SW-5`, `REQ-SW-7` to `REQ-SW-10`, `REQ-SW-12`, `REQ-WH-4`, `REQ-WH-7` to `REQ-WH-9`, `REQ-RG-5`, `REQ-DT-8`, `REQ-DT-10`, `REQ-OB-1` to `REQ-OB-3`, `REQ-API-2`, `INV-5`, `INV-6` |
 | F-003 self-hosting | Image pins, deploy definitions and runbook in the devops repository; the service, task role, DNS and routing in the infrastructure repository; the store move | DEC-2, DEC-7, DEC-8, DEC-9 |
 | F-004 directed deposit | `directed_deposit` targets | `REQ-SW-6` (second kind) |
 
