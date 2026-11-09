@@ -1,6 +1,7 @@
 use super::{
-    DepositQueueCounts, Erc20Deposit, Erc20Settlement, NewErc20Deposit, NewNativeDeposit,
-    NewSweepIntent, OutboxEntry, SweepIntent, SweepRecord, WebhookDeliveryRecord, WriteQueueError,
+    DepositQueueCounts, Erc20Deposit, Erc20Settlement, IntentTx, NativeSettlement, NewErc20Deposit,
+    NewNativeDeposit, NewSweepIntent, OutboxEntry, SweepIntent, SweepRecord, WebhookDeliveryRecord,
+    WriteQueueError,
 };
 use anyhow::{anyhow, Result};
 use r2d2::Pool;
@@ -1407,6 +1408,11 @@ impl Db {
             [chain],
             |row| row.get(0),
         )?;
+        let native_needs_review: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM deposits WHERE chain = ?1 AND status = 'needs_review'",
+            [chain],
+            |row| row.get(0),
+        )?;
         let erc20_needs_review: i64 = conn.query_row(
             "SELECT COUNT(*) FROM erc20_deposits WHERE chain = ?1 AND status = 'needs_review'",
             [chain],
@@ -1415,6 +1421,7 @@ impl Db {
         Ok(DepositQueueCounts {
             native_detected: native_detected as u64,
             native_failed: native_failed as u64,
+            native_needs_review: native_needs_review as u64,
             erc20_detected: erc20_detected as u64,
             erc20_failed: erc20_failed as u64,
             erc20_needs_review: erc20_needs_review as u64,
@@ -1426,12 +1433,41 @@ impl Db {
         let chain = chain.to_string();
         let tx_hash = tx_hash.to_string();
         self.with_write_priority(move |conn| {
-            conn.execute(
-                "UPDATE deposits SET status = 'detected'
-                 WHERE chain = ?1 AND tx_hash = ?2 AND status = 'failed'",
-                params![chain, tx_hash],
-            )?;
-            Ok(conn.changes() == 1)
+            atomically(conn, |conn| {
+                let pattern = format!("%\"{tx_hash}\"%");
+                let in_flight: Option<Option<String>> = conn
+                    .query_row(
+                        "SELECT tx_hash FROM sweep_intents
+                         WHERE chain = ?1 AND state = 'pending' AND keys LIKE ?2 LIMIT 1",
+                        params![chain, pattern],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(hash) = in_flight {
+                    return Err(anyhow!(
+                        "cannot retry: a sweep is still in flight (tx {})",
+                        hash.as_deref().unwrap_or("not yet signed")
+                    ));
+                }
+                conn.execute(
+                    "UPDATE deposits SET status = 'detected', review_kind = NULL
+                     WHERE chain = ?1 AND tx_hash = ?2 AND status IN ('failed', 'needs_review')",
+                    params![chain, tx_hash],
+                )?;
+                let updated = conn.changes() == 1;
+                if updated {
+                    conn.execute(
+                        "UPDATE sweep_intents SET state = 'closed_by_operator'
+                         WHERE chain = ?1 AND state = 'review' AND keys LIKE ?2",
+                        params![chain, pattern],
+                    )?;
+                    conn.execute(
+                        "DELETE FROM sweep_alerts WHERE chain = ?1 AND deposit_key = ?2",
+                        params![chain, tx_hash],
+                    )?;
+                }
+                Ok(updated)
+            })
         })
     }
 
@@ -1471,12 +1507,12 @@ impl Db {
                          WHERE chain = ?1 AND tx_hash = ?2 AND log_index = ?3",
                         params![chain, tx_hash, log_index as i64],
                     )?;
-                    // A review whose transfer may really have moved funds is
-                    // checked against its receipt again.
+                    // The operator has looked at the review intents: they are
+                    // closed, never re-opened. What is owed is computed from the
+                    // recorded sweeps alone from here on.
                     conn.execute(
-                        "UPDATE sweep_intents SET state = 'pending', passes = 0
-                         WHERE chain = ?1 AND state = 'review' AND tx_hash IS NOT NULL
-                           AND keys LIKE ?2",
+                        "UPDATE sweep_intents SET state = 'closed_by_operator'
+                         WHERE chain = ?1 AND state = 'review' AND keys LIKE ?2",
                         params![chain, pattern],
                     )?;
                     conn.execute(
@@ -1681,12 +1717,13 @@ impl Db {
         self.with_write(move |conn| {
             conn.execute(
                 "INSERT INTO sweep_intents
-                 (chain, account_id, token_address, group_key, keys, part_index, amount, target,
-                  state, tx_hash, passes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', NULL, 0)",
+                 (chain, account_id, address, token_address, group_key, keys, part_index, amount,
+                  target, state, tx_hash, passes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', NULL, 0)",
                 params![
                     new.chain,
                     new.account_id,
+                    new.address,
                     new.token_address,
                     new.group_key,
                     keys,
@@ -1699,22 +1736,129 @@ impl Db {
         })
     }
 
-    pub fn set_sweep_intent_signed(
-        &self,
-        id: i64,
-        nonce: u64,
-        tx_hash: &str,
-        raw_tx: &str,
-    ) -> Result<()> {
-        let tx_hash = tx_hash.to_string();
-        let raw_tx = raw_tx.to_string();
+    pub fn set_sweep_intent_signed(&self, id: i64, nonce: u64, tx: &IntentTx) -> Result<()> {
+        let tx = tx.clone();
+        self.with_write(move |conn| {
+            atomically(conn, |conn| {
+                let existing: String = conn.query_row(
+                    "SELECT txs FROM sweep_intents WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+                let mut txs: Vec<IntentTx> = serde_json::from_str(&existing).unwrap_or_default();
+                txs.push(tx.clone());
+                conn.execute(
+                    "UPDATE sweep_intents
+                     SET nonce = COALESCE(nonce, ?2), tx_hash = ?3, raw_tx = ?4, txs = ?5,
+                         passes = 0, gone_passes = 0
+                     WHERE id = ?1",
+                    params![
+                        id,
+                        nonce as i64,
+                        tx.hash,
+                        tx.raw,
+                        serde_json::to_string(&txs)?
+                    ],
+                )?;
+                Ok(())
+            })
+        })
+    }
+
+    pub fn bump_sweep_intent_gone_passes(&self, id: i64) -> Result<u64> {
         self.with_write(move |conn| {
             conn.execute(
-                "UPDATE sweep_intents SET nonce = ?2, tx_hash = ?3, raw_tx = ?4 WHERE id = ?1",
-                params![id, nonce as i64, tx_hash, raw_tx],
+                "UPDATE sweep_intents SET gone_passes = gone_passes + 1 WHERE id = ?1",
+                params![id],
             )?;
-            Ok(())
+            let n: i64 = conn.query_row(
+                "SELECT gone_passes FROM sweep_intents WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )?;
+            Ok(n as u64)
         })
+    }
+
+    pub fn highest_landed_intent_nonce(
+        &self,
+        chain: &str,
+        account_id: &str,
+    ) -> Result<Option<u64>> {
+        let conn = self.read.get()?;
+        let n: Option<i64> = conn.query_row(
+            "SELECT MAX(nonce) FROM sweep_intents
+             WHERE chain = ?1 AND account_id = ?2 AND state IN ('succeeded', 'failed', 'review')",
+            params![chain, account_id],
+            |r| r.get(0),
+        )?;
+        Ok(n.map(|n| n as u64))
+    }
+
+    pub fn settle_native_intent(
+        &self,
+        chain: &str,
+        id: i64,
+        settlements: &[NativeSettlement],
+    ) -> Result<usize> {
+        let chain = chain.to_string();
+        let settlements = settlements.to_vec();
+        self.with_write(move |conn| {
+            atomically(conn, |conn| {
+                conn.execute(
+                    "UPDATE sweep_intents SET state = 'succeeded' WHERE id = ?1",
+                    params![id],
+                )?;
+                let mut enqueued = 0;
+                for s in &settlements {
+                    conn.execute(
+                        "UPDATE deposits SET status = 'swept' WHERE chain = ?1 AND tx_hash = ?2",
+                        params![chain, s.tx_hash],
+                    )?;
+                    if let Some(entry) = &s.outbox {
+                        if upsert_outbox(conn, entry)? {
+                            enqueued += 1;
+                        }
+                    }
+                }
+                Ok(enqueued)
+            })
+        })
+    }
+
+    pub fn mark_native_deposits_needs_review_for_keys(
+        &self,
+        chain: &str,
+        keys: &[String],
+        kind: &str,
+    ) -> Result<()> {
+        let chain = chain.to_string();
+        let keys = keys.to_vec();
+        let kind = kind.to_string();
+        self.with_write(move |conn| {
+            atomically(conn, |conn| {
+                for key in &keys {
+                    conn.execute(
+                        "UPDATE deposits SET status = 'needs_review', review_kind = ?3
+                         WHERE chain = ?1 AND tx_hash = ?2 AND status = 'detected'",
+                        params![chain, key, kind],
+                    )?;
+                }
+                Ok(())
+            })
+        })
+    }
+
+    pub fn blocking_native_deposits(&self, chain: &str, account_id: &str) -> Result<Vec<String>> {
+        let conn = self.read.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT tx_hash FROM deposits
+             WHERE chain = ?1 AND account_id = ?2 AND status IN ('needs_review', 'failed')
+             ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![chain, account_id], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn set_sweep_intent_tx(&self, id: i64, tx_hash: &str) -> Result<()> {
@@ -1758,7 +1902,7 @@ impl Db {
         let conn = self.read.get()?;
         let mut stmt = conn.prepare(
             "SELECT id, group_key, keys, part_index, amount, target, tx_hash, passes, nonce, raw_tx,
-                    account_id, token_address
+                    account_id, token_address, address, txs, gone_passes
              FROM sweep_intents WHERE chain = ?1 AND state = 'pending' ORDER BY id",
         )?;
         let rows = stmt.query_map([chain], |r| {
@@ -1766,9 +1910,14 @@ impl Db {
             let part_index: i64 = r.get(3)?;
             let passes: i64 = r.get(7)?;
             let nonce: Option<i64> = r.get(8)?;
+            let txs_json: String = r.get(13)?;
+            let gone: i64 = r.get(14)?;
             Ok(SweepIntent {
                 id: r.get(0)?,
                 account_id: r.get(10)?,
+                address: r.get(12)?,
+                txs: serde_json::from_str(&txs_json).unwrap_or_default(),
+                gone_passes: gone as u64,
                 token_address: r.get(11)?,
                 group_key: r.get(1)?,
                 keys: serde_json::from_str(&keys_json).unwrap_or_default(),
@@ -1818,17 +1967,25 @@ impl Db {
         chain: &str,
         account_id: &str,
         token_address: &str,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<Erc20Deposit>> {
         let conn = self.read.get()?;
         let mut stmt = conn.prepare(
-            "SELECT tx_hash, log_index FROM erc20_deposits
+            "SELECT tx_hash, log_index, account_id, amount, token_address, token_symbol, from_address
+             FROM erc20_deposits
              WHERE chain = ?1 AND account_id = ?2 AND LOWER(token_address) = LOWER(?3)
                AND status IN ('needs_review', 'failed') ORDER BY rowid",
         )?;
-        let rows = stmt.query_map(params![chain, account_id, token_address], |r| {
-            let tx_hash: String = r.get(0)?;
-            let log_index: i64 = r.get(1)?;
-            Ok(format!("{tx_hash}:{log_index}"))
+        let rows = stmt.query_map(params![chain, account_id, token_address], |row| {
+            let tx_hash: String = row.get(0)?;
+            let log_index: i64 = row.get(1)?;
+            Ok(Erc20Deposit {
+                key: format!("{tx_hash}:{log_index}"),
+                account_id: row.get(2)?,
+                amount: row.get(3)?,
+                token_address: row.get(4)?,
+                token_symbol: row.get(5)?,
+                from_address: row.get(6)?,
+            })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
@@ -2284,6 +2441,7 @@ mod tests {
             DepositQueueCounts {
                 native_detected: 1,
                 native_failed: 0,
+                native_needs_review: 0,
                 erc20_detected: 0,
                 erc20_failed: 1,
                 erc20_needs_review: 0,

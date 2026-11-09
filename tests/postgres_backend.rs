@@ -157,10 +157,10 @@ fn seed_sqlite_source(next_index: i64, block_cursor: (&str, i64)) -> NamedTempFi
     .unwrap();
     conn.execute(
         "INSERT INTO sweep_intents
-         (chain, account_id, token_address, group_key, keys, part_index, amount, target, state,
-          tx_hash, nonce, raw_tx, passes)
-         VALUES ('base', 'seed-user', '0xtoken1', 'g', '[\"0xerc1:0\"]', 0, '50', '0xtarget',
-                 'succeeded', '0xsweepA', 5, '0xraw', 1)",
+         (chain, account_id, address, token_address, group_key, keys, part_index, amount, target,
+          state, tx_hash, nonce, raw_tx, passes)
+         VALUES ('base', 'seed-user', '0xseed', '0xtoken1', 'g', '[\"0xerc1:0\"]', 0, '50',
+                 '0xtarget', 'succeeded', '0xsweepA', 5, '0xraw', 1)",
         [],
     )
     .unwrap();
@@ -1377,6 +1377,7 @@ fn assert_order_intents_and_review(db: &Db) {
         .create_sweep_intent(&evmhot::db::NewSweepIntent {
             chain: "base".to_string(),
             account_id: "acct-a".to_string(),
+            address: "0xaddr-a".to_string(),
             token_address: "0xtoken1".to_string(),
             group_key: "gk".to_string(),
             keys: group.clone(),

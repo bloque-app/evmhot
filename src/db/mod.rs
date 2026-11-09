@@ -35,6 +35,8 @@ const DEFAULT_READ_POOL_MAX_SIZE: u32 = 10;
 pub struct DepositQueueCounts {
     pub native_detected: u64,
     pub native_failed: u64,
+    /// Native deposits an operator must look at (`needs_review`).
+    pub native_needs_review: u64,
     pub erc20_detected: u64,
     pub erc20_failed: u64,
     /// Token deposits an operator must look at (`needs_review`).
@@ -45,6 +47,7 @@ impl DepositQueueCounts {
     pub fn has_pending(&self) -> bool {
         self.native_detected > 0
             || self.native_failed > 0
+            || self.native_needs_review > 0
             || self.erc20_detected > 0
             || self.erc20_failed > 0
             || self.erc20_needs_review > 0
@@ -124,11 +127,31 @@ pub struct SweepRecord {
     pub sweep_target: Option<String>,
 }
 
+/// One signed transaction of an intent.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IntentTx {
+    pub hash: String,
+    /// `0x` hex of the signed bytes.
+    pub raw: String,
+    /// Fees as decimal strings (they exceed what JSON numbers carry).
+    pub max_fee: String,
+    pub max_priority: String,
+}
+
+/// What a native sweep settles: a deposit and its outbox row.
+#[derive(Clone, Debug)]
+pub struct NativeSettlement {
+    pub tx_hash: String,
+    pub outbox: Option<OutboxEntry>,
+}
+
 /// What is stored before a sweep part is signed.
 #[derive(Clone, Debug)]
 pub struct NewSweepIntent {
     pub chain: String,
     pub account_id: String,
+    /// The deposit address: nonces are per address, so is the one-open-intent rule.
+    pub address: String,
     pub token_address: String,
     pub group_key: String,
     pub keys: Vec<String>,
@@ -143,6 +166,12 @@ pub struct NewSweepIntent {
 pub struct SweepIntent {
     pub id: i64,
     pub account_id: String,
+    pub address: String,
+    /// Every transaction signed for this intent's nonce, oldest first (a
+    /// repricing signs another at the same nonce).
+    pub txs: Vec<IntentTx>,
+    /// Passes in which the nonce was seen used with no receipt of ours.
+    pub gone_passes: u64,
     pub token_address: String,
     pub group_key: String,
     pub keys: Vec<String>,
@@ -648,13 +677,13 @@ impl Db {
         }
     }
 
-    /// Keys of deposits of this address and token that are `needs_review` or `failed`.
+    /// Deposits of this address and token that are `needs_review` or `failed`.
     pub fn blocking_erc20_deposits(
         &self,
         chain: &str,
         account_id: &str,
         token_address: &str,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<Erc20Deposit>> {
         match self.inner.as_ref() {
             DbInner::Sqlite(s) => s.blocking_erc20_deposits(chain, account_id, token_address),
             DbInner::Postgres(p) => p.blocking_erc20_deposits(chain, account_id, token_address),
@@ -669,17 +698,78 @@ impl Db {
         }
     }
 
-    /// Stores the signed transaction (nonce, hash, raw bytes) before it is broadcast.
-    pub fn set_sweep_intent_signed(
+    /// Appends a signed transaction to the intent (before it is broadcast) and
+    /// resets its wait counters. The first call fixes the intent's nonce.
+    pub fn set_sweep_intent_signed(&self, id: i64, nonce: u64, tx: &IntentTx) -> Result<()> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.set_sweep_intent_signed(id, nonce, tx),
+            DbInner::Postgres(p) => p.set_sweep_intent_signed(id, nonce, tx),
+        }
+    }
+
+    /// The one open intent of a deposit address, if any.
+    pub fn open_sweep_intent(&self, chain: &str, account_id: &str) -> Result<Option<SweepIntent>> {
+        Ok(self
+            .all_pending_sweep_intents(chain)?
+            .into_iter()
+            .find(|i| i.account_id == account_id))
+    }
+
+    /// Counts one more pass in which the nonce was used with no receipt of ours.
+    pub fn bump_sweep_intent_gone_passes(&self, id: i64) -> Result<u64> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.bump_sweep_intent_gone_passes(id),
+            DbInner::Postgres(p) => p.bump_sweep_intent_gone_passes(id),
+        }
+    }
+
+    /// Highest nonce of an intent that landed (succeeded, failed or review):
+    /// the next nonce is at least one above it even if a public RPC's pending
+    /// count is stale.
+    pub fn highest_landed_intent_nonce(
         &self,
+        chain: &str,
+        account_id: &str,
+    ) -> Result<Option<u64>> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.highest_landed_intent_nonce(chain, account_id),
+            DbInner::Postgres(p) => p.highest_landed_intent_nonce(chain, account_id),
+        }
+    }
+
+    /// One transaction: the intent succeeds, the native deposits are marked
+    /// swept, and their `deposit_swept` rows are enqueued (REQ-WH-7). Returns
+    /// how many outbox rows were written.
+    pub fn settle_native_intent(
+        &self,
+        chain: &str,
         id: i64,
-        nonce: u64,
-        tx_hash: &str,
-        raw_tx: &str,
+        settlements: &[NativeSettlement],
+    ) -> Result<usize> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.settle_native_intent(chain, id, settlements),
+            DbInner::Postgres(p) => p.settle_native_intent(chain, id, settlements),
+        }
+    }
+
+    /// Moves native deposits to `needs_review`.
+    pub fn mark_native_deposits_needs_review_for_keys(
+        &self,
+        chain: &str,
+        keys: &[String],
+        kind: &str,
     ) -> Result<()> {
         match self.inner.as_ref() {
-            DbInner::Sqlite(s) => s.set_sweep_intent_signed(id, nonce, tx_hash, raw_tx),
-            DbInner::Postgres(p) => p.set_sweep_intent_signed(id, nonce, tx_hash, raw_tx),
+            DbInner::Sqlite(s) => s.mark_native_deposits_needs_review_for_keys(chain, keys, kind),
+            DbInner::Postgres(p) => p.mark_native_deposits_needs_review_for_keys(chain, keys, kind),
+        }
+    }
+
+    /// Native deposits of this address that are `needs_review` or `failed`.
+    pub fn blocking_native_deposits(&self, chain: &str, account_id: &str) -> Result<Vec<String>> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.blocking_native_deposits(chain, account_id),
+            DbInner::Postgres(p) => p.blocking_native_deposits(chain, account_id),
         }
     }
 

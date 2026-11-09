@@ -47,6 +47,8 @@ pub struct DepositRow {
     pub status: String,
     /// Sender (REQ-WH-9). `None` for rows written before it was stored.
     pub from_address: Option<String>,
+    /// Why it needs an operator (`needs_review` deposits).
+    pub review_kind: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -71,6 +73,7 @@ pub struct SweepIntentRow {
     pub id: i64,
     pub chain: String,
     pub account_id: String,
+    pub address: String,
     pub token_address: String,
     pub group_key: String,
     pub keys: String,
@@ -81,7 +84,9 @@ pub struct SweepIntentRow {
     pub tx_hash: Option<String>,
     pub nonce: Option<i64>,
     pub raw_tx: Option<String>,
+    pub txs: String,
     pub passes: i64,
+    pub gone_passes: i64,
 }
 
 /// One sweep that settled a deposit (REQ-SW-10).
@@ -208,8 +213,13 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
     };
 
     let mut stmt = conn.prepare(&format!(
-        "SELECT chain, tx_hash, account_id, amount, status, {} FROM deposits ORDER BY rowid",
-        from_expr("deposits")?
+        "SELECT chain, tx_hash, account_id, amount, status, {}, {} FROM deposits ORDER BY rowid",
+        from_expr("deposits")?,
+        if table_has_column(&conn, "deposits", "review_kind")? {
+            "review_kind"
+        } else {
+            "NULL"
+        }
     ))?;
     let rows = stmt.query_map([], |r| {
         Ok(DepositRow {
@@ -219,6 +229,7 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
             amount: r.get(3)?,
             status: r.get(4)?,
             from_address: r.get(5)?,
+            review_kind: r.get(6)?,
         })
     })?;
     snapshot.deposits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -341,7 +352,7 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
     if table_exists(&conn, "sweep_intents")? {
         let mut stmt = conn.prepare(
             "SELECT id, chain, account_id, token_address, group_key, keys, part_index, amount,
-                    target, state, tx_hash, nonce, raw_tx, passes
+                    target, state, tx_hash, nonce, raw_tx, passes, address, txs, gone_passes
              FROM sweep_intents ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -360,6 +371,9 @@ pub fn read_sqlite_snapshot(path: &Path) -> Result<SqliteSnapshot> {
                 nonce: r.get(11)?,
                 raw_tx: r.get(12)?,
                 passes: r.get(13)?,
+                address: r.get(14)?,
+                txs: r.get(15)?,
+                gone_passes: r.get(16)?,
             })
         })?;
         snapshot.sweep_intents = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -499,8 +513,8 @@ fn migrate_after_checks(
     summary.deposits.0 = snapshot.deposits.len();
     for row in &snapshot.deposits {
         let changes = tx.execute(
-            "INSERT INTO deposits (chain, tx_hash, account_id, amount, status, from_address)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO deposits (chain, tx_hash, account_id, amount, status, from_address, review_kind)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (chain, tx_hash) DO NOTHING",
             &[
                 &row.chain,
@@ -509,6 +523,7 @@ fn migrate_after_checks(
                 &row.amount,
                 &row.status,
                 &row.from_address,
+                &row.review_kind,
             ],
         )?;
         summary.deposits.1 += changes as usize;
@@ -566,8 +581,8 @@ fn migrate_after_checks(
         let changes = tx.execute(
             "INSERT INTO sweep_intents
              (id, chain, account_id, token_address, group_key, keys, part_index, amount, target,
-              state, tx_hash, nonce, raw_tx, passes)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+              state, tx_hash, nonce, raw_tx, passes, address, txs, gone_passes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
              ON CONFLICT (id) DO NOTHING",
             &[
                 &row.id,
@@ -584,6 +599,9 @@ fn migrate_after_checks(
                 &row.nonce,
                 &row.raw_tx,
                 &row.passes,
+                &row.address,
+                &row.txs,
+                &row.gone_passes,
             ],
         )?;
         summary.sweep_intents.1 += changes as usize;
@@ -934,9 +952,9 @@ mod tests {
         }
         conn.execute(
             "INSERT INTO sweep_intents
-             (chain, account_id, token_address, group_key, keys, part_index, amount, target, state,
-              tx_hash, nonce, raw_tx, passes)
-             VALUES ('base', 'u1', '0xt', 'g', '[]', 0, '1', '0xtarget', 'succeeded', '0xh', 4, '0xraw', 2)",
+             (chain, account_id, address, token_address, group_key, keys, part_index, amount, target,
+              state, tx_hash, nonce, raw_tx, passes)
+             VALUES ('base', 'u1', '0x1', '0xt', 'g', '[]', 0, '1', '0xtarget', 'succeeded', '0xh', 4, '0xraw', 2)",
             [],
         )
         .unwrap();

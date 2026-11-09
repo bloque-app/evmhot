@@ -119,12 +119,14 @@ CREATE TABLE IF NOT EXISTS sweeps (
 -- sequence on erc20_deposits so detected deposits are read in insertion order.
 ALTER TABLE sweeps ADD COLUMN IF NOT EXISTS sweep_target TEXT;
 ALTER TABLE erc20_deposits ADD COLUMN IF NOT EXISTS review_kind TEXT;
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS review_kind TEXT;
 ALTER TABLE erc20_deposits ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
 
 CREATE TABLE IF NOT EXISTS sweep_intents (
   id BIGSERIAL PRIMARY KEY,
   chain TEXT NOT NULL,
   account_id TEXT NOT NULL,
+  address TEXT NOT NULL,
   token_address TEXT NOT NULL,
   group_key TEXT NOT NULL,
   keys TEXT NOT NULL,
@@ -135,9 +137,12 @@ CREATE TABLE IF NOT EXISTS sweep_intents (
   tx_hash TEXT,
   nonce BIGINT,
   raw_tx TEXT,
-  passes BIGINT NOT NULL DEFAULT 0
+  txs TEXT NOT NULL DEFAULT '[]',
+  passes BIGINT NOT NULL DEFAULT 0,
+  gone_passes BIGINT NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sweep_intents_state ON sweep_intents (chain, state);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sweep_intents_open ON sweep_intents (chain, account_id) WHERE state = 'pending';
 
 CREATE TABLE IF NOT EXISTS sweep_alerts (
   chain TEXT NOT NULL,
