@@ -1653,7 +1653,7 @@ impl PostgresBackend {
         let rows = guard.client().query(
             "SELECT id, event FROM webhook_deliveries
              WHERE status = 'pending'
-               AND attempt_count < CASE WHEN event = 'deposit_swept:notify' THEN $4 ELSE $1 END
+               AND attempt_count < CASE WHEN event = 'deposit_swept:notify' THEN $4::BIGINT ELSE $1::BIGINT END
                AND (leased_until IS NULL OR leased_until < $2)
              ORDER BY updated_at ASC
              LIMIT $3",
