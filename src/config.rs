@@ -84,16 +84,23 @@ impl SweepTarget {
     }
 }
 
-/// Splits `amount` into sweeps that respect a target's bounds (REQ-SW-7).
+/// Splits `amount` into sweeps that respect a target's bounds (REQ-SW-7), at
+/// most `limit` parts per call so a tiny `max` can never make one pass unbounded;
+/// the rest is planned on a later pass from the then-current balance.
 ///
 /// - Below `min`: no sweep (the amount waits).
 /// - Above `max`: parts of `max`, then the remainder.
 /// - A remainder under `min` is topped up from the previous part when both can
-///   stay within bounds; otherwise it stays in the deposit address, because no
-///   sweep may fall outside the target's bounds.
-pub fn plan_sweep_parts(amount: U256, min: Option<U256>, max: Option<U256>) -> Vec<U256> {
+///   stay within bounds; otherwise it is left owed, because no sweep may fall
+///   outside the target's bounds.
+pub fn plan_sweep_parts(
+    amount: U256,
+    min: Option<U256>,
+    max: Option<U256>,
+    limit: usize,
+) -> Vec<U256> {
     let min = min.unwrap_or(U256::ZERO);
-    if amount.is_zero() || amount < min {
+    if amount.is_zero() || amount < min || limit == 0 {
         return Vec::new();
     }
     let Some(max) = max.filter(|m| !m.is_zero()) else {
@@ -104,16 +111,19 @@ pub fn plan_sweep_parts(amount: U256, min: Option<U256>, max: Option<U256>) -> V
     }
     let full = amount / max;
     let rem = amount % max;
-    let mut parts: Vec<U256> = Vec::new();
-    let mut i = U256::ZERO;
-    while i < full {
-        parts.push(max);
-        i += U256::from(1u8);
+    // More full parts than this pass may send: send `limit` of them and plan the
+    // rest next pass (no tail rebalancing needed, the tail is not in this plan).
+    if full > U256::from(limit) {
+        return vec![max; limit];
     }
+    let full = full.to::<usize>();
+    let mut parts: Vec<U256> = vec![max; full];
     if !rem.is_zero() {
         if rem >= min {
-            parts.push(rem);
-        } else if max + rem >= min + min {
+            if parts.len() < limit {
+                parts.push(rem);
+            }
+        } else if max + rem >= min + min && parts.len() < limit {
             // Both parts stay within [min, max]: rem < min gives prev < max.
             let last = parts.len() - 1;
             parts[last] = max + rem - min;

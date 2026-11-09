@@ -68,8 +68,23 @@ or in `token_targets`, not both.
 
 Each sweep is one `transfer` call into the target. evmhot reads the sweep's coordinate (transaction hash, block number,
 block hash, block-level log index of the `Transfer` into the target, amount) from the receipt and reports it in
-`deposit_swept` ([`WEBHOOK_SPEC.md`](WEBHOOK_SPEC.md)). A sweep whose receipt shows a revert, or has no such `Transfer`
-log, is a failure and is never reported.
+`deposit_swept` ([`WEBHOOK_SPEC.md`](WEBHOOK_SPEC.md)). A sweep whose receipt shows a revert is a failure and is never
+reported.
+
+**Sweep intents and `needs_review`.** Before a sweep is signed, evmhot stores an intent (deposits, part, amount,
+target); its transaction hash is stored when it is sent. On each pass, an intent still pending is resolved from its
+hash's receipt before anything is planned; with no hash, or no receipt after 10 passes, the deposits go to
+`needs_review`. A deposit is also moved to `needs_review` (never auto-settled or auto-retried, no `deposit_swept`,
+`EVMHOT_ALERT kind=... network=... deposit=... tx=...` logged at ERROR, counted in the sweeper's queue log) when:
+`sweep_review` the receipt succeeded but has no matching `Transfer` or its value differs from the planned amount;
+`balance_shortfall` a `per_sender` pair holds less than every sender is still owed (so one sender's sweep can never
+spend another's funds); `no_sender` a deposit with no recorded sender sits on a `per_sender` target. `POST
+/admin/retry_sweeps` (with the operator token) is the only route that moves a `needs_review` or `failed` deposit back to
+`detected`.
+
+**Limits.** A split sends at most 10 parts per pass; the balance is re-read on the next pass. A dust remainder below
+`min` stays owed (`EVMHOT_ALERT kind=dust` warning): the deposits are not settled and a later deposit lifts it. At load,
+`max = 0` and `min > max` are refused.
 
 ## HTTP API
 

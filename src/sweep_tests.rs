@@ -462,6 +462,7 @@ async fn req_sw_10_coordinate_comes_from_receipt_log_index_not_tx_position() {
             sweep_block_hash: hash32(11),
             sweep_log_index: 17,
             sweep_amount: "1000".into(),
+            sweep_target: Some(checksum(TARGET_A)),
         }]
     );
     let payload = fx.swept_webhook("0xaaa:1").expect("deposit_swept enqueued");
@@ -472,12 +473,13 @@ async fn req_sw_10_coordinate_comes_from_receipt_log_index_not_tx_position() {
     assert_eq!(payload["sweeps"][0]["sweep_block_hash"], hash32(11));
     assert_eq!(payload["sweeps"][0]["sweep_log_index"], 17);
     assert_eq!(payload["sweeps"][0]["sweep_amount"], "1000");
+    assert_eq!(payload["sweeps"][0]["sweep_target"], checksum(TARGET_A));
     assert_eq!(payload["original_tx_hash"], "0xaaa");
     assert_eq!(payload["from_address"], SENDER_A);
 }
 
 #[tokio::test]
-async fn req_sw_10_receipt_without_a_transfer_into_the_target_is_a_failure() {
+async fn req_sw_10_receipt_without_a_transfer_into_the_target_goes_to_review_with_an_alert() {
     let fx = fixture();
     fx.token_deposit("0xaaa", 1, "1000", Some(SENDER_A));
     let tx = sweep_tx(5);
@@ -494,18 +496,54 @@ async fn req_sw_10_receipt_without_a_transfer_into_the_target_is_a_failure() {
 
     sweeper.process_deposits_once().await.unwrap();
 
+    // Not settled, not retried, no webhook: an operator looks.
+    assert_eq!(fx.detected(), 0);
     assert_eq!(
-        fx.detected(),
-        1,
-        "a sweep with no coordinate is not reported"
+        fx.db
+            .get_review_kind(TEST_CHAIN, "0xaaa:1")
+            .unwrap()
+            .as_deref(),
+        Some("sweep_review")
     );
     assert!(fx.swept_webhook("0xaaa:1").is_none());
     assert_eq!(
         fx.db
-            .get_sweep_failure_count(TEST_CHAIN, "0xaaa:1")
-            .unwrap(),
+            .deposit_queue_counts(TEST_CHAIN)
+            .unwrap()
+            .erc20_needs_review,
         1
     );
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(rpc.sent(), 1, "a deposit in review is never swept again");
+}
+
+#[tokio::test]
+async fn req_sw_10_matched_transfer_with_a_different_value_goes_to_review() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "1000", Some(SENDER_A));
+    let tx = sweep_tx(6);
+    // The Transfer into the target moved 900, not the planned 1000.
+    let rpc = Rpc::start(
+        1000,
+        vec![tx.clone()],
+        vec![(
+            tx.clone(),
+            ok_receipt(&tx, 11, 3, TOKEN, &fx.addr, TARGET_A, 900),
+        )],
+    )
+    .await;
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |_| {}));
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(fx.detected(), 0);
+    assert_eq!(
+        fx.db
+            .get_review_kind(TEST_CHAIN, "0xaaa:1")
+            .unwrap()
+            .as_deref(),
+        Some("sweep_review")
+    );
+    assert!(fx.swept_webhook("0xaaa:1").is_none());
+    assert!(fx.db.get_sweeps(TEST_CHAIN, "0xaaa:1").unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -879,28 +917,31 @@ async fn req_sw_7_split_waits_for_its_last_sweep_and_resumes_after_a_failure() {
 fn req_sw_7_plan_sweep_parts_respects_both_bounds() {
     let u = |n: u64| U256::from(n);
     // No bounds: one sweep. Zero: none.
-    assert_eq!(plan_sweep_parts(u(250), None, None), vec![u(250)]);
-    assert!(plan_sweep_parts(u(0), None, None).is_empty());
+    assert_eq!(plan_sweep_parts(u(250), None, None, 10), vec![u(250)]);
+    assert!(plan_sweep_parts(u(0), None, None, 10).is_empty());
     // Below the minimum waits.
-    assert!(plan_sweep_parts(u(99), Some(u(100)), None).is_empty());
+    assert!(plan_sweep_parts(u(99), Some(u(100)), None, 10).is_empty());
     // At the maximum is one sweep; above it splits.
-    assert_eq!(plan_sweep_parts(u(100), None, Some(u(100))), vec![u(100)]);
     assert_eq!(
-        plan_sweep_parts(u(250), None, Some(u(100))),
+        plan_sweep_parts(u(100), None, Some(u(100)), 10),
+        vec![u(100)]
+    );
+    assert_eq!(
+        plan_sweep_parts(u(250), None, Some(u(100)), 10),
         vec![u(100), u(100), u(50)]
     );
     // A remainder under the minimum is topped up from the previous part.
     assert_eq!(
-        plan_sweep_parts(u(210), Some(u(50)), Some(u(100))),
+        plan_sweep_parts(u(210), Some(u(50)), Some(u(100)), 10),
         vec![u(100), u(60), u(50)]
     );
     // When it cannot be, the dust stays in the address rather than being swept
     // outside the bounds.
     assert_eq!(
-        plan_sweep_parts(u(110), Some(u(90)), Some(u(100))),
+        plan_sweep_parts(u(110), Some(u(90)), Some(u(100)), 10),
         vec![u(100)]
     );
-    for part in plan_sweep_parts(u(1234), Some(u(40)), Some(u(100))) {
+    for part in plan_sweep_parts(u(1234), Some(u(40)), Some(u(100)), 10) {
         assert!(part >= u(40) && part <= u(100));
     }
 }
@@ -1167,32 +1208,34 @@ async fn req_sw_12_per_sender_deposits_of_one_sender_accumulate_to_the_minimum()
 }
 
 #[tokio::test]
-async fn req_sw_12_per_sender_deposit_with_no_recorded_sender_is_swept_on_its_own() {
+async fn no_sender_on_per_sender_target_goes_to_review() {
     let fx = fixture();
     fx.token_deposit("0xaaa", 1, "100", None);
-    fx.token_deposit("0xbbb", 2, "200", None);
-    let (t1, t2) = (sweep_tx(51), sweep_tx(52));
+    fx.token_deposit("0xbbb", 2, "200", Some(SENDER_A));
+    let t1 = sweep_tx(51);
     let rpc = Rpc::start(
         300,
-        vec![t1.clone(), t2.clone()],
-        vec![
-            (
-                t1.clone(),
-                ok_receipt(&t1, 50, 1, TOKEN, &fx.addr, TARGET_A, 100),
-            ),
-            (
-                t2.clone(),
-                ok_receipt(&t2, 51, 1, TOKEN, &fx.addr, TARGET_A, 200),
-            ),
-        ],
+        vec![t1.clone()],
+        vec![(
+            t1.clone(),
+            ok_receipt(&t1, 50, 1, TOKEN, &fx.addr, TARGET_A, 200),
+        )],
     )
     .await;
     let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |t| t.per_sender = true));
     sweeper.process_deposits_once().await.unwrap();
-    assert_eq!(rpc.sent(), 2);
-    // Legacy rows have no sender: the event carries it as null.
-    let payload = fx.swept_webhook("0xaaa:1").unwrap();
-    assert!(payload["from_address"].is_null());
+    // The sender-less deposit has no refund address: never swept, for an operator.
+    assert_eq!(
+        fx.db
+            .get_review_kind(TEST_CHAIN, "0xaaa:1")
+            .unwrap()
+            .as_deref(),
+        Some("no_sender")
+    );
+    assert!(fx.swept_webhook("0xaaa:1").is_none());
+    // The sender that is known is still swept (its own 200 only).
+    assert_eq!(rpc.sent(), 1);
+    assert!(fx.swept_webhook("0xbbb:2").is_some());
 }
 
 #[tokio::test]
@@ -1210,6 +1253,7 @@ async fn req_sw_7_a_deposit_that_joined_after_the_sweeps_does_not_block_settling
                 sweep_block_hash: hash32(5),
                 sweep_log_index: 2,
                 sweep_amount: "100".into(),
+                sweep_target: None,
             },
         )
         .unwrap();
@@ -1643,6 +1687,7 @@ fn req_sw_10_store_records_sweeps_idempotently_and_in_order() {
         sweep_block_hash: hash32(7),
         sweep_log_index: log,
         sweep_amount: "10".into(),
+        sweep_target: Some(TARGET_A.into()),
     };
     let keys = vec!["0xd1:1".to_string(), "0xd2:2".to_string()];
     db.record_sweep(TEST_CHAIN, &keys, &rec("0xs1", 3)).unwrap();
@@ -1652,4 +1697,279 @@ fn req_sw_10_store_records_sweeps_idempotently_and_in_order() {
         let sweeps = db.get_sweeps(TEST_CHAIN, key).unwrap();
         assert_eq!(sweeps, vec![rec("0xs1", 3), rec("0xs2", 4)]);
     }
+}
+
+// ---------------------------------------------------------- review fixes
+
+fn pending_intent(fx: &Fixture, key: &str, amount: &str, tx: Option<&str>) -> i64 {
+    let id = fx
+        .db
+        .create_sweep_intent(
+            TEST_CHAIN,
+            "gk",
+            &[key.to_string()],
+            0,
+            amount,
+            &checksum(TARGET_A),
+        )
+        .unwrap();
+    if let Some(tx) = tx {
+        fx.db.set_sweep_intent_tx(id, tx).unwrap();
+    }
+    id
+}
+
+#[tokio::test]
+async fn review_landed_but_unrecorded_is_never_silently_settled() {
+    // A sweep was sent (intent has its hash) but the process stopped before
+    // recording it. The address is now empty, so the zero-balance rule would
+    // settle the deposit silently. It must wait for the receipt instead.
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let tx = sweep_tx(101);
+    pending_intent(&fx, "0xaaa:1", "100", Some(&tx));
+    let rpc = Rpc::start(0, vec![sweep_tx(102)], vec![]).await; // no receipt yet
+    let sweeper = fx.sweeper(&rpc, target_for(TOKEN, |_| {}));
+    for _ in 0..9 {
+        sweeper.process_deposits_once().await.unwrap();
+    }
+    assert_eq!(fx.detected(), 1, "not settled by the zero-balance rule");
+    assert!(fx.swept_webhook("0xaaa:1").is_none());
+    // Still no receipt after the tenth pass: an operator looks.
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(fx.detected(), 0);
+    assert_eq!(
+        fx.db
+            .get_review_kind(TEST_CHAIN, "0xaaa:1")
+            .unwrap()
+            .as_deref(),
+        Some("sweep_review")
+    );
+    assert_eq!(rpc.sent(), 0);
+}
+
+#[tokio::test]
+async fn review_pending_intent_is_resolved_from_its_receipt_and_settled() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let tx = sweep_tx(103);
+    pending_intent(&fx, "0xaaa:1", "100", Some(&tx));
+    let rpc = Rpc::start(
+        0,
+        vec![sweep_tx(104)],
+        vec![(
+            tx.clone(),
+            ok_receipt(&tx, 30, 6, TOKEN, &fx.addr, TARGET_A, 100),
+        )],
+    )
+    .await;
+    fx.sweeper(&rpc, target_for(TOKEN, |_| {}))
+        .process_deposits_once()
+        .await
+        .unwrap();
+    // Recovered: recorded from the receipt, settled by the recorded sweep, not re-sent.
+    assert_eq!(rpc.sent(), 0);
+    assert_eq!(fx.detected(), 0);
+    let payload = fx.swept_webhook("0xaaa:1").expect("deposit_swept");
+    assert_eq!(payload["sweeps"][0]["sweep_tx_hash"], tx);
+    assert_eq!(payload["sweeps"][0]["sweep_log_index"], 6);
+}
+
+#[tokio::test]
+async fn review_pending_intent_without_a_hash_goes_to_review() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    pending_intent(&fx, "0xaaa:1", "100", None);
+    let rpc = Rpc::start(100, vec![sweep_tx(105)], vec![]).await;
+    fx.sweeper(&rpc, target_for(TOKEN, |_| {}))
+        .process_deposits_once()
+        .await
+        .unwrap();
+    assert_eq!(rpc.sent(), 0, "it may have been sent: no second sweep");
+    assert_eq!(
+        fx.db
+            .get_review_kind(TEST_CHAIN, "0xaaa:1")
+            .unwrap()
+            .as_deref(),
+        Some("sweep_review")
+    );
+}
+
+#[tokio::test]
+async fn review_a_sweep_leaves_a_succeeded_intent_and_a_sweep_row() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    let tx = sweep_tx(106);
+    let rpc = Rpc::start(
+        100,
+        vec![tx.clone()],
+        vec![(
+            tx.clone(),
+            ok_receipt(&tx, 30, 6, TOKEN, &fx.addr, TARGET_A, 100),
+        )],
+    )
+    .await;
+    fx.sweeper(&rpc, target_for(TOKEN, |_| {}))
+        .process_deposits_once()
+        .await
+        .unwrap();
+    assert!(fx
+        .db
+        .pending_sweep_intents(TEST_CHAIN, &["0xaaa:1".to_string()])
+        .unwrap()
+        .is_empty());
+    assert_eq!(fx.db.get_sweeps(TEST_CHAIN, "0xaaa:1").unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn per_sender_never_spends_other_senders_funds() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "500", Some(SENDER_A));
+    fx.token_deposit("0xbbb", 2, "300", Some(SENDER_B));
+    // The address holds 600, less than the 800 owed to the two senders.
+    let rpc = Rpc::start(600, vec![sweep_tx(111)], vec![]).await;
+    fx.sweeper(&rpc, target_for(TOKEN, |t| t.per_sender = true))
+        .process_deposits_once()
+        .await
+        .unwrap();
+    assert_eq!(rpc.sent(), 0, "nothing is swept for the pair");
+    for key in ["0xaaa:1", "0xbbb:2"] {
+        assert_eq!(
+            fx.db.get_review_kind(TEST_CHAIN, key).unwrap().as_deref(),
+            Some("balance_shortfall")
+        );
+    }
+}
+
+#[tokio::test]
+async fn split_plan_is_bounded_per_pass() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "1500", Some(SENDER_A));
+    let hashes: Vec<String> = (0..15).map(|i| sweep_tx(200 + i)).collect();
+    let receipts = hashes
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            (
+                h.clone(),
+                ok_receipt(h, 40 + i as u64, i as u64, TOKEN, &fx.addr, TARGET_A, 100),
+            )
+        })
+        .collect();
+    let rpc = Rpc::start(1500, hashes.clone(), receipts).await;
+    let sweeper = fx.sweeper(
+        &rpc,
+        target_for(TOKEN, |t| t.max = Some(U256::from(100u64))),
+    );
+    sweeper.process_deposits_once().await.unwrap();
+    // 15 parts are owed; a pass sends at most 10 and settles nothing.
+    assert_eq!(rpc.sent(), 10);
+    assert_eq!(fx.detected(), 1);
+    assert!(fx.swept_webhook("0xaaa:1").is_none());
+    // The next pass re-reads the balance and sends the rest.
+    rpc.set_balance(500);
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(rpc.sent(), 15);
+    assert_eq!(fx.detected(), 0);
+    let payload = fx.swept_webhook("0xaaa:1").unwrap();
+    assert_eq!(payload["sweeps"].as_array().unwrap().len(), 15);
+}
+
+#[tokio::test]
+async fn dust_after_a_split_stays_owed_and_is_lifted_by_a_later_deposit() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "110", Some(SENDER_A));
+    let (t1, t2) = (sweep_tx(301), sweep_tx(302));
+    let rpc = Rpc::start(
+        110,
+        vec![t1.clone(), t2.clone()],
+        vec![
+            (
+                t1.clone(),
+                ok_receipt(&t1, 50, 1, TOKEN, &fx.addr, TARGET_A, 100),
+            ),
+            (
+                t2.clone(),
+                ok_receipt(&t2, 51, 1, TOKEN, &fx.addr, TARGET_A, 100),
+            ),
+        ],
+    )
+    .await;
+    let sweeper = fx.sweeper(
+        &rpc,
+        target_for(TOKEN, |t| {
+            t.min = Some(U256::from(90u64));
+            t.max = Some(U256::from(100u64));
+        }),
+    );
+    sweeper.process_deposits_once().await.unwrap();
+    // 100 went out; the 10 left is below the minimum: owed, not settled.
+    assert_eq!(rpc.sent(), 1);
+    assert_eq!(fx.detected(), 1);
+    assert!(fx.swept_webhook("0xaaa:1").is_none());
+    rpc.set_balance(10);
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(rpc.sent(), 1);
+    assert_eq!(fx.detected(), 1);
+    // A later deposit lifts the dust over the minimum; both are settled.
+    fx.token_deposit("0xbbb", 2, "90", Some(SENDER_B));
+    rpc.set_balance(100);
+    sweeper.process_deposits_once().await.unwrap();
+    assert_eq!(rpc.sent(), 2);
+    assert_eq!(fx.detected(), 0);
+    let first = fx.swept_webhook("0xaaa:1").unwrap();
+    assert_eq!(first["sweeps"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn split_plan_limit_never_allocates_more_than_the_limit() {
+    let u = |n: u64| U256::from(n);
+    // A tiny maximum on a huge amount is capped, not expanded.
+    let huge = U256::from(10u64).pow(U256::from(30u64));
+    assert_eq!(plan_sweep_parts(huge, None, Some(u(1)), 10).len(), 10);
+    assert_eq!(plan_sweep_parts(u(1500), None, Some(u(100)), 10).len(), 10);
+    assert_eq!(plan_sweep_parts(u(1000), None, Some(u(100)), 10).len(), 10);
+    assert_eq!(plan_sweep_parts(u(1010), None, Some(u(100)), 10).len(), 10);
+}
+
+#[test]
+fn review_admin_retry_moves_needs_review_back_to_detected() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    pending_intent(&fx, "0xaaa:1", "100", None);
+    fx.db
+        .mark_erc20_deposits_needs_review_for_keys(
+            TEST_CHAIN,
+            &["0xaaa:1".to_string()],
+            "sweep_review",
+        )
+        .unwrap();
+    assert_eq!(fx.detected(), 0);
+    // Only the retry route (this call) moves it back.
+    assert!(fx.db.retry_erc20_deposit(TEST_CHAIN, "0xaaa", 1).unwrap());
+    assert_eq!(fx.detected(), 1);
+    assert_eq!(fx.db.get_review_kind(TEST_CHAIN, "0xaaa:1").unwrap(), None);
+    // The intent that put it into review no longer waits on it.
+    assert!(fx
+        .db
+        .pending_sweep_intents(TEST_CHAIN, &["0xaaa:1".to_string()])
+        .unwrap()
+        .is_empty());
+    // A deposit that is not in review or failed is untouched.
+    assert!(!fx.db.retry_erc20_deposit(TEST_CHAIN, "0xaaa", 1).unwrap());
+}
+
+#[tokio::test]
+async fn review_deposits_are_not_picked_up_by_the_sweeper() {
+    let fx = fixture();
+    fx.token_deposit("0xaaa", 1, "100", Some(SENDER_A));
+    fx.db
+        .mark_erc20_deposits_needs_review_for_keys(TEST_CHAIN, &["0xaaa:1".to_string()], "dust")
+        .unwrap();
+    let rpc = Rpc::start(100, vec![sweep_tx(401)], vec![]).await;
+    fx.sweeper(&rpc, |_| {})
+        .process_deposits_once()
+        .await
+        .unwrap();
+    assert_eq!(rpc.sent(), 0);
 }
