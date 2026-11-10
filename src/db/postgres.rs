@@ -1608,7 +1608,7 @@ impl PostgresBackend {
                  last_http_status = $3,
                  last_error = $4,
                  status = $5,
-                 leased_until = CASE WHEN $5 = 'pending' AND $7 > 0 THEN $6 + $7 ELSE NULL END,
+                 leased_until = CASE WHEN $5 = 'pending' AND $7::BIGINT > 0 THEN $6::BIGINT + $7::BIGINT ELSE NULL END,
                  updated_at = $6
              WHERE id = $1 AND event = $2",
             &[
