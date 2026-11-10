@@ -999,6 +999,16 @@ impl Db {
         .map_err(Into::into)
     }
 
+    pub fn list_registrations(&self) -> Result<Vec<(String, u32, String)>> {
+        let conn = self.read.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, derivation_index, address FROM accounts ORDER BY derivation_index",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn get_webhook_url(&self, account_id: &str) -> Result<Option<String>> {
         let conn = self.read.get()?;
         conn.query_row(

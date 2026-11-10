@@ -15,7 +15,7 @@ COPY src ./src
 COPY migrations ./migrations
 COPY certs ./certs
 
-RUN cargo build --release --locked --bin evmhot
+RUN cargo build --release --locked --bin evmhot --bin evmhot-gapscan
 
 # ---- runtime ----
 FROM debian:bookworm-slim
@@ -25,6 +25,7 @@ RUN apt-get update \
     && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin evmhot
 
 COPY --from=builder /app/target/release/evmhot /usr/local/bin/evmhot
+COPY --from=builder /app/target/release/evmhot-gapscan /usr/local/bin/evmhot-gapscan
 
 USER 10001
 # chains.toml is mounted or baked into a derived image; see CHAINS_CONFIG.

@@ -394,10 +394,12 @@ impl Monitor {
 
     /// Handles a single ERC20 Transfer log: allowlist/faucet/min-deposit checks,
     /// idempotent recording, and webhook dispatch. Shared by the per-block
-    /// steady-state path and the batch catch-up path's ranged log queries.
-    async fn handle_erc20_log(&self, log: &Log) -> Result<()> {
+    /// steady-state path, the batch catch-up path's ranged log queries and the
+    /// offline gap scan. Returns whether a new deposit was stored (`false` for a
+    /// skip or an already-known identity).
+    pub(crate) async fn handle_erc20_log(&self, log: &Log) -> Result<bool> {
         if log.topics().len() < 3 {
-            return Ok(());
+            return Ok(false);
         }
 
         let token_address = log.address();
@@ -412,7 +414,7 @@ impl Monitor {
                 "[{}] Skipping ERC20 deposit from faucet: Token: {}, To: {}",
                 self.chain.name, token_address, to_address_str
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let registration_id = {
@@ -422,7 +424,7 @@ impl Monitor {
                 .await?
         };
         let Some(registration_id) = registration_id else {
-            return Ok(());
+            return Ok(false);
         };
 
         if !self.chain.is_token_allowed(&token_address.to_string()) {
@@ -430,19 +432,10 @@ impl Monitor {
                 "[{}] Skipping non-allowlisted ERC20 token: {}",
                 self.chain.name, token_address
             );
-            return Ok(());
+            return Ok(false);
         }
 
-        let amount = if log.data().data.len() >= 32 {
-            let amount_bytes: [u8; 32] = log.data().data[..32]
-                .try_into()
-                .expect("slice length is 32");
-            alloy::primitives::U256::from_be_bytes(amount_bytes)
-        } else if !log.data().data.is_empty() {
-            alloy::primitives::U256::from_be_slice(&log.data().data)
-        } else {
-            alloy::primitives::U256::ZERO
-        };
+        let amount = transfer_amount(log);
 
         let token_address_lc = token_address.to_string().to_lowercase();
         let min_deposit = self.chain.min_deposits.for_token(&token_address_lc);
@@ -451,13 +444,13 @@ impl Monitor {
                 "[{}] Skipping ERC20 deposit below minimum: token={}, amount={}, min={}",
                 self.chain.name, token_address, amount, min_deposit
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let token_info = self.get_or_fetch_token_metadata(token_address).await?;
 
         let Some(tx_hash) = log.transaction_hash else {
-            return Ok(());
+            return Ok(false);
         };
         let log_index = log.log_index.unwrap_or(0);
         let tx_hash_str = tx_hash.to_string();
@@ -499,7 +492,7 @@ impl Monitor {
             self.deliverer.notify_worker();
         }
 
-        Ok(())
+        Ok(is_new_deposit)
     }
 
     async fn get_logs_with_retry(
@@ -668,6 +661,21 @@ struct TokenInfo {
     symbol: String,
     decimals: u8,
     name: String,
+}
+
+/// The `value` of a `Transfer` log (zero when the data is empty).
+pub(crate) fn transfer_amount(log: &Log) -> alloy::primitives::U256 {
+    use alloy::primitives::U256;
+    if log.data().data.len() >= 32 {
+        let amount_bytes: [u8; 32] = log.data().data[..32]
+            .try_into()
+            .expect("slice length is 32");
+        U256::from_be_bytes(amount_bytes)
+    } else if !log.data().data.is_empty() {
+        U256::from_be_slice(&log.data().data)
+    } else {
+        U256::ZERO
+    }
 }
 
 async fn get_token_info(

@@ -185,6 +185,37 @@ file by default).
 
 Public RPC endpoints are rate limited; they are for trying the service out, not for production.
 
+## Gap scan
+
+`evmhot-gapscan` finds token deposits evmhot missed while it was down, so they can be stored before the cursor jumps
+to the present. It is cheap in RPC calls: it reads `balanceOf` for every registered address and admitted token at one
+block `B` through Multicall3, then fetches inbound `Transfer` logs only for addresses with a non-zero balance. It
+reads the same `chains.toml` and `DATABASE_URL` as evmhot (no mnemonics needed) and judges logs by the monitor's own
+rules; with `--apply` it stores them through the monitor's code path, so identity, once-only storage and the
+`deposit_detected` outbox row are the same as live detection.
+
+```sh
+# 1. Dry run (the default): writes nothing to the store, prints a report, writes gapscan-report.csv.
+evmhot-gapscan --chain polygon
+
+# 2. Review the report. Anything under "UNEXPLAINED BALANCE" is balance the transfers found do not explain
+#    (transfers before --from, or a leftover). Understand it before going on.
+
+# 3. Store the deposits, at the same block as the dry run. Safe to repeat: known deposits are not written twice.
+evmhot-gapscan --chain polygon --block <B> --apply
+
+# 4. Separate step: move the cursor to B once the deposits are stored.
+evmhot-gapscan --chain polygon --block <B> --apply --set-cursor
+```
+
+Flags: `--from` (first block of the gap; default the network's stored cursor), `--block` (block `B`; default the head
+minus `block_offset_from_head`), `--batch-size` (addresses per Multicall3 call, default 500), `--log-range` and
+`--log-addresses` (blocks and recipients per `eth_getLogs`, defaults 50000 and 20; a refused range is split),
+`--csv` (report path), `--multicall`. `--set-cursor` needs `--apply`, `--block` and one `--chain`, so the cursor
+cannot skip a part of the chain. After step 3 or 4 the cursor may already be at `B`, so a re-run needs `--from`.
+Stop the service while applying, so it does not move the cursor underneath the scan. `--include-native` is reserved
+and refused: the native coin is not scanned.
+
 ## Container image
 
 CI publishes `ghcr.io/bloque-app/evmhot` on every push to `main` (tags `main` and `sha-<commit>`) and on `v*` tags.

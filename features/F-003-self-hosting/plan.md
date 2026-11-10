@@ -14,4 +14,9 @@ evmhot runs as its own production service, from its own image, with its own stor
 - The runbook: the offline gap scan, the cursor move, the clients' base-URL change, the first test deposit. Each
   production step is approved on its own.
 
+The offline gap scan exists: the `evmhot-gapscan` binary (see the README, "Gap scan"). It is a dry run by default,
+reads balances at one block through Multicall3, fetches logs only for addresses that hold tokens, and reports any
+balance the transfers do not explain. `--apply` stores the deposits and `--set-cursor` moves the cursor, as separate
+steps, each approved on its own.
+
 Details that name hosts, accounts or addresses stay in the private repository.

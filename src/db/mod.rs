@@ -343,6 +343,15 @@ impl Db {
         }
     }
 
+    /// Every registration as `(id, derivation_index, address)`, in derivation
+    /// order. Used by the offline gap scan.
+    pub fn list_registrations(&self) -> Result<Vec<(String, u32, String)>> {
+        match self.inner.as_ref() {
+            DbInner::Sqlite(s) => s.list_registrations(),
+            DbInner::Postgres(p) => p.list_registrations(),
+        }
+    }
+
     pub fn get_webhook_url(&self, account_id: &str) -> Result<Option<String>> {
         match self.inner.as_ref() {
             DbInner::Sqlite(s) => s.get_webhook_url(account_id),

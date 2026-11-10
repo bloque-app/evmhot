@@ -2,6 +2,7 @@
 pub mod config;
 pub mod db;
 pub(crate) mod faucet;
+pub mod gapscan;
 mod monitor;
 pub mod redb_import;
 pub mod redb_store;
@@ -15,6 +16,8 @@ mod webhook;
 mod e2e_tests;
 #[cfg(test)]
 mod fake_chain;
+#[cfg(test)]
+mod gapscan_tests;
 #[cfg(test)]
 mod prop_tests;
 #[cfg(test)]
