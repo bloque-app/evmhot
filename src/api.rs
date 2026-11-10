@@ -750,7 +750,7 @@ allowed_token_addresses = ["0x1111111111111111111111111111111111111111"]
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             json_body(&body),
-            json!({"retried": false, "token_type": "native"})
+            json!({"retried": false, "token_type": "native", "settled": false})
         );
 
         let (status, _) = call(

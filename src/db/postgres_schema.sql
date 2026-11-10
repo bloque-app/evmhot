@@ -95,3 +95,58 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending
   ON webhook_deliveries (status, attempt_count, updated_at);
+
+-- F-002a (mirrors migrations/V4__sweep_coordinates_and_senders.sql). CREATE TABLE
+-- IF NOT EXISTS never adds columns to a table that already exists, so the new
+-- nullable columns are added explicitly.
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS from_address TEXT;
+ALTER TABLE erc20_deposits ADD COLUMN IF NOT EXISTS from_address TEXT;
+
+CREATE TABLE IF NOT EXISTS sweeps (
+  seq BIGSERIAL PRIMARY KEY,
+  chain TEXT NOT NULL,
+  tx_hash TEXT NOT NULL,
+  log_index BIGINT NOT NULL DEFAULT 0,
+  sweep_tx_hash TEXT NOT NULL,
+  sweep_block_number BIGINT NOT NULL,
+  sweep_block_hash TEXT NOT NULL,
+  sweep_log_index BIGINT NOT NULL,
+  sweep_amount TEXT NOT NULL,
+  UNIQUE (chain, tx_hash, log_index, sweep_tx_hash, sweep_log_index)
+);
+
+-- F-002a review fixes (mirrors migrations/V5__sweep_intents_and_review.sql), plus a
+-- sequence on erc20_deposits so detected deposits are read in insertion order.
+ALTER TABLE sweeps ADD COLUMN IF NOT EXISTS sweep_target TEXT;
+ALTER TABLE erc20_deposits ADD COLUMN IF NOT EXISTS review_kind TEXT;
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS review_kind TEXT;
+ALTER TABLE erc20_deposits ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
+
+CREATE TABLE IF NOT EXISTS sweep_intents (
+  id BIGSERIAL PRIMARY KEY,
+  chain TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  address TEXT NOT NULL,
+  token_address TEXT NOT NULL,
+  group_key TEXT NOT NULL,
+  keys TEXT NOT NULL,
+  part_index BIGINT NOT NULL,
+  amount TEXT NOT NULL,
+  target TEXT NOT NULL,
+  state TEXT NOT NULL,
+  tx_hash TEXT,
+  nonce BIGINT,
+  raw_tx TEXT,
+  txs TEXT NOT NULL DEFAULT '[]',
+  passes BIGINT NOT NULL DEFAULT 0,
+  gone_block BIGINT NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sweep_intents_state ON sweep_intents (chain, state);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sweep_intents_open ON sweep_intents (chain, account_id) WHERE state = 'pending';
+
+CREATE TABLE IF NOT EXISTS sweep_alerts (
+  chain TEXT NOT NULL,
+  deposit_key TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  PRIMARY KEY (chain, deposit_key, kind)
+);

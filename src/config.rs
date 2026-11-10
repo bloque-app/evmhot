@@ -27,8 +27,125 @@ impl MinDepositSettings {
     }
 }
 
-/// Per-chain configuration loaded from `chains.toml`.
+/// What a sweep target does with a token (REQ-SW-6).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetKind {
+    /// Token transfer to an address.
+    Transfer,
+    /// No sweep: deposits are detected and notified, and stay where they are
+    /// until the target's kind changes (amendment 0003).
+    Hold,
+}
+
+/// A `[chains.token_targets."0x..."]` table, as written.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenTargetRaw {
+    pub kind: TargetKind,
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Minimum per sweep, in the token's minor units (REQ-SW-7).
+    #[serde(default)]
+    pub min: Option<String>,
+    /// Maximum per sweep, in the token's minor units (REQ-SW-7).
+    #[serde(default)]
+    pub max: Option<String>,
+    /// This address admits only this token (REQ-SW-8).
+    #[serde(default)]
+    pub admits_only: bool,
+    /// Each sweep needs one refund address: never mix senders (REQ-SW-12).
+    #[serde(default)]
+    pub per_sender: bool,
+    /// Each inbound deposit is swept on its own, never combined with another,
+    /// not even from the same sender.
+    #[serde(default)]
+    pub per_transfer: bool,
+    /// Also deliver every token `deposit_swept` for a deposit settled into this
+    /// target to this URL (the swap service), with its own bearer token.
+    #[serde(default)]
+    pub notify_url: Option<String>,
+    /// Name of the environment variable that holds that bearer token.
+    #[serde(default)]
+    pub notify_token_env: Option<String>,
+}
+
+/// A validated sweep target for one token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SweepTarget {
+    pub kind: TargetKind,
+    /// Lowercased `0x` address. `None` only for `Hold`.
+    pub address: Option<String>,
+    pub min: Option<U256>,
+    pub max: Option<U256>,
+    pub admits_only: bool,
+    pub per_sender: bool,
+    pub per_transfer: bool,
+    /// Second destination for `deposit_swept`. The token itself is read from the
+    /// environment variable `notify_token_env` names, never kept in the config.
+    pub notify_url: Option<String>,
+    pub notify_token_env: Option<String>,
+}
+
+impl SweepTarget {
+    fn plain(address: String) -> Self {
+        Self {
+            kind: TargetKind::Transfer,
+            address: Some(address),
+            min: None,
+            max: None,
+            admits_only: false,
+            per_sender: false,
+            per_transfer: false,
+            notify_url: None,
+            notify_token_env: None,
+        }
+    }
+}
+
+/// The next sweep for an amount still to be swept (REQ-SW-7). One part is sent
+/// at a time (each needs its own receipt before the address signs again), and
+/// the amount is planned again after each.
+///
+/// - Nothing, if the amount is zero or below `min` (it waits).
+/// - All of it, when there is no `max` or it fits.
+/// - `even` (per_transfer): `ceil(amount / ceil(amount / max))`, so a deposit's
+///   parts are near equal and the last is never a stub.
+/// - Otherwise `max`; when the tail would fall below `min`, the part is cut so the
+///   tail is exactly `min` (if both can stay in bounds; if not, the tail is dust
+///   that waits for later deposits).
+pub fn next_sweep_part(
+    remaining: U256,
+    min: Option<U256>,
+    max: Option<U256>,
+    even: bool,
+) -> Option<U256> {
+    let min = min.unwrap_or(U256::ZERO);
+    if remaining.is_zero() || remaining < min {
+        return None;
+    }
+    let Some(max) = max.filter(|m| !m.is_zero()) else {
+        return Some(remaining);
+    };
+    if remaining <= max {
+        return Some(remaining);
+    }
+    if even {
+        let parts = remaining.div_ceil(max);
+        return Some(remaining.div_ceil(parts));
+    }
+    let tail = remaining - max;
+    if tail < min && remaining >= min + min {
+        return Some(remaining - min);
+    }
+    Some(max)
+}
+
+/// Per-chain configuration loaded from `chains.toml`. An unknown key is an
+/// error: a setting that is silently ignored (a misspelt one, or one an older
+/// template carried for a feature that is not built) is worse than a refusal.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChainConfigRaw {
     pub name: String,
     pub chain_id: u64,
@@ -50,6 +167,11 @@ pub struct ChainConfigRaw {
     /// (and native ETH) use `treasury_address`.
     #[serde(default)]
     pub token_treasuries: HashMap<String, String>,
+    /// Map of token contract address -> sweep target table (kind, address,
+    /// bounds, admission, per-sender). A token may appear here or in
+    /// `token_treasuries`, not both.
+    #[serde(default)]
+    pub token_targets: HashMap<String, TokenTargetRaw>,
     #[serde(default = "default_block_offset")]
     pub block_offset_from_head: u64,
     #[serde(default = "default_poll_interval")]
@@ -123,6 +245,8 @@ pub struct ChainConfig {
     /// Lowercased token contract → lowercased sweep destination. Empty means
     /// every ERC20 uses `treasury_address`.
     pub token_treasuries: HashMap<String, String>,
+    /// Lowercased token contract -> table-form sweep target.
+    pub token_targets: HashMap<String, SweepTarget>,
 }
 
 impl ChainConfig {
@@ -143,6 +267,16 @@ impl ChainConfig {
             .unwrap_or(self.treasury_address.as_str())
     }
 
+    /// The sweep target for a token: its `token_targets` table, else its
+    /// `token_treasuries` address, else the network default (REQ-SW-2, REQ-SW-6).
+    pub fn target_for_token(&self, token_address: &str) -> SweepTarget {
+        let token = normalize_token_address(token_address);
+        if let Some(target) = self.token_targets.get(&token) {
+            return target.clone();
+        }
+        SweepTarget::plain(normalize_token_address(self.treasury_for_token(&token)))
+    }
+
     /// Stable lines describing native + per-token sweep destinations, for boot logs.
     pub fn sweep_route_log_lines(&self) -> Vec<String> {
         let mut lines = Vec::with_capacity(1 + self.allowed_token_addresses.len());
@@ -150,6 +284,32 @@ impl ChainConfig {
         let mut tokens: Vec<&String> = self.allowed_token_addresses.iter().collect();
         tokens.sort();
         for token in tokens {
+            if let Some(target) = self.token_targets.get(token) {
+                let mut line = match (&target.kind, &target.address) {
+                    (TargetKind::Hold, _) => format!("{token} -> hold (token_targets)"),
+                    (TargetKind::Transfer, address) => format!(
+                        "{token} -> {} (token_targets)",
+                        address.as_deref().unwrap_or("")
+                    ),
+                };
+                if let Some(min) = target.min {
+                    line.push_str(&format!(" min={min}"));
+                }
+                if let Some(max) = target.max {
+                    line.push_str(&format!(" max={max}"));
+                }
+                if target.admits_only {
+                    line.push_str(" admits_only");
+                }
+                if target.per_sender {
+                    line.push_str(" per_sender");
+                }
+                if target.per_transfer {
+                    line.push_str(" per_transfer");
+                }
+                lines.push(line);
+                continue;
+            }
             let dest = self.treasury_for_token(token);
             let via = if self.token_treasuries.contains_key(token) {
                 "token_treasuries"
@@ -314,6 +474,137 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
             token_treasuries.insert(token_norm, normalize_token_address(dest_trimmed));
         }
 
+        let mut token_targets = HashMap::new();
+        for (token, table) in &raw.token_targets {
+            let token_norm = normalize_token_address(token);
+            let field = format!("Chain '{}': token_targets[{}]", raw.name, token);
+            if !allowed_token_addresses.contains(&token_norm) {
+                bail!("{field} is not in allowed_token_addresses");
+            }
+            if token_treasuries.contains_key(&token_norm) {
+                bail!("{field} is also listed in token_treasuries; use one or the other");
+            }
+            let min = table
+                .min
+                .as_deref()
+                .map(|v| parse_u256_str(v, &format!("{field}.min")))
+                .transpose()?;
+            let max = table
+                .max
+                .as_deref()
+                .map(|v| parse_u256_str(v, &format!("{field}.max")))
+                .transpose()?;
+            if table.per_transfer && table.per_sender {
+                bail!("{field}: per_transfer and per_sender cannot both be set (per_transfer is the stricter)");
+            }
+            if table.per_transfer {
+                // Every stored deposit must be sweepable alone: none may be
+                // below the target's minimum (REQ-DT-4 skips what is below the
+                // detection minimum, so only that is ever stored).
+                let detection_min = per_token
+                    .get(&token_norm)
+                    .copied()
+                    .unwrap_or(min_deposit_default);
+                // The even split of a deposit above `max` has parts of at least
+                // (max + 1) / 2, so none falls below `min` only if 2 * min <= max + 1.
+                if let (Some(min), Some(max)) = (min, max) {
+                    if min + min > max + U256::from(1u8) {
+                        bail!(
+                            "{field}: per_transfer splits a deposit above max ({max}) evenly, so \
+                             min ({min}) must be at most (max + 1) / 2, or a part could fall below it"
+                        );
+                    }
+                }
+                if let Some(min) = min {
+                    if min > detection_min {
+                        bail!(
+                            "{field}: per_transfer needs min ({min}) at or below the token's detection \
+                             minimum ({detection_min}; min_deposits or min_deposit_default), or a \
+                             deposit could be stored that can never be swept alone"
+                        );
+                    }
+                }
+            }
+            let (notify_url, notify_token_env) = match (&table.notify_url, &table.notify_token_env)
+            {
+                (None, None) => (None, None),
+                (Some(url), env) => {
+                    let url = url.trim();
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        bail!("{field}.notify_url must be an http(s) URL");
+                    }
+                    let Some(env) = env.as_deref().map(str::trim).filter(|e| !e.is_empty()) else {
+                        bail!("{field}: notify_url needs notify_token_env, the name of the variable holding its bearer token");
+                    };
+                    // Startup fails rather than deliver unauthenticated.
+                    if std::env::var(env)
+                        .map(|v| v.trim().is_empty())
+                        .unwrap_or(true)
+                    {
+                        bail!("{field}: notify_url is set but the environment variable {env} is empty or unset");
+                    }
+                    (Some(url.to_string()), Some(env.to_string()))
+                }
+                (None, Some(_)) => bail!("{field}: notify_token_env without notify_url"),
+            };
+            if max == Some(U256::ZERO) {
+                bail!("{field}.max must be greater than zero");
+            }
+            if let (Some(min), Some(max)) = (min, max) {
+                if min > max {
+                    bail!("{field}: min ({min}) is greater than max ({max})");
+                }
+            }
+            let address = match table.kind {
+                TargetKind::Transfer => {
+                    let Some(address) = table.address.as_deref() else {
+                        bail!("{field}: kind \"transfer\" requires an address");
+                    };
+                    let address = address.trim();
+                    Address::from_str(address)
+                        .with_context(|| format!("{field}: invalid address: {address}"))?;
+                    Some(normalize_token_address(address))
+                }
+                TargetKind::Hold => {
+                    if table.address.is_some()
+                        || table.min.is_some()
+                        || table.max.is_some()
+                        || table.admits_only
+                        || table.per_sender
+                        || table.per_transfer
+                        || table.notify_url.is_some()
+                    {
+                        bail!(
+                            "{field}: kind \"hold\" takes no address, bounds or flags; \
+                             set a transfer target to release held deposits"
+                        );
+                    }
+                    None
+                }
+            };
+            token_targets.insert(
+                token_norm,
+                SweepTarget {
+                    kind: table.kind,
+                    address,
+                    min,
+                    max,
+                    admits_only: table.admits_only,
+                    per_sender: table.per_sender,
+                    per_transfer: table.per_transfer,
+                    notify_url,
+                    notify_token_env,
+                },
+            );
+        }
+        check_admits_only(
+            &raw.name,
+            &raw.treasury_address,
+            &allowed_token_addresses,
+            &token_treasuries,
+            &token_targets,
+        )?;
+
         chains.push(ChainConfig {
             name: raw.name,
             chain_id: raw.chain_id,
@@ -334,10 +625,64 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
             },
             allowed_token_addresses,
             token_treasuries,
+            token_targets,
         });
     }
 
     Ok(chains)
+}
+
+/// REQ-SW-8: a target that admits only one token must not receive anything
+/// else. The native coin and every token without a target of its own go to the
+/// network default target, so that address cannot be an `admits_only` address.
+fn check_admits_only(
+    chain: &str,
+    default_target: &str,
+    allowed_tokens: &HashSet<String>,
+    token_treasuries: &HashMap<String, String>,
+    token_targets: &HashMap<String, SweepTarget>,
+) -> Result<()> {
+    let default_norm = normalize_token_address(default_target);
+    // Where every token goes (None = held, goes nowhere).
+    let route = |token: &str| -> Option<String> {
+        if let Some(target) = token_targets.get(token) {
+            return target.address.clone();
+        }
+        Some(
+            token_treasuries
+                .get(token)
+                .cloned()
+                .unwrap_or_else(|| default_norm.clone()),
+        )
+    };
+    let mut guarded: Vec<(&String, &SweepTarget)> = token_targets
+        .iter()
+        .filter(|(_, t)| t.admits_only)
+        .collect();
+    guarded.sort_by(|a, b| a.0.cmp(b.0));
+    for (token, target) in guarded {
+        let Some(address) = target.address.as_deref() else {
+            continue;
+        };
+        if default_norm == address {
+            bail!(
+                "Chain '{chain}': token_targets[{token}] admits only that token, but address \
+                 {address} is also the network default target, which the native coin and every \
+                 token without a target of its own use"
+            );
+        }
+        let mut others: Vec<&String> = allowed_tokens.iter().filter(|t| *t != token).collect();
+        others.sort();
+        for other in others {
+            if route(other).as_deref() == Some(address) {
+                bail!(
+                    "Chain '{chain}': token_targets[{token}] admits only that token, but token \
+                     {other} is also routed to {address}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_chain_name(name: &str) -> Result<()> {

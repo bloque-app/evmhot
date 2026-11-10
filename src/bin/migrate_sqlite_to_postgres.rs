@@ -152,6 +152,14 @@ fn main() -> Result<()> {
         summary.sweep_failures.0, summary.sweep_failures.1
     );
     println!(
+        "sweep_intents: {} sqlite -> {} inserted",
+        summary.sweep_intents.0, summary.sweep_intents.1
+    );
+    println!(
+        "sweeps: {} sqlite -> {} inserted",
+        summary.sweeps.0, summary.sweeps.1
+    );
+    println!(
         "webhook_deliveries: {} sqlite -> {} inserted",
         summary.webhook_deliveries.0, summary.webhook_deliveries.1
     );

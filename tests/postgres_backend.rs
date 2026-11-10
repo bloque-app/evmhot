@@ -133,15 +133,34 @@ fn seed_sqlite_source(next_index: i64, block_cursor: (&str, i64)) -> NamedTempFi
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO deposits (chain, tx_hash, account_id, amount, status)
-         VALUES ('base', '0xdep1', 'seed-user', '100', 'detected')",
+        "INSERT INTO deposits (chain, tx_hash, account_id, amount, status, from_address)
+         VALUES ('base', '0xdep1', 'seed-user', '100', 'detected', '0xsender-native')",
         [],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO erc20_deposits
-         (chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status)
-         VALUES ('base', '0xerc1', 0, 'seed-user', '50', '0xtoken1', 'USDC', 'detected')",
+         (chain, tx_hash, log_index, account_id, amount, token_address, token_symbol, status,
+          from_address)
+         VALUES ('base', '0xerc1', 0, 'seed-user', '50', '0xtoken1', 'USDC', 'detected',
+                 '0xsender-token')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sweeps
+         (chain, tx_hash, log_index, sweep_tx_hash, sweep_block_number, sweep_block_hash,
+          sweep_log_index, sweep_amount)
+         VALUES ('base', '0xerc1', 0, '0xsweepA', 77, '0xblockA', 12, '50')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sweep_intents
+         (chain, account_id, address, token_address, group_key, keys, part_index, amount, target,
+          state, tx_hash, nonce, raw_tx, passes)
+         VALUES ('base', 'seed-user', '0xseed', '0xtoken1', 'g', '[\"0xerc1:0\"]', 0, '50',
+                 '0xtarget', 'succeeded', '0xsweepA', 5, '0xraw', 1)",
         [],
     )
     .unwrap();
@@ -232,6 +251,94 @@ fn assert_all_migrated_tables(url: &str, context: &str) {
         "detected",
         "{context}: deposits.status"
     );
+    // F-002a: the sender and the sweep coordinates travel with the rows
+    // (REQ-ST-2: a move to a new database carries every row).
+    let senders: (Option<String>, Option<String>) = (
+        client
+            .query_one(
+                "SELECT from_address FROM deposits WHERE chain = 'base' AND tx_hash = '0xdep1'",
+                &[],
+            )
+            .unwrap()
+            .get(0),
+        client
+            .query_one(
+                "SELECT from_address FROM erc20_deposits WHERE chain = 'base' AND tx_hash = '0xerc1'",
+                &[],
+            )
+            .unwrap()
+            .get(0),
+    );
+    assert_eq!(
+        senders,
+        (
+            Some("0xsender-native".to_string()),
+            Some("0xsender-token".to_string())
+        ),
+        "{context}: from_address"
+    );
+    let sweep = client
+        .query_one(
+            "SELECT sweep_tx_hash, sweep_block_number, sweep_block_hash, sweep_log_index, sweep_amount
+             FROM sweeps WHERE chain = 'base' AND tx_hash = '0xerc1' AND log_index = 0",
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("{context}: sweeps row missing or query failed: {e}"));
+    assert_eq!(
+        sweep.get::<_, String>(0),
+        "0xsweepA",
+        "{context}: sweeps.sweep_tx_hash"
+    );
+    assert_eq!(
+        sweep.get::<_, i64>(1),
+        77,
+        "{context}: sweeps.sweep_block_number"
+    );
+    assert_eq!(
+        sweep.get::<_, String>(2),
+        "0xblockA",
+        "{context}: sweeps.sweep_block_hash"
+    );
+    assert_eq!(
+        sweep.get::<_, i64>(3),
+        12,
+        "{context}: sweeps.sweep_log_index"
+    );
+    assert_eq!(
+        sweep.get::<_, String>(4),
+        "50",
+        "{context}: sweeps.sweep_amount"
+    );
+    let intent = client
+        .query_one(
+            "SELECT state, tx_hash, nonce, raw_tx FROM sweep_intents WHERE chain = 'base'",
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("{context}: sweep_intents row missing: {e}"));
+    assert_eq!(
+        intent.get::<_, String>(0),
+        "succeeded",
+        "{context}: intent state"
+    );
+    assert_eq!(
+        intent.get::<_, Option<i64>>(2),
+        Some(5),
+        "{context}: intent nonce"
+    );
+    assert_eq!(
+        intent.get::<_, Option<String>>(3).as_deref(),
+        Some("0xraw"),
+        "{context}: raw_tx"
+    );
+    let sweep_count: i64 = client
+        .query_one("SELECT COUNT(*) FROM sweeps", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        sweep_count, 1,
+        "{context}: sweeps must not be duplicated by a re-run"
+    );
+
     let deposit_count: i64 = client
         .query_one("SELECT COUNT(*) FROM deposits WHERE chain = 'base'", &[])
         .unwrap()
@@ -922,4 +1029,713 @@ fn postgres_counter_seed_starts_above_existing_hashed_index() {
         "the next registration must get an index strictly above the highest stored one, got {idx}"
     );
     assert_eq!(i64::from(idx), HASHED_INDEX + 1);
+}
+
+// ---------------------------------------------------------------- F-002a
+
+fn f002a_outbox(id: &str, event: &str) -> evmhot::db::OutboxEntry {
+    evmhot::db::OutboxEntry {
+        id: id.to_string(),
+        event: event.to_string(),
+        registration_id: "acct-a".to_string(),
+        webhook_url: "https://hook.example/a".to_string(),
+        payload: format!("{{\"id\":\"{id}\",\"event\":\"{event}\"}}"),
+    }
+}
+
+fn f002a_token_deposit(
+    tx: &str,
+    log_index: u64,
+    from: Option<&str>,
+) -> evmhot::db::NewErc20Deposit {
+    evmhot::db::NewErc20Deposit {
+        chain: "base".to_string(),
+        tx_hash: tx.to_string(),
+        log_index,
+        account_id: "acct-a".to_string(),
+        amount: "10".to_string(),
+        token_address: "0xtoken1".to_string(),
+        token_symbol: "TKN".to_string(),
+        from_address: from.map(str::to_string),
+    }
+}
+
+/// REQ-WH-7, REQ-WH-9, REQ-SW-10 on a live `Db`, whichever backend.
+fn assert_f002a_store_cycle(db: &Db) {
+    let native = evmhot::db::NewNativeDeposit {
+        chain: "base".to_string(),
+        tx_hash: "0xn1".to_string(),
+        account_id: "acct-a".to_string(),
+        amount: "5".to_string(),
+        from_address: Some("0xsender-n".to_string()),
+    };
+    assert!(db
+        .record_native_deposit_atomic(
+            &native,
+            Some(&f002a_outbox("base:0xn1", "deposit_detected"))
+        )
+        .unwrap());
+    assert!(!db
+        .record_native_deposit_atomic(
+            &native,
+            Some(&f002a_outbox("base:0xn1", "deposit_detected"))
+        )
+        .unwrap());
+    assert_eq!(
+        db.get_deposit_from_address("base", "0xn1")
+            .unwrap()
+            .as_deref(),
+        Some("0xsender-n")
+    );
+    assert!(db
+        .get_webhook_delivery("base:0xn1", "deposit_detected")
+        .unwrap()
+        .is_some());
+
+    let token = f002a_token_deposit("0xt1", 3, Some("0xsender-t"));
+    assert!(db
+        .record_erc20_deposit_atomic(
+            &token,
+            Some(&f002a_outbox("base:0xt1:3", "deposit_detected"))
+        )
+        .unwrap());
+    let detected = db.get_detected_erc20_deposits("base").unwrap();
+    assert_eq!(detected.len(), 1);
+    assert_eq!(detected[0].from_address.as_deref(), Some("0xsender-t"));
+
+    let rec = |tx: &str, log: u64| evmhot::db::SweepRecord {
+        sweep_tx_hash: tx.to_string(),
+        sweep_block_number: 9,
+        sweep_block_hash: "0xblock".to_string(),
+        sweep_log_index: log,
+        sweep_amount: "10".to_string(),
+        sweep_target: Some("0xtarget".to_string()),
+    };
+    let keys = vec!["0xt1:3".to_string()];
+    db.record_sweep("base", &keys, &rec("0xs1", 4)).unwrap();
+    db.record_sweep("base", &keys, &rec("0xs2", 5)).unwrap();
+    db.record_sweep("base", &keys, &rec("0xs1", 4)).unwrap();
+    assert_eq!(
+        db.get_sweeps("base", "0xt1:3").unwrap(),
+        vec![rec("0xs1", 4), rec("0xs2", 5)]
+    );
+
+    let settlements = vec![evmhot::db::Erc20Settlement {
+        key: "0xt1:3".to_string(),
+        outbox: Some(f002a_outbox("base:0xt1:3", "deposit_swept")),
+        notify: Some(evmhot::db::OutboxEntry {
+            webhook_url: "https://swap.example/hook".to_string(),
+            event: "deposit_swept:notify".to_string(),
+            ..f002a_outbox("base:0xt1:3", "deposit_swept")
+        }),
+    }];
+    // One row for the registration webhook, one for the target's notify_url.
+    assert_eq!(db.complete_erc20_sweep("base", &settlements).unwrap(), 2);
+    assert!(db.get_detected_erc20_deposits("base").unwrap().is_empty());
+    assert!(db
+        .get_webhook_delivery("base:0xt1:3", "deposit_swept")
+        .unwrap()
+        .is_some());
+    // The copy for the target's notify_url is a separate row, same transaction.
+    let note = db
+        .get_webhook_delivery("base:0xt1:3", "deposit_swept:notify")
+        .unwrap()
+        .expect("notify row");
+    assert_eq!(note.webhook_url, "https://swap.example/hook");
+    assert!(db
+        .complete_native_sweep(
+            "base",
+            "0xn1",
+            Some(&f002a_outbox("base:0xn1", "deposit_swept"))
+        )
+        .unwrap());
+    assert!(db.get_detected_deposits("base").unwrap().is_empty());
+}
+
+fn seed_account(db: &Db) {
+    db.register_account("acct-a", 0, "0xaddr-a", "https://hook.example/a")
+        .unwrap();
+}
+
+#[test]
+fn sqlite_f002a_store_cycle() {
+    let tmp = NamedTempFile::new().unwrap();
+    let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+    seed_account(&db);
+    assert_f002a_store_cycle(&db);
+}
+
+#[test]
+fn postgres_f002a_store_cycle_matches_sqlite() {
+    if !docker_available() {
+        eprintln!("skipping postgres_f002a_store_cycle_matches_sqlite: Docker not available");
+        return;
+    }
+    let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let (_container, url) = start_postgres();
+    let db = connect_pg(&url, None, None);
+    seed_account(&db);
+    assert_f002a_store_cycle(&db);
+}
+
+/// An older Postgres store (tables without the F-002a columns) gains them on
+/// connect, and its old rows stay readable (nullable columns, no backfill).
+#[test]
+fn postgres_f002a_schema_upgrades_an_existing_store() {
+    if !docker_available() {
+        eprintln!(
+            "skipping postgres_f002a_schema_upgrades_an_existing_store: Docker not available"
+        );
+        return;
+    }
+    let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let (_container, url) = start_postgres();
+    {
+        let mut client = raw_pg_client(&url);
+        client
+            .batch_execute(
+                "CREATE TABLE erc20_deposits (
+                   chain TEXT NOT NULL, tx_hash TEXT NOT NULL, log_index BIGINT NOT NULL,
+                   account_id TEXT NOT NULL, amount TEXT NOT NULL, token_address TEXT NOT NULL,
+                   token_symbol TEXT NOT NULL, status TEXT NOT NULL,
+                   PRIMARY KEY (chain, tx_hash, log_index));
+                 INSERT INTO erc20_deposits VALUES ('base', '0xold', 1, 'acct-a', '7', '0xtoken1', 'TKN', 'detected');",
+            )
+            .unwrap();
+    }
+    let db = connect_pg(&url, None, None);
+    let detected = db.get_detected_erc20_deposits("base").unwrap();
+    assert_eq!(detected.len(), 1);
+    assert_eq!(detected[0].from_address, None);
+}
+
+/// REQ-WH-7 on Postgres: when the outbox write fails, the state change it
+/// reports is rolled back with it.
+#[test]
+fn postgres_req_wh_7_failed_outbox_write_rolls_back_the_state_change() {
+    if !docker_available() {
+        eprintln!("skipping postgres_req_wh_7_failed_outbox_write_rolls_back_the_state_change: Docker not available");
+        return;
+    }
+    let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let (_container, url) = start_postgres();
+    let db = connect_pg(&url, None, None);
+    seed_account(&db);
+    let token = f002a_token_deposit("0xt1", 3, Some("0xsender-t"));
+    db.record_erc20_deposit_atomic(&token, None).unwrap();
+    db.record_native_deposit_atomic(
+        &evmhot::db::NewNativeDeposit {
+            chain: "base".to_string(),
+            tx_hash: "0xn0".to_string(),
+            account_id: "acct-a".to_string(),
+            amount: "5".to_string(),
+            from_address: None,
+        },
+        None,
+    )
+    .unwrap();
+
+    let mut client = raw_pg_client(&url);
+    client
+        .batch_execute(
+            "CREATE FUNCTION fail_outbox() RETURNS trigger AS $$
+             BEGIN RAISE EXCEPTION 'outbox unavailable'; END $$ LANGUAGE plpgsql;
+             CREATE TRIGGER fail_outbox BEFORE INSERT ON webhook_deliveries
+             FOR EACH ROW EXECUTE FUNCTION fail_outbox();",
+        )
+        .unwrap();
+
+    // Detection: nothing is stored.
+    let fresh = f002a_token_deposit("0xt2", 4, Some("0xsender-t"));
+    assert!(db
+        .record_erc20_deposit_atomic(
+            &fresh,
+            Some(&f002a_outbox("base:0xt2:4", "deposit_detected"))
+        )
+        .is_err());
+    assert!(db
+        .record_native_deposit_atomic(
+            &evmhot::db::NewNativeDeposit {
+                chain: "base".to_string(),
+                tx_hash: "0xn1".to_string(),
+                account_id: "acct-a".to_string(),
+                amount: "5".to_string(),
+                from_address: None,
+            },
+            Some(&f002a_outbox("base:0xn1", "deposit_detected")),
+        )
+        .is_err());
+    let detected = db.get_detected_erc20_deposits("base").unwrap();
+    assert_eq!(
+        detected.len(),
+        1,
+        "the failed detection left no deposit behind"
+    );
+    assert_eq!(detected[0].key, "0xt1:3");
+    assert_eq!(db.get_detected_deposits("base").unwrap().len(), 1);
+
+    // Sweep completion: nothing is marked swept.
+    let settlements = vec![evmhot::db::Erc20Settlement {
+        key: "0xt1:3".to_string(),
+        outbox: Some(f002a_outbox("base:0xt1:3", "deposit_swept")),
+        notify: None,
+    }];
+    assert!(db.complete_erc20_sweep("base", &settlements).is_err());
+    assert!(db
+        .complete_native_sweep(
+            "base",
+            "0xn0",
+            Some(&f002a_outbox("base:0xn0", "deposit_swept"))
+        )
+        .is_err());
+    assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 1);
+    assert_eq!(db.get_detected_deposits("base").unwrap().len(), 1);
+
+    client
+        .batch_execute("DROP TRIGGER fail_outbox ON webhook_deliveries;")
+        .unwrap();
+    assert_eq!(db.complete_erc20_sweep("base", &settlements).unwrap(), 1);
+    assert!(db.get_detected_erc20_deposits("base").unwrap().is_empty());
+}
+
+fn assert_registration_refused_at_the_ceiling(db: &Db, set_counter: impl Fn(u64)) {
+    let derive = |i: u32| -> anyhow::Result<String> { Ok(format!("0xaddr{i}")) };
+    // The last index, 2^32 - 1, is still issued, once.
+    set_counter(u64::from(u32::MAX));
+    let (index, _, created) = db
+        .register_account_auto("last", "https://x", derive)
+        .unwrap();
+    assert_eq!((index, created), (u32::MAX, true));
+
+    // The counter is now 2^32: refused, never wrapped.
+    let err = db
+        .register_account_auto("one-too-many", "https://x", derive)
+        .unwrap_err();
+    assert!(err.to_string().contains("REQ-RG-5"), "{err}");
+    assert!(db.get_account_by_id("one-too-many").unwrap().is_none());
+    // Refusing again is stable (the counter did not move).
+    assert!(db
+        .register_account_auto("one-too-many", "https://x", derive)
+        .is_err());
+    // A repeated registration of an existing id still answers.
+    let (index, _, created) = db
+        .register_account_auto("last", "https://x", derive)
+        .unwrap();
+    assert_eq!((index, created), (u32::MAX, false));
+}
+
+#[test]
+fn sqlite_req_rg_5_registration_at_2_pow_32_is_refused() {
+    let tmp = NamedTempFile::new().unwrap();
+    let path = tmp.path().to_str().unwrap().to_string();
+    let db = Db::new(&path).unwrap();
+    assert_registration_refused_at_the_ceiling(&db, |value| {
+        let conn = RusqliteConnection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO state (key, value) VALUES ('next_index', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [value.to_string()],
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn postgres_req_rg_5_registration_at_2_pow_32_is_refused() {
+    if !docker_available() {
+        eprintln!(
+            "skipping postgres_req_rg_5_registration_at_2_pow_32_is_refused: Docker not available"
+        );
+        return;
+    }
+    let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let (_container, url) = start_postgres();
+    let db = connect_pg(&url, None, None);
+    assert_registration_refused_at_the_ceiling(&db, |value| {
+        let mut client = raw_pg_client(&url);
+        client
+            .execute(
+                "UPDATE state SET value = $1 WHERE key = 'next_index'",
+                &[&value.to_string()],
+            )
+            .unwrap();
+    });
+}
+
+/// Detected deposits come back in insertion order (the first of a group keys
+/// its counters), intents settle atomically, and the retry route moves
+/// `needs_review` back to `detected`. Same on both backends.
+fn assert_order_intents_and_review(db: &Db) {
+    // Inserted in reverse hash order, so a primary-key order would differ.
+    for (i, tx) in ["0xfff", "0xccc", "0xeee", "0xaaa", "0xddd"]
+        .iter()
+        .enumerate()
+    {
+        db.record_erc20_deposit_atomic(&f002a_token_deposit(tx, i as u64, Some("0xs")), None)
+            .unwrap();
+    }
+    let keys: Vec<String> = db
+        .get_detected_erc20_deposits("base")
+        .unwrap()
+        .into_iter()
+        .map(|d| d.key)
+        .collect();
+    assert_eq!(
+        keys,
+        ["0xfff:0", "0xccc:1", "0xeee:2", "0xaaa:3", "0xddd:4"]
+    );
+
+    let group = vec!["0xfff:0".to_string(), "0xccc:1".to_string()];
+    let id = db
+        .create_sweep_intent(&evmhot::db::NewSweepIntent {
+            chain: "base".to_string(),
+            account_id: "acct-a".to_string(),
+            address: "0xaddr-a".to_string(),
+            token_address: "0xtoken1".to_string(),
+            group_key: "gk".to_string(),
+            keys: group.clone(),
+            part_index: 0,
+            amount: "20".to_string(),
+            target: "0xtarget".to_string(),
+        })
+        .unwrap();
+    assert!(db.pending_sweep_intents("base", &group).unwrap().len() == 1);
+    assert!(db
+        .pending_sweep_intents("base", &["0xaaa:3".to_string()])
+        .unwrap()
+        .is_empty());
+    db.set_sweep_intent_tx(id, "0xhash").unwrap();
+    assert_eq!(db.bump_sweep_intent_passes(id).unwrap(), 1);
+    let pending = db.pending_sweep_intents("base", &group).unwrap();
+    assert_eq!(pending[0].tx_hash.as_deref(), Some("0xhash"));
+    assert_eq!(pending[0].keys, group);
+
+    let rec = evmhot::db::SweepRecord {
+        sweep_tx_hash: "0xhash".to_string(),
+        sweep_block_number: 3,
+        sweep_block_hash: "0xb".to_string(),
+        sweep_log_index: 9,
+        sweep_amount: "20".to_string(),
+        sweep_target: Some("0xtarget".to_string()),
+    };
+    db.settle_sweep_intent("base", id, &group, &rec, &[])
+        .unwrap();
+    assert!(db.pending_sweep_intents("base", &group).unwrap().is_empty());
+    assert_eq!(db.get_sweeps("base", "0xccc:1").unwrap(), vec![rec]);
+
+    // F-002a review: the first block a nonce was seen used sticks; intents are
+    // listed by state; a watched verdict moves on; a wrongly reviewed deposit is
+    // released.
+    let gid = db
+        .create_sweep_intent(&evmhot::db::NewSweepIntent {
+            chain: "base".to_string(),
+            account_id: "acct-a".to_string(),
+            address: "0xaddr-a".to_string(),
+            token_address: "0xtoken1".to_string(),
+            group_key: "g2".to_string(),
+            keys: vec!["0xeee:2".to_string()],
+            part_index: 0,
+            amount: "1".to_string(),
+            target: "0xtarget".to_string(),
+        })
+        .unwrap();
+    assert_eq!(db.note_nonce_used_block(gid, 500).unwrap(), 500);
+    assert_eq!(db.note_nonce_used_block(gid, 900).unwrap(), 500);
+    db.finish_sweep_intent(gid, "review_gone").unwrap();
+    assert_eq!(
+        db.sweep_intents_in_state("base", "review_gone")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(db.all_pending_sweep_intents("base").unwrap().is_empty());
+    db.mark_erc20_deposits_needs_review_for_keys("base", &["0xeee:2".to_string()], "sweep_review")
+        .unwrap();
+    assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 4);
+    db.release_review_deposits_for_keys("base", &["0xeee:2".to_string()], false)
+        .unwrap();
+    assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 5);
+    db.move_sweep_intent(gid, "review_gone", "review").unwrap();
+    assert!(db
+        .sweep_intents_in_state("base", "review_gone")
+        .unwrap()
+        .is_empty());
+
+    // A watched sweep whose receipt turns up late: one transaction records it,
+    // releases its deposit, and releases the address's balance_shortfall deposits
+    // of the same token. The block of the verdict is where the watch starts.
+    let wid = db
+        .create_sweep_intent(&evmhot::db::NewSweepIntent {
+            chain: "base".to_string(),
+            account_id: "acct-a".to_string(),
+            address: "0xaddr-a".to_string(),
+            token_address: "0xtoken1".to_string(),
+            group_key: "g3".to_string(),
+            keys: vec!["0xddd:4".to_string()],
+            part_index: 0,
+            amount: "10".to_string(),
+            target: "0xtarget".to_string(),
+        })
+        .unwrap();
+    db.mark_review_gone(wid, 777).unwrap();
+    let watched = db.sweep_intents_in_state("base", "review_gone").unwrap();
+    assert_eq!((watched[0].gone_block, watched[0].reviewed), (777, true));
+    db.mark_erc20_deposits_needs_review_for_keys("base", &["0xddd:4".to_string()], "sweep_review")
+        .unwrap();
+    db.mark_erc20_deposits_needs_review_for_keys(
+        "base",
+        &["0xfff:0".to_string()],
+        "balance_shortfall",
+    )
+    .unwrap();
+    let late = evmhot::db::SweepRecord {
+        sweep_tx_hash: "0xlate".to_string(),
+        sweep_block_number: 4,
+        sweep_block_hash: "0xb2".to_string(),
+        sweep_log_index: 1,
+        sweep_amount: "10".to_string(),
+        sweep_target: Some("0xtarget".to_string()),
+    };
+    let released = db
+        .settle_reviewed_sweep_intent(
+            "base",
+            wid,
+            &["0xddd:4".to_string()],
+            &late,
+            "acct-a",
+            "0xtoken1",
+        )
+        .unwrap();
+    assert_eq!(released, 1, "the shortfall deposit");
+    assert!(db
+        .sweep_intents_in_state("base", "review_gone")
+        .unwrap()
+        .is_empty());
+    assert_eq!(db.get_review_kind("base", "0xddd:4").unwrap(), None);
+    assert_eq!(db.get_review_kind("base", "0xfff:0").unwrap(), None);
+    assert_eq!(db.get_sweeps("base", "0xddd:4").unwrap(), vec![late]);
+    assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 5);
+
+    // needs_review is out of the detected queue, counted, and retried only by
+    // the retry call.
+    let review = vec!["0xaaa:3".to_string()];
+    db.mark_erc20_deposits_needs_review_for_keys("base", &review, "sweep_review")
+        .unwrap();
+    assert_eq!(
+        db.get_review_kind("base", "0xaaa:3").unwrap().as_deref(),
+        Some("sweep_review")
+    );
+    assert_eq!(
+        db.deposit_queue_counts("base").unwrap().erc20_needs_review,
+        1
+    );
+    assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 4);
+    assert!(db.retry_erc20_deposit("base", "0xaaa", 3).unwrap());
+    assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 5);
+    assert_eq!(db.get_review_kind("base", "0xaaa:3").unwrap(), None);
+}
+
+#[test]
+fn sqlite_detected_order_intents_and_review() {
+    let tmp = NamedTempFile::new().unwrap();
+    let db = Db::new(tmp.path().to_str().unwrap()).unwrap();
+    seed_account(&db);
+    assert_order_intents_and_review(&db);
+}
+
+#[test]
+fn postgres_detected_order_is_stable() {
+    if !docker_available() {
+        eprintln!("skipping postgres_detected_order_is_stable: Docker not available");
+        return;
+    }
+    let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let (_container, url) = start_postgres();
+    let db = connect_pg(&url, None, None);
+    seed_account(&db);
+    assert_order_intents_and_review(&db);
+}
+
+/// `information_schema.columns` of the public schema, as a sortable snapshot.
+fn column_snapshot(client: &mut postgres::Client) -> Vec<String> {
+    client
+        .query(
+            "SELECT table_name || '.' || column_name || ':' || data_type || ':' ||
+                    COALESCE(column_default, '-') || ':' || is_nullable
+             FROM information_schema.columns WHERE table_schema = 'public'
+             ORDER BY table_name, column_name",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+/// The schema upgrade, from production's actual tables (read 2026-11-09), not
+/// from an older evmhot schema: every row survives, the new columns are NULL or
+/// defaulted, the new tables exist empty, and a second start changes nothing.
+#[test]
+fn postgres_f002a_upgrades_the_production_ledger_schema() {
+    if !docker_available() {
+        eprintln!(
+            "skipping postgres_f002a_upgrades_the_production_ledger_schema: Docker not available"
+        );
+        return;
+    }
+    let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let (_container, url) = start_postgres();
+    {
+        let mut client = raw_pg_client(&url);
+        client
+            .batch_execute(include_str!("fixtures/prod_ledger_schema_2026-11-09.sql"))
+            .unwrap();
+        client
+            .batch_execute(
+                "INSERT INTO accounts VALUES ('acct-1', 5, '0xa1', 'https://hook.example/a');
+                 INSERT INTO accounts VALUES ('acct-2', 2147500000, '0xa2', 'https://hook.example/b');
+                 INSERT INTO deposits VALUES ('polygon', '0xnative1', 'acct-1', '1000', 'swept');
+                 INSERT INTO erc20_deposits VALUES ('polygon', '0xerc1', 0, 'acct-1', '50', '0xtok', 'USDT', 'swept');
+                 INSERT INTO erc20_deposits VALUES ('polygon', '0xerc2', 3, 'acct-2', '70', '0xtok', 'USDT', 'failed');
+                 INSERT INTO state VALUES ('next_index', '6');
+                 INSERT INTO state VALUES ('last_block:polygon', '123456');
+                 INSERT INTO sweep_meta VALUES ('polygon', '0xerc1', 0, '0xsweep1', 2);
+                 INSERT INTO token_metadata VALUES ('polygon', '0xtok', 'USDT', 6, 'Tether');
+                 INSERT INTO webhook_deliveries VALUES ('polygon:0xerc1:0', 'deposit_swept', 'acct-1',
+                   'https://hook.example/a', '{\"k\":1}', 'delivered', 1, 200, NULL, NULL, 1700000000);",
+            )
+            .unwrap();
+    }
+
+    // First start: the normal schema bootstrap.
+    let db = connect_pg(&url, None, None);
+    let mut client = raw_pg_client(&url);
+    let after_first = column_snapshot(&mut client);
+    let count = |client: &mut postgres::Client, table: &str| -> i64 {
+        client
+            .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .unwrap()
+            .get(0)
+    };
+    for (table, n) in [
+        ("accounts", 2),
+        ("deposits", 1),
+        ("erc20_deposits", 2),
+        ("state", 2),
+        ("sweep_meta", 1),
+        ("token_metadata", 1),
+        ("webhook_deliveries", 1),
+        // New tables, empty.
+        ("sweeps", 0),
+        ("sweep_intents", 0),
+        ("sweep_alerts", 0),
+    ] {
+        assert_eq!(count(&mut client, table), n, "{table} after the upgrade");
+    }
+
+    // Row values survived exactly; the new columns are NULL.
+    let deposit = client
+        .query_one(
+            "SELECT account_id, amount, status, from_address, review_kind FROM deposits",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(deposit.get::<_, String>(0), "acct-1");
+    assert_eq!(deposit.get::<_, String>(1), "1000");
+    assert_eq!(deposit.get::<_, String>(2), "swept");
+    assert_eq!(deposit.get::<_, Option<String>>(3), None);
+    assert_eq!(deposit.get::<_, Option<String>>(4), None);
+    let erc = client
+        .query(
+            "SELECT tx_hash, amount, status, from_address, review_kind, seq
+             FROM erc20_deposits ORDER BY tx_hash",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(erc[0].get::<_, String>(2), "swept");
+    assert_eq!(erc[1].get::<_, String>(2), "failed");
+    for r in &erc {
+        assert_eq!(r.get::<_, Option<String>>(3), None, "from_address NULL");
+        assert_eq!(r.get::<_, Option<String>>(4), None, "review_kind NULL");
+    }
+    assert_ne!(
+        erc[0].get::<_, i64>(5),
+        erc[1].get::<_, i64>(5),
+        "seq is filled in"
+    );
+    let meta = client
+        .query_one(
+            "SELECT sweep_tx_hash, zero_balance_retry_count FROM sweep_meta",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(meta.get::<_, String>(0), "0xsweep1");
+    assert_eq!(meta.get::<_, i64>(1), 2);
+    let hook = client
+        .query_one(
+            "SELECT status, payload, updated_at FROM webhook_deliveries",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(hook.get::<_, String>(0), "delivered");
+    assert_eq!(hook.get::<_, i64>(2), 1700000000);
+
+    // The store works on it: reads through the API, the counter continues, and a
+    // new deposit records with its sender and the new columns.
+    assert_eq!(db.get_account_by_id("acct-1").unwrap().unwrap().1, "0xa1");
+    assert!(db
+        .get_detected_erc20_deposits("polygon")
+        .unwrap()
+        .is_empty());
+    let (index, _, created) = db
+        .register_account_auto("acct-3", "https://hook.example/c", |i| {
+            Ok(format!("0xnew{i}"))
+        })
+        .unwrap();
+    assert_eq!((index, created), (6, true));
+    db.record_erc20_deposit_atomic(&f002a_token_deposit("0xnew", 1, Some("0xs")), None)
+        .unwrap();
+    assert_eq!(db.get_detected_erc20_deposits("base").unwrap().len(), 1);
+    // The upgraded tables took the unique index on open sweep intents too.
+    let idx: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'uq_sweep_intents_open'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(idx, 1);
+    drop(db);
+
+    // Second start: a no-op (same columns, defaults, and rows).
+    let before_rows: Vec<i64> = [
+        "accounts",
+        "deposits",
+        "erc20_deposits",
+        "state",
+        "webhook_deliveries",
+    ]
+    .iter()
+    .map(|t| count(&mut client, t))
+    .collect();
+    let after_columns_before = column_snapshot(&mut client);
+    assert_eq!(after_first, after_columns_before);
+    let db = connect_pg(&url, None, None);
+    let after_rows: Vec<i64> = [
+        "accounts",
+        "deposits",
+        "erc20_deposits",
+        "state",
+        "webhook_deliveries",
+    ]
+    .iter()
+    .map(|t| count(&mut client, t))
+    .collect();
+    assert_eq!(before_rows, after_rows);
+    assert_eq!(
+        column_snapshot(&mut client),
+        after_first,
+        "a second start changes no column"
+    );
+    drop(db);
 }

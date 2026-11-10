@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/bloque-app/evmhot/contracts/deposit_swept/schema.json",
+  "title": "evmhot deposit_swept (token deposit)",
+  "description": "The deposit_swept event evmhot sends for a token deposit, once every sweep that settles it has succeeded and been checked on its receipt. Version 1.0.0. Producer: evmhot (SPEC REQ-WH-3, REQ-WH-4, REQ-WH-9, REQ-SW-10, amendments 0003 and 0004). Receivers key on (id, event); consumers that register sweeps key each sweeps[] entry on (chain, sweep_block_hash, sweep_log_index). Consumers MUST ignore fields they don't know: later minor versions add optional fields.",
+  "type": "object",
+  "required": [
+    "id",
+    "chain",
+    "chain_id",
+    "event",
+    "account_id",
+    "registration_id",
+    "original_tx_hash",
+    "from_address",
+    "amount",
+    "token_type",
+    "token_symbol",
+    "token_address",
+    "sweep_tx_hash",
+    "sweeps"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]+:0x[0-9a-fA-F]{64}:[0-9]+$",
+      "description": "<chain>:<inbound tx hash>:<inbound block-level log index>. Stable for the deposit."
+    },
+    "chain": {
+      "type": "string",
+      "description": "Network name from evmhot's configuration, e.g. polygon, base."
+    },
+    "chain_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "event": {
+      "const": "deposit_swept"
+    },
+    "account_id": {
+      "$ref": "#/$defs/address",
+      "description": "The deposit address."
+    },
+    "registration_id": {
+      "type": "string",
+      "description": "The id the client registered the deposit address under."
+    },
+    "original_tx_hash": {
+      "$ref": "#/$defs/hash",
+      "description": "The inbound transfer's transaction."
+    },
+    "from_address": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/address"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The inbound transfer's sender (the Transfer log's from). null only for deposits recorded before evmhot stored senders; such deposits never reach a per_transfer or per_sender target."
+    },
+    "amount": {
+      "$ref": "#/$defs/atoms",
+      "description": "The inbound amount, in the token's minor units."
+    },
+    "token_type": {
+      "const": "erc20"
+    },
+    "token_symbol": {
+      "type": "string",
+      "description": "Metadata only; \"UNKNOWN\" when symbol() could not be read. Admission is by token_address."
+    },
+    "token_address": {
+      "$ref": "#/$defs/address"
+    },
+    "token_decimals": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255,
+      "description": "Present when known."
+    },
+    "sweep_tx_hash": {
+      "$ref": "#/$defs/hash",
+      "description": "Equal to sweeps[0].sweep_tx_hash; kept for older clients."
+    },
+    "sweeps": {
+      "type": "array",
+      "minItems": 1,
+      "description": "One entry per sweep that settled the deposit: one, or several when the amount was split by the target's max. Ordered by part. Under per_transfer, every entry is for this deposit alone.",
+      "items": {
+        "type": "object",
+        "required": [
+          "sweep_tx_hash",
+          "sweep_block_number",
+          "sweep_block_hash",
+          "sweep_log_index",
+          "sweep_amount",
+          "sweep_target"
+        ],
+        "additionalProperties": true,
+        "properties": {
+          "sweep_tx_hash": {
+            "$ref": "#/$defs/hash"
+          },
+          "sweep_block_number": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sweep_block_hash": {
+            "$ref": "#/$defs/hash"
+          },
+          "sweep_log_index": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Block-level logIndex of the Transfer into the target, from the receipt."
+          },
+          "sweep_amount": {
+            "$ref": "#/$defs/atoms"
+          },
+          "sweep_target": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/address"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The address the Transfer went to. null only for sweeps recorded before targets were stored."
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "hash": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]{64}$"
+    },
+    "address": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]{40}$",
+      "description": "Any case; compare case-insensitively."
+    },
+    "atoms": {
+      "type": "string",
+      "pattern": "^[0-9]+$",
+      "description": "Decimal integer string in the token's minor units."
+    }
+  }
+}

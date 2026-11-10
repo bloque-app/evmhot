@@ -1,4 +1,8 @@
-use crate::{config::ChainConfig, db::Db, webhook::WebhookDeliverer};
+use crate::{
+    config::ChainConfig,
+    db::{Db, NewErc20Deposit, NewNativeDeposit, OutboxEntry},
+    webhook::WebhookDeliverer,
+};
 use alloy::primitives::Address;
 use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::{Block, BlockNumberOrTag, Filter, Log};
@@ -24,6 +28,8 @@ struct DepositInfo<'a> {
     account_id: &'a str,
     registration_id: &'a str,
     tx_hash: &'a str,
+    /// Sender of the inbound transfer (REQ-WH-9).
+    from_address: &'a str,
     amount: &'a str,
     token_type: &'a str,
     token_symbol: Option<&'a str>,
@@ -61,6 +67,11 @@ impl Monitor {
             provider,
             allowed_token_filter,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn catch_up_once(&self) -> Result<()> {
+        self.catch_up().await
     }
 
     async fn catch_up(&self) -> Result<()> {
@@ -250,40 +261,37 @@ impl Monitor {
             );
 
             let tx_hash_str = tx.hash.to_string();
-            let is_new_deposit = {
-                let chain_name = self.chain.name.clone();
-                let tx_hash_str = tx_hash_str.clone();
-                let registration_id = registration_id.clone();
-                let value_str = tx.value.to_string();
-                self.db
-                    .blocking(move |db| {
-                        db.record_deposit(&chain_name, &tx_hash_str, &registration_id, &value_str)
-                    })
-                    .await?
+            let amount_str = tx.value.to_string();
+            let deposit_id = format!("{}:{}", self.chain.name, tx_hash_str);
+            let deposit_info = DepositInfo {
+                id: &deposit_id,
+                chain: &self.chain.name,
+                chain_id: self.chain.chain_id,
+                account_id: &to_address_str,
+                registration_id: &registration_id,
+                tx_hash: &tx_hash_str,
+                from_address: &from_address_str,
+                amount: &amount_str,
+                token_type: "native",
+                token_symbol: None,
+                token_address: None,
+                token_decimals: None,
             };
-
+            let outbox = self.build_deposit_detected_outbox(&deposit_info).await?;
+            let deposit = NewNativeDeposit {
+                chain: self.chain.name.clone(),
+                tx_hash: tx_hash_str.clone(),
+                account_id: registration_id.clone(),
+                amount: amount_str.clone(),
+                from_address: Some(from_address_str.clone()),
+            };
+            // REQ-WH-7: the deposit and its webhook are one transaction.
+            let is_new_deposit = self
+                .db
+                .blocking(move |db| db.record_native_deposit_atomic(&deposit, outbox.as_ref()))
+                .await?;
             if is_new_deposit {
-                let amount_str = tx.value.to_string();
-                let deposit_id = format!("{}:{}", self.chain.name, tx_hash_str);
-                let deposit_info = DepositInfo {
-                    id: &deposit_id,
-                    chain: &self.chain.name,
-                    chain_id: self.chain.chain_id,
-                    account_id: &to_address_str,
-                    registration_id: &registration_id,
-                    tx_hash: &tx_hash_str,
-                    amount: &amount_str,
-                    token_type: "native",
-                    token_symbol: None,
-                    token_address: None,
-                    token_decimals: None,
-                };
-                if let Err(e) = self.send_deposit_detected_webhook(&deposit_info).await {
-                    error!(
-                        "[{}] Failed to send deposit detected webhook: {:?}",
-                        self.chain.name, e
-                    );
-                }
+                self.deliverer.notify_worker();
             }
         }
 
@@ -448,14 +456,6 @@ impl Monitor {
 
         let token_info = self.get_or_fetch_token_metadata(token_address).await?;
 
-        if token_info.symbol.len() > 5 {
-            info!(
-                "[{}] Skipping ERC20 deposit: token symbol '{}' exceeds 5 characters",
-                self.chain.name, token_info.symbol
-            );
-            return Ok(());
-        }
-
         let Some(tx_hash) = log.transaction_hash else {
             return Ok(());
         };
@@ -463,50 +463,40 @@ impl Monitor {
         let tx_hash_str = tx_hash.to_string();
         let deposit_id = format!("{}:{}:{}", self.chain.name, tx_hash_str, log_index);
 
-        let is_new_deposit = {
-            let chain_name = self.chain.name.clone();
-            let tx_hash_str = tx_hash_str.clone();
-            let registration_id = registration_id.clone();
-            let amount_str = amount.to_string();
-            let token_address_str = token_address.to_string();
-            let symbol = token_info.symbol.clone();
-            self.db
-                .blocking(move |db| {
-                    db.record_erc20_deposit(
-                        &chain_name,
-                        &tx_hash_str,
-                        log_index,
-                        &registration_id,
-                        &amount_str,
-                        &token_address_str,
-                        &symbol,
-                    )
-                })
-                .await?
+        let token_addr_str = token_address.to_string();
+        let amount_str = amount.to_string();
+        let deposit_info = DepositInfo {
+            id: &deposit_id,
+            chain: &self.chain.name,
+            chain_id: self.chain.chain_id,
+            account_id: &to_address_str,
+            registration_id: &registration_id,
+            tx_hash: &tx_hash_str,
+            from_address: &from_address_str,
+            amount: &amount_str,
+            token_type: "erc20",
+            token_symbol: Some(&token_info.symbol),
+            token_address: Some(&token_addr_str),
+            token_decimals: Some(token_info.decimals),
         };
-
+        let outbox = self.build_deposit_detected_outbox(&deposit_info).await?;
+        let deposit = NewErc20Deposit {
+            chain: self.chain.name.clone(),
+            tx_hash: tx_hash_str.clone(),
+            log_index,
+            account_id: registration_id.clone(),
+            amount: amount_str.clone(),
+            token_address: token_addr_str.clone(),
+            token_symbol: token_info.symbol.clone(),
+            from_address: Some(from_address_str.clone()),
+        };
+        // REQ-WH-7: the deposit and its webhook are one transaction.
+        let is_new_deposit = self
+            .db
+            .blocking(move |db| db.record_erc20_deposit_atomic(&deposit, outbox.as_ref()))
+            .await?;
         if is_new_deposit {
-            let token_addr_str = token_address.to_string();
-            let amount_str = amount.to_string();
-            let deposit_info = DepositInfo {
-                id: &deposit_id,
-                chain: &self.chain.name,
-                chain_id: self.chain.chain_id,
-                account_id: &to_address_str,
-                registration_id: &registration_id,
-                tx_hash: &tx_hash_str,
-                amount: &amount_str,
-                token_type: "erc20",
-                token_symbol: Some(&token_info.symbol),
-                token_address: Some(&token_addr_str),
-                token_decimals: Some(token_info.decimals),
-            };
-            if let Err(e) = self.send_deposit_detected_webhook(&deposit_info).await {
-                error!(
-                    "[{}] Failed to send ERC20 deposit detected webhook: {:?}",
-                    self.chain.name, e
-                );
-            }
+            self.deliverer.notify_worker();
         }
 
         Ok(())
@@ -602,7 +592,12 @@ impl Monitor {
         }
     }
 
-    async fn send_deposit_detected_webhook(&self, info: &DepositInfo<'_>) -> Result<()> {
+    /// Builds the `deposit_detected` outbox row. `None` when the registration
+    /// has no webhook URL, in which case the deposit is stored without one.
+    async fn build_deposit_detected_outbox(
+        &self,
+        info: &DepositInfo<'_>,
+    ) -> Result<Option<OutboxEntry>> {
         let webhook_url = {
             let registration_id = info.registration_id.to_string();
             self.db
@@ -614,7 +609,7 @@ impl Monitor {
                 "No webhook URL found for registration_id: {}",
                 info.registration_id
             );
-            return Ok(());
+            return Ok(None);
         };
 
         let mut payload = serde_json::json!({
@@ -625,6 +620,7 @@ impl Monitor {
             "account_id": info.account_id,
             "registration_id": info.registration_id,
             "tx_hash": info.tx_hash,
+            "from_address": info.from_address,
             "amount": info.amount,
             "token_type": info.token_type
         });
@@ -639,16 +635,13 @@ impl Monitor {
             payload["token_decimals"] = serde_json::json!(decimals);
         }
 
-        self.deliverer
-            .enqueue(&webhook_url, info.registration_id, payload)
-            .await?;
-
-        info!(
-            "[{}] Deposit detected webhook enqueued for {} (registration_id={})",
-            info.chain, webhook_url, info.registration_id
-        );
-
-        Ok(())
+        Ok(Some(OutboxEntry {
+            id: info.id.to_string(),
+            event: "deposit_detected".to_string(),
+            registration_id: info.registration_id.to_string(),
+            webhook_url,
+            payload: payload.to_string(),
+        }))
     }
 }
 

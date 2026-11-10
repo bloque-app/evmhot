@@ -328,6 +328,17 @@ async fn mount_deposit_sweep_rpc_mocks(
         .mount(rpc_server)
         .await;
 
+    // The native sweep asks the node how much gas the treasury transfer needs.
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_estimateGas"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": "0x5208"
+        })))
+        .mount(rpc_server)
+        .await;
+
     Mock::given(method("POST"))
         .and(body_json_contains("eth_getBalance"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({

@@ -49,8 +49,84 @@ Secrets and process settings come from the environment; per-network settings com
 Copy [`chains.toml.example`](chains.toml.example). Each `[[chains]]` block configures one network: `name`,
 `chain_id`, `rpc_url` (HTTP polling only), `treasury_address` (the default sweep target), `faucet_address`,
 `existential_deposit`, a non-empty `allowed_token_addresses`, and optionally `token_treasuries` (a per-token sweep
-target), `min_deposits`, `min_deposit_default`, `min_deposit_native`, `poll_interval` and `block_offset_from_head`.
-Use a separate RPC key per network in production so one busy network cannot exhaust another's quota.
+target), `token_targets` (see below), `min_deposits`, `min_deposit_default`, `min_deposit_native`, `poll_interval` and
+`block_offset_from_head`. Use a separate RPC key per network in production so one busy network cannot exhaust
+another's quota.
+
+A token's sweep target is, in order: its `[chains.token_targets."0x..."]` table, its `token_treasuries` address, or the
+network's `treasury_address`. The native coin always uses `treasury_address`. A token is listed in `token_treasuries`
+or in `token_targets`, not both.
+
+| `token_targets` key | Meaning |
+|---|---|
+| `kind` | `"transfer"` (sweep to `address`) or `"hold"` (detect and notify, never sweep). Changing a held token to `"transfer"` and restarting releases its held deposits on the first pass. |
+| `address` | Required for `transfer`; not allowed for `hold`. |
+| `min` | Smallest sweep, in the token's minor units. A balance below it (or, with `per_sender`, one sender's unswept total) waits for later deposits. |
+| `max` | Largest sweep. A larger amount is swept in several sweeps, each at most `max`; `deposit_swept` lists them all in `sweeps` and is sent once, after the last. A remainder below `min` is topped up from the previous part when both can stay in bounds, otherwise it stays in the deposit address. |
+| `admits_only` | `true` when the address admits only this token. The process refuses to start if another token, the native coin or the network default target routes to that address; the error names the conflict. |
+| `per_transfer` | `true` to sweep each inbound deposit on its own (one sweep per transfer, never combined with another, even from the same sender): the amount is that deposit's amount minus what was already swept for it (never capped to the balance: a shortfall goes to review), and a deposit above `max` is split into parts that all belong to it. This is the setting for a Safe-style target that routes one hot wallet to one user. A deposit with no recorded sender goes to review (`no_sender`); a balance below what the deposits are owed goes to review (`balance_shortfall`). Refused at load if `min` is above the token's detection minimum (`min_deposits` or `min_deposit_default`), since a stored deposit below `min` could never be swept alone. Not combinable with `per_sender`. |
+| `notify_url`, `notify_token_env` | Optional second destination. Every token `deposit_swept` for a deposit settled into this target is also delivered to `notify_url` (same payload, same atomic outbox write as the registration webhook, same retries and leases) with `Authorization: Bearer <token>`, the token read from the environment variable `notify_token_env` names (production: `EVMHOT_SWAP_NOTIFY_TOKEN`). Startup fails if `notify_url` is set and that variable is empty or unset. The token is never written to the config, the store or the logs, and the registration webhook's token is never sent to this URL. Its outbox row is keyed `(id, "deposit_swept:notify")`. A notify delivery is retried for at least two hours (one attempt a minute, or per the worker's poll interval if longer), not on the registration webhooks' short schedule; when it finally fails, `EVMHOT_ALERT kind=notify_failed network=… deposit=…` is logged at ERROR, because that sweep is otherwise never registered at the swap service, and `POST /admin/retry_webhooks` with event `deposit_swept:notify` brings it back. Its outbox row is keyed `(id, "deposit_swept:notify")`, so it never collides with the registration webhook's `(id, "deposit_swept")`; the payload's `event` is still `deposit_swept`. Not for `hold` targets. |
+| `per_sender` | `true` when each sweep needs one refund address. A sweep moves one sender's unswept deposits (not the whole balance) and never mixes senders; deposits with no recorded sender (stored before senders were) are swept one at a time. |
+
+Each sweep is one `transfer` call into the target. evmhot reads the sweep's coordinate (transaction hash, block number,
+block hash, block-level log index of the `Transfer` into the target, amount) from the receipt and reports it in
+`deposit_swept` ([`WEBHOOK_SPEC.md`](WEBHOOK_SPEC.md)). A sweep whose receipt shows a revert is a failure and is never
+reported.
+
+**Sweep sending: one signed transaction per deposit address.** Nonces belong to an address, so evmhot keeps at most one
+signed, unresolved transaction per deposit address, across every token and the native coin. Every sweep, native
+included, goes through a sweep intent:
+
+1. The intent is stored first (deposits, part, amount, target). The transaction is then signed locally with an explicit
+   nonce, its nonce, hash and signed bytes are stored on the intent, and it is broadcast. A broadcast error (a
+   rate-limited public RPC, a lost answer) is not an error: the intent is open with its bytes, and no receipt is ever
+   waited for inside a pass. The pass for that address ends at its first send.
+2. At the start of each pass the address's open intent is resolved before anything else is planned. A receipt settles
+   it (a revert fails it; the failure is counted, REQ-SW-4). With no receipt and the nonce still free, the same bytes
+   are broadcast again (an evicted transaction comes back; a known one is a no-op). An intent keeps its nonce for
+   good: it is **never dropped** once signed. If it is underpriced (its max fee is below the current estimate) after 10
+   waiting passes, it is re-signed **at the same nonce** with both fee fields raised by at least 10% (or to the
+   current estimate), the new hash is stored next to the old, and it is broadcast; at most one of them can land. If
+   the nonce is used and none of our hashes has a receipt, it waits: receipt indexing on a public or load-balanced RPC
+   can lag the nonce. Only after 64 blocks past the nonce first being seen used does it conclude that something outside
+   evmhot used the key, and send the deposits to review (`review_gone`). That verdict is still **watched**: every pass
+   reads the receipts of such intents, and if one of our hashes shows up the sweep is recorded through the normal path,
+   the deposits go back to `detected` in the same transaction (as do the address's deposits of that token that went to
+   `balance_shortfall` while the sweep's amount was reserved), and `EVMHOT_ALERT kind=review_self_resolved` is raised
+   once, only when the receipt really matches the plan. The deposits of a watched intent are never planned, whatever
+   their status. A watched intent that cannot be read this pass (an RPC error, a damaged stored hash) is logged and
+   skipped; it does not stop the rest. The operator's retry is refused until the watch ends: 5,000 blocks counted from
+   when the review began (the "nonce used" verdict), not from the nonce first being seen used. Only an intent that was never signed (a crash before signing) is
+   dropped. A sweep that sits unmined with its nonce free raises `EVMHOT_ALERT kind=sweep_stuck` once after 30 minutes
+   (it is still rebroadcast and, if underpriced, repriced).
+3. A split sends one part per pass and re-reads the balance for the next; a long split on one token therefore holds
+   back the address's other tokens and its native sweep until it ends. With `per_transfer` the parts are
+   `ceil(remaining / ceil(remaining / max))`, near equal.
+
+A deposit is moved to `needs_review` (never auto-settled or auto-retried, no `deposit_swept`,
+`EVMHOT_ALERT kind=... network=... deposit=... tx=...` logged at ERROR, counted in the sweeper's queue log; native
+deposits too) when:
+`sweep_review` the receipt succeeded but has no matching `Transfer` or its value differs from the planned amount, or
+the nonce was used by another transaction; `balance_shortfall` a `per_sender` or `per_transfer` pair holds less than is
+owed on it (the live deposits plus those waiting for a person, whose amounts are **reserved**; nothing is ever swept
+with a capped amount); `no_sender` a deposit with no recorded sender sits on a `per_sender`/`per_transfer` target.
+Whole-balance targets cannot reserve, so on them any `needs_review` or `failed` deposit blocks the pair
+(`EVMHOT_ALERT kind=pair_blocked`, once, naming it); `per_sender` and `per_transfer` pairs keep sweeping what they can
+account for. `POST /admin/retry_sweeps` (with the operator token) is the only route that moves a `needs_review` or
+`failed` deposit back to `detected`. It refuses, naming the transaction, while an intent of that deposit is unresolved,
+and it **closes** that deposit's review intents (`closed_by_operator`); it never re-opens them. What is owed is then
+computed from recorded sweeps alone. If the transfer that was reviewed had really moved the funds and no sweep is
+recorded, the address is empty and the zero-balance rule (REQ-SW-3) settles the retried deposit after 10 passes with no
+`deposit_swept`: retrying such a review is the operator's word that the deposit needs nothing more.
+
+**Native sweeps.** The gas for the native sweep is estimated by the node (a contract treasury's receive function can
+cost more than 21,000 gas, or revert). A native sweep that fails to estimate or reverts on chain counts toward
+REQ-SW-4; the fifth sends the native deposits to `needs_review` (`kind=native_sweep_failed`, `EVMHOT_ALERT`) instead of
+retrying forever. A faucet top-up whose receipt times out is a transient funding error, not a sweep failure.
+
+**Limits.** A dust remainder below `min` stays owed (`EVMHOT_ALERT kind=dust`, once): the deposits are not settled and a
+later deposit lifts it. At load, `max = 0` and `min > max` are refused, and for `per_transfer` so is any `max` with
+`2 * min > max + 1` (the even split of a deposit above `max` has parts of at least `(max + 1) / 2`).
 
 ## HTTP API
 
@@ -66,8 +142,8 @@ Bodies are JSON; errors are a status code with a plain-text body. The surface is
 | `POST /evm/block_number` | `{"block_number"}` | `{"block_number"}`: moves the default network's cursor |
 | `GET /evm/chains/{chain}/block_number` | | `{"chain", "block_number"}` |
 | `POST /evm/chains/{chain}/block_number` | `{"block_number"}` | `{"chain", "block_number"}` |
-| `POST /admin/retry_sweeps` | `{"chain", "tx_hash", "log_index"?}` | `{"retried", "token_type"}` |
-| `POST /admin/retry_webhooks` | `{"id", "event"}` | `{"retried", "status"}` |
+| `POST /admin/retry_sweeps` | `{"chain", "tx_hash", "log_index"?}` | `{"retried", "token_type", "settled"}`; reads the receipts of the deposit's earlier sweeps first. If one had landed, the sweep is recorded instead (`settled: true`, `retried: false`, `deposit_swept` follows); if one succeeded without the planned `Transfer`, the retry is refused |
+| `POST /admin/retry_webhooks` | `{"id", "event"}` | `{"retried", "status"}`; `event` is `deposit_detected`, `deposit_swept`, or `deposit_swept:notify` for the copy sent to a target's `notify_url` |
 
 `/admin/*` needs `Authorization: Bearer <WEBHOOK_JWT_TOKEN>`. Moving a cursor backwards replays detection; deposits
 are recorded at most once, and webhooks already delivered are not sent again.
@@ -125,3 +201,10 @@ cargo test        # the Postgres backend tests need Docker; they skip when it is
 
 As a library: `HotWalletService::new(config)`, `start_background_services()`, `register`, `verify_transfer`,
 `get_block_number_async`, `set_block_number`, `retry_sweep`, `retry_webhook`.
+
+## Holding deliveries
+
+`WEBHOOK_DELIVERY_PAUSED=1` keeps every webhook and notify delivery `pending` in the outbox: no HTTP request is made
+and no attempt is counted, while detection and sweeps run as usual. evmhot logs
+`EVMHOT_ALERT kind=deliveries_paused` at start. Unset it and restart to send everything held, in order. The cutover
+uses it so the first sweeps reach the Safe before the services that consume `deposit_swept` are ready.

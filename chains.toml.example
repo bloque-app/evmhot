@@ -41,6 +41,25 @@ min_deposit_native = "0"
 # Native ETH and unlisted ERC20s still go to treasury_address.
 # [chains.token_treasuries]
 # "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+#
+# Optional: a table per token, for targets with bounds, held tokens or per-sender sweeps.
+# A token is listed here or in token_treasuries, not both. All addresses below are placeholders.
+#
+# [chains.token_targets."0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"]
+# kind = "transfer"        # "transfer" sweeps to `address`; "hold" detects and notifies but never sweeps
+# address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"   # required for transfer, not allowed for hold
+# min = "1000000"          # optional, token minor units: a balance below this waits
+# max = "50000000000"      # optional: a larger amount is swept in several sweeps, each at most this
+# admits_only = true       # optional: this address admits only this token (startup refuses a conflict)
+# notify_url = "https://swap.example.invalid/evmhot/deposit_swept"  # optional: also deliver every token deposit_swept for this target here
+# notify_token_env = "EVMHOT_SWAP_NOTIFY_TOKEN"  # name of the env var holding that URL's bearer token (required with notify_url; startup fails if empty)
+# per_transfer = true      # optional: each inbound deposit is swept on its own (use this for a Safe-style target)
+# per_sender = true        # optional, instead of per_transfer: each sweep covers one sender's deposits
+#
+# To hold a token until its target is ready, then release it (change the kind to "transfer", add the
+# address, and restart; held deposits are swept on the first pass):
+# [chains.token_targets."0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"]
+# kind = "hold"
 
 [[chains]]
 name = "polygon"

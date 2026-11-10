@@ -294,7 +294,7 @@ fn test_sweeper_multiple_deposits() {
 // ========== Verify Transfer Tests ==========
 
 // Helper matcher for body contains
-fn body_json_contains(substring: &str) -> impl wiremock::Match {
+pub(crate) fn body_json_contains(substring: &str) -> impl wiremock::Match {
     BodyContains(substring.to_string())
 }
 
@@ -328,7 +328,7 @@ fn field_hex(field: &str, value: u64) -> String {
     format!("\"{field}\":\"0x{value:x}\"")
 }
 
-fn empty_block_rpc_response() -> serde_json::Value {
+pub(crate) fn empty_block_rpc_response() -> serde_json::Value {
     let block_hash = "0x000000000000000000000000000000000000000000000000000000000000000a";
     let parent_hash = "0x0000000000000000000000000000000000000000000000000000000000000009";
     let root_hash = "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -1151,13 +1151,24 @@ async fn test_erc20_sweep_emits_per_deposit_webhooks() {
         .mount(&webhook_server)
         .await;
 
-    // balanceOf -> 3000000030 (aggregate on-chain balance)
+    // balanceOf -> 3000000006 (aggregate on-chain balance, the planned sweep)
+    let swept_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_for_balance = std::sync::Arc::clone(&swept_flag);
+    let flag_for_send = std::sync::Arc::clone(&swept_flag);
     Mock::given(method("POST"))
         .and(body_json_contains("eth_call"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "result": "0x00000000000000000000000000000000000000000000000000000000b2d05e06"
-        })))
+        .respond_with(move |_: &wiremock::Request| {
+            // The tokens leave the address once the sweep was broadcast.
+            let left = flag_for_balance.load(std::sync::atomic::Ordering::SeqCst);
+            let balance = if left {
+                "0x0000000000000000000000000000000000000000000000000000000000000000"
+            } else {
+                "0x00000000000000000000000000000000000000000000000000000000b2d05e06"
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "result": balance
+            }))
+        })
         .mount(&rpc_server)
         .await;
 
@@ -1210,9 +1221,11 @@ async fn test_erc20_sweep_emits_per_deposit_webhooks() {
     let sweep_tx_hash = "0x00000000000000000000000000000000000000000000000000000000000000f1";
     Mock::given(method("POST"))
         .and(body_json_contains("eth_sendRawTransaction"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0", "id": 1, "result": sweep_tx_hash
-        })))
+        .respond_with(move |_: &wiremock::Request| {
+            flag_for_send.store(true, std::sync::atomic::Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": sweep_tx_hash}))
+        })
         .mount(&rpc_server)
         .await;
 
@@ -1230,7 +1243,7 @@ async fn test_erc20_sweep_emits_per_deposit_webhooks() {
                 "cumulativeGasUsed": "0x186a0",
                 "gasUsed": "0x186a0",
                 "contractAddress": null,
-                "logs": [],
+                "logs": [test_support::transfer_log_json(token_address, &addr, TEST_TREASURY, 3000000006, 4, sweep_tx_hash, 11, 1)],
                 "status": "0x1",
                 "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
                 "type": "0x0",
@@ -1375,12 +1388,23 @@ async fn test_erc20_sweep_uses_token_treasury_override() {
     )
     .unwrap();
 
+    let swept_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_for_balance = std::sync::Arc::clone(&swept_flag);
+    let flag_for_send = std::sync::Arc::clone(&swept_flag);
     Mock::given(method("POST"))
         .and(body_json_contains("eth_call"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "result": "0x00000000000000000000000000000000000000000000000000000000b2d05e06"
-        })))
+        .respond_with(move |_: &wiremock::Request| {
+            // The tokens leave the address once the sweep was broadcast.
+            let left = flag_for_balance.load(std::sync::atomic::Ordering::SeqCst);
+            let balance = if left {
+                "0x0000000000000000000000000000000000000000000000000000000000000000"
+            } else {
+                "0x00000000000000000000000000000000000000000000000000000000b2d05e06"
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "result": balance
+            }))
+        })
         .mount(&rpc_server)
         .await;
 
@@ -1433,9 +1457,11 @@ async fn test_erc20_sweep_uses_token_treasury_override() {
     let sweep_tx_hash = "0x00000000000000000000000000000000000000000000000000000000000000f2";
     Mock::given(method("POST"))
         .and(body_json_contains("eth_sendRawTransaction"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0", "id": 1, "result": sweep_tx_hash
-        })))
+        .respond_with(move |_: &wiremock::Request| {
+            flag_for_send.store(true, std::sync::atomic::Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": sweep_tx_hash}))
+        })
         .mount(&rpc_server)
         .await;
 
@@ -1453,7 +1479,7 @@ async fn test_erc20_sweep_uses_token_treasury_override() {
                 "cumulativeGasUsed": "0x186a0",
                 "gasUsed": "0x186a0",
                 "contractAddress": null,
-                "logs": [],
+                "logs": [test_support::transfer_log_json(token_address, &addr, override_treasury, 3000000006, 4, sweep_tx_hash, 11, 1)],
                 "status": "0x1",
                 "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
                 "type": "0x0",
@@ -1587,12 +1613,23 @@ async fn test_erc20_sweep_webhook_best_effort_on_failure() {
         .mount(&webhook_server)
         .await;
 
+    let swept_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_for_balance = std::sync::Arc::clone(&swept_flag);
+    let flag_for_send = std::sync::Arc::clone(&swept_flag);
     Mock::given(method("POST"))
         .and(body_json_contains("eth_call"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "result": "0x00000000000000000000000000000000000000000000000000000000b2d05e06"
-        })))
+        .respond_with(move |_: &wiremock::Request| {
+            // The tokens leave the address once the sweep was broadcast.
+            let left = flag_for_balance.load(std::sync::atomic::Ordering::SeqCst);
+            let balance = if left {
+                "0x0000000000000000000000000000000000000000000000000000000000000000"
+            } else {
+                "0x00000000000000000000000000000000000000000000000000000000b2d05e06"
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "result": balance
+            }))
+        })
         .mount(&rpc_server)
         .await;
     Mock::given(method("POST"))
@@ -1640,9 +1677,11 @@ async fn test_erc20_sweep_webhook_best_effort_on_failure() {
     let sweep_tx_hash = "0x00000000000000000000000000000000000000000000000000000000000000f2";
     Mock::given(method("POST"))
         .and(body_json_contains("eth_sendRawTransaction"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0", "id": 1, "result": sweep_tx_hash
-        })))
+        .respond_with(move |_: &wiremock::Request| {
+            flag_for_send.store(true, std::sync::atomic::Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": sweep_tx_hash}))
+        })
         .mount(&rpc_server)
         .await;
     Mock::given(method("POST"))
@@ -1659,7 +1698,7 @@ async fn test_erc20_sweep_webhook_best_effort_on_failure() {
                 "cumulativeGasUsed": "0x186a0",
                 "gasUsed": "0x186a0",
                 "contractAddress": null,
-                "logs": [],
+                "logs": [test_support::transfer_log_json(token_address, &addr, TEST_TREASURY, 3000000006, 4, sweep_tx_hash, 11, 1)],
                 "status": "0x1",
                 "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
                 "type": "0x0",
@@ -1679,6 +1718,7 @@ async fn test_erc20_sweep_webhook_best_effort_on_failure() {
         .unwrap(),
     );
     let deliverer = test_webhook_deliverer(db.clone());
+    let deliverer_for_wake = Arc::clone(&deliverer);
     let webhook_worker = WebhookRetryService::new(Arc::clone(&deliverer));
     tokio::spawn(async move {
         webhook_worker.run().await;
@@ -1736,6 +1776,10 @@ async fn test_erc20_sweep_webhook_best_effort_on_failure() {
             both_delivered = true;
             break;
         }
+        // The 503'd row is retried on the next worker pass. Both rows now land
+        // in one transaction (REQ-WH-7), so there is no second enqueue to
+        // trigger that pass; wake the worker as the poll interval would.
+        deliverer_for_wake.notify_worker();
         sleep(Duration::from_millis(100)).await;
     }
 
@@ -1799,6 +1843,56 @@ async fn test_webhook_attempt_stored_retries_until_success() {
         }
     }
     panic!("webhook was not delivered after retries");
+}
+
+#[tokio::test]
+async fn paused_delivery_holds_every_row_until_unpaused() {
+    let webhook_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&webhook_server)
+        .await;
+
+    let db_file = NamedTempFile::new().unwrap();
+    let db = Db::new(db_file.path().to_str().unwrap()).unwrap();
+    let paused = WebhookDeliverer::new_for_test(db.clone(), None, 3, 10, 60, 50, 60)
+        .unwrap()
+        .with_delivery_paused(true);
+    paused
+        .enqueue(
+            &webhook_server.uri(),
+            "user1",
+            json!({"id": "polygon:0xabc:1", "event": "deposit_swept"}),
+        )
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        paused
+            .attempt_stored("polygon:0xabc:1", "deposit_swept")
+            .await
+            .unwrap();
+        paused.process_pending_batch().await.unwrap();
+    }
+    let row = db
+        .get_webhook_delivery("polygon:0xabc:1", "deposit_swept")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.attempt_count, 0, "a held delivery counts no attempt");
+    assert!(webhook_server.received_requests().await.unwrap().is_empty());
+
+    // The same store with delivery resumed sends it once.
+    let resumed = test_webhook_deliverer(db.clone());
+    resumed
+        .attempt_stored("polygon:0xabc:1", "deposit_swept")
+        .await
+        .unwrap();
+    let row = db
+        .get_webhook_delivery("polygon:0xabc:1", "deposit_swept")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "delivered");
+    assert_eq!(webhook_server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -2928,7 +3022,11 @@ async fn test_block_number_unknown_chain() {
 // Builds a native-transfer block RPC response by cloning the shared empty-block
 // skeleton (so the many fixed-size hex fields like logsBloom stay valid) and
 // overriding only the block number and transaction list.
-fn native_tx_block_response(block_num: u64, to_addr: &str, tx_hash: &str) -> serde_json::Value {
+pub(crate) fn native_tx_block_response(
+    block_num: u64,
+    to_addr: &str,
+    tx_hash: &str,
+) -> serde_json::Value {
     let mut resp = empty_block_rpc_response();
     let block_hex = format!("0x{block_num:x}");
     resp["result"]["number"] = json!(block_hex);
