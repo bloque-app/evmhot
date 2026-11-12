@@ -47,7 +47,7 @@ Secrets and process settings come from the environment; per-network settings com
 ### `chains.toml`
 
 Copy [`chains.toml.example`](chains.toml.example). Each `[[chains]]` block configures one network: `name`,
-`chain_id`, `rpc_url` (HTTP polling only), `treasury_address` (the default sweep target), `faucet_address`,
+`chain_id`, `rpc_url` (HTTP polling only) and optionally `rpc_urls` (more endpoints to fail over to), `treasury_address` (the default sweep target), `faucet_address`,
 `existential_deposit`, a non-empty `allowed_token_addresses`, and optionally `token_treasuries` (a per-token sweep
 target), `token_targets` (see below), `min_deposits`, `min_deposit_default`, `min_deposit_native`, `poll_interval` and
 `block_offset_from_head`. Use a separate RPC key per network in production so one busy network cannot exhaust

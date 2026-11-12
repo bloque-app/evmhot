@@ -114,6 +114,7 @@ fn is_transient_funding_error(err_debug: &str) -> bool {
         || s.contains("insufficient native balance for gas")
         || s.contains("still insufficient balance after faucet")
         || s.contains("faucet top-up receipt timed out")
+        || s.contains("faucet top-up pending")
 }
 
 impl Sweeper {

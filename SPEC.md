@@ -1,6 +1,6 @@
 # evmhot — System Specification
 
-**Version:** 0.2.4 · **Status:** draft for review · **Owner:** @pandres95
+**Version:** 0.2.5 · **Status:** draft for review · **Owner:** @pandres95
 
 ## 0. How to read this document
 
@@ -16,6 +16,7 @@ yet are marked **(not built)**, and `PLAN.md` §4 names the feature that builds 
 | Version | Date | Change |
 |---|---|---|
 | 0.1.0 | 2026-11-09 | The service as it ran: registration, detection, sweeps, faucet, webhooks, store, API |
+| 0.2.5 | 2026-11-12 | Amendment 0006: `rpc_urls` pool with failover, backoff on rate limits instead of discarding a chunk, a faucet top-up that was sent is sent |
 | 0.2.4 | 2026-11-09 | Amendment 0005: a second delivery of `deposit_swept` to a target's notify URL; the published `deposit_swept` contract |
 | 0.2.3 | 2026-11-09 | Amendment 0004: sweep intents before broadcast, review states, one sweep per transfer, alerts, `sweep_target` |
 | 0.2.2 | 2026-11-09 | Amendment 0003: the `hold` target kind; `sweeps` in `deposit_swept` |
@@ -181,6 +182,9 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
 - `REQ-FC-1` Before a sweep, the sweeper checks the deposit address's native balance against the gas the sweep needs,
   and asks the faucet to top it up if short.
 - `REQ-FC-2` A faucet with too little balance makes sweeps wait; it never marks a deposit swept.
+- `REQ-FC-3` Once the faucet's transaction is broadcast, the top-up counts as sent. If its receipt cannot be read, the
+  faucet logs the hash and returns it as funded but unconfirmed; the sweeper re-checks the balance on its next pass,
+  and no second top-up is sent for that address while the first is unconfirmed. (Amendment 0006.)
 
 ### 6.4 Sweep targets (amendment 0001)
 
@@ -249,6 +253,9 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
 - `REQ-DT-8` **(not built)** A network's configuration MUST choose its detection height as one of: the provider's
   `finalized` block, its `safe` block, or the newest block minus an offset. The default is `finalized` where the
   network has it.
+- `REQ-DT-9` A block fetch or `eth_getLogs` that fails with a 429, 403, 5xx or transport error is retried with a wait
+  of 0.5 s doubling to 8 s (6 attempts) before the chunk fails; a range is bisected only for a range or size error,
+  after every endpoint refused it. (Amendment 0006.)
 
 ## 8. Webhooks
 
@@ -285,7 +292,10 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   start when a notify URL's token is empty. The swap
   service receives bezent's Safe sweeps this way (R12). (Amendment 0005.)
 - `REQ-CF-1` A `[[chains]]` table with a key evmhot does not know MUST be refused at load, so configuration never
-  claims behaviour the binary lacks. (Amendment 0005.)
+  claims behaviour the binary lacks. `rpc_urls` is a known key. (Amendment 0005, 0006.)
+- `REQ-CF-2` A chain MAY list several RPC endpoints (`rpc_url` first, then `rpc_urls`). A call moves to the next
+  endpoint on a 429, 403, 5xx, transport error, or a refusal of the method, range or size; an endpoint that answered
+  429 cools down for a few seconds. (Amendment 0006.)
 - `REQ-WH-11` The token `deposit_swept` body is published as a versioned contract in `contracts/deposit_swept/`
   (JSON Schema, fixtures, changelog); a test checks the payload evmhot builds against it. Consumers ignore unknown
   fields; an additive change bumps the minor version. (Amendment 0005.)

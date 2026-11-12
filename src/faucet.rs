@@ -1,13 +1,16 @@
 use alloy::network::{Ethereum, EthereumWallet, TransactionBuilder};
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::fillers::{FillProvider, JoinFill, RecommendedFiller, WalletFiller};
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use alloy::rpc::types::TransactionRequest;
 use alloy::transports::{BoxTransport, Transport};
 use anyhow::Result;
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::wallet::Wallet;
 
@@ -18,12 +21,19 @@ type FaucetProvider = FillProvider<
     Ethereum,
 >;
 
+/// How long a top-up that was broadcast but not seen confirmed blocks a second
+/// top-up for the same address.
+const UNCONFIRMED_HOLD: Duration = Duration::from_secs(600);
+
 pub struct Faucet {
     root: RootProvider<BoxTransport>,
     wallet: EthereumWallet,
     faucet_address: Address,
     existential_deposit: U256,
     provider: RwLock<FaucetProvider>,
+    /// Top-ups that were broadcast but whose receipt could not be read (amendment
+    /// 0006: once `send_transaction` succeeds, the top-up is sent).
+    unconfirmed: Mutex<HashMap<Address, (TxHash, Instant)>>,
 }
 
 impl Faucet {
@@ -45,6 +55,7 @@ impl Faucet {
             faucet_address,
             existential_deposit,
             provider,
+            unconfirmed: Mutex::new(HashMap::new()),
         })
     }
 
@@ -84,6 +95,20 @@ impl Faucet {
             .with_to(to)
             .with_value(self.existential_deposit);
 
+        // A top-up broadcast earlier whose receipt we could not read: do not
+        // send a second one while the first may still land.
+        let earlier = self.unconfirmed.lock().unwrap().get(&to).copied();
+        if let Some((hash, at)) = earlier {
+            let landed = matches!(self.root.get_transaction_receipt(hash).await, Ok(Some(_)));
+            if landed || at.elapsed() > UNCONFIRMED_HOLD {
+                self.unconfirmed.lock().unwrap().remove(&to);
+            } else {
+                return Err(anyhow::anyhow!(
+                    "faucet top-up pending: {hash} was sent to {to_address} and is not confirmed yet"
+                ));
+            }
+        }
+
         let receipt = {
             let provider = self.provider.read().await;
             let pending = match provider.send_transaction(tx).await {
@@ -95,18 +120,30 @@ impl Faucet {
                     return Err(e.into());
                 }
             };
+            let sent_hash = *pending.tx_hash();
             // alloy 0.1 has no receipt timeout: bound the wait so one stuck top-up
             // cannot freeze the sweeper.
-            match tokio::time::timeout(std::time::Duration::from_secs(60), pending.get_receipt())
-                .await
-            {
-                Ok(receipt) => receipt?,
-                Err(_) => {
-                    // The top-up may still land; the nonce cache is stale either
-                    // way. Rebuild it, and let the caller treat this as transient.
+            let waited = tokio::time::timeout(Duration::from_secs(60), pending.get_receipt()).await;
+            match waited {
+                Ok(Ok(receipt)) => receipt,
+                other => {
+                    // The transaction went out, so the top-up counts as sent. The
+                    // nonce cache may be stale; rebuild it. The caller re-checks
+                    // the balance on its next pass.
+                    let why = match other {
+                        Ok(Err(e)) => e.to_string(),
+                        _ => "receipt wait timed out".to_string(),
+                    };
                     drop(provider);
+                    warn!(
+                        "Faucet top-up of {to_address} was broadcast as {sent_hash} but its receipt could not be read ({why}); counting it as sent"
+                    );
                     *self.provider.write().await = Self::build_provider(&self.root, &self.wallet);
-                    return Err(anyhow::anyhow!("faucet top-up receipt timed out"));
+                    self.unconfirmed
+                        .lock()
+                        .unwrap()
+                        .insert(to, (sent_hash, Instant::now()));
+                    return Ok(sent_hash.to_string());
                 }
             }
         };

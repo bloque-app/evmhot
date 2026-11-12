@@ -3392,7 +3392,7 @@ async fn test_batch_catchup_bisects_on_provider_error() {
         .and(body_json_contains("eth_getLogs"))
         .and(body_json_contains(&field_hex("fromBlock", 1)))
         .and(body_json_contains(&field_hex("toBlock", 21)))
-        .respond_with(ResponseTemplate::new(500))
+        .respond_with(oversized_range_response())
         .expect(1)
         .mount(&rpc_server)
         .await;
@@ -3517,7 +3517,7 @@ async fn test_batch_catchup_bisect_floor_surfaces_error() {
             .and(body_json_contains("eth_getLogs"))
             .and(body_json_contains(&field_hex("fromBlock", from)))
             .and(body_json_contains(&field_hex("toBlock", to)))
-            .respond_with(ResponseTemplate::new(500))
+            .respond_with(oversized_range_response())
             .expect(1)
             .mount(&rpc_server)
             .await;
@@ -3526,7 +3526,7 @@ async fn test_batch_catchup_bisect_floor_surfaces_error() {
         .and(body_json_contains("eth_getLogs"))
         .and(body_json_contains(&field_hex("fromBlock", 2)))
         .and(body_json_contains(&field_hex("toBlock", 2)))
-        .respond_with(ResponseTemplate::new(500))
+        .respond_with(oversized_range_response())
         .expect(0)
         .mount(&rpc_server)
         .await;
@@ -3799,4 +3799,282 @@ async fn test_batch_catchup_replay_is_idempotent() {
         0,
         "replay must not re-enqueue/re-attempt the webhook for an already-detected deposit"
     );
+}
+
+/// Runs one catch-up over a 20-block gap (ranged `eth_getLogs` plus a
+/// block-by-block native scan) against a mock node. With `inject`, the first
+/// `eth_getBlockByNumber` for every block, and the first `eth_getLogs`, answers
+/// 429 (or 403-archive); the monitor must back off and end up with the same
+/// result. Returns (ERC20 deposit count, cursor, deposit_detected enqueued).
+async fn catch_up_with_injected_rate_limits(inject: Option<u16>) -> (usize, u64, bool) {
+    use std::collections::HashSet;
+    use std::sync::Mutex as StdMutex;
+
+    crate::monitor::RPC_BACKOFF_BASE_MS.store(1, std::sync::atomic::Ordering::Relaxed);
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let addr = wallet.derive_address(0).unwrap().to_string();
+    let allowed_token = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+    let mut allowlist = HashSet::new();
+    allowlist.insert(allowed_token.to_lowercase());
+
+    let mut config = test_config_with_allowlist(allowlist);
+    config.database_url = db_file.path().to_str().unwrap().to_string();
+    config.chains[0].rpc_url = rpc_server.uri();
+    config.chains[0].get_logs_max_retries = 1;
+    config.chains[0].get_logs_delay_ms = 1;
+
+    let db = Db::new(&config.database_url).unwrap();
+    db.register_account("user_1", 0, &addr, "http://localhost/webhook")
+        .unwrap();
+    db.store_token_metadata(TEST_CHAIN, allowed_token, "USDT", 6, "Tether USD")
+        .unwrap();
+    db.set_last_processed_block(TEST_CHAIN, 1).unwrap();
+
+    let transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    let from_topic = "0x0000000000000000000000000000000000000000000000000000000000000001";
+    let to_topic = format!("0x000000000000000000000000{}", addr[2..].to_lowercase());
+    let tx_hash = format!("0x{}", "a".repeat(64));
+    let log = json!({
+        "address": allowed_token,
+        "topics": [transfer_topic, from_topic, to_topic],
+        "data": "0x00000000000000000000000000000000000000000000000000000000000f4240",
+        "blockNumber": "0x5",
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+        "blockHash": "0x000000000000000000000000000000000000000000000000000000000000000a",
+        "logIndex": "0x0",
+        "removed": false
+    });
+
+    let seen: StdMutex<HashSet<String>> = StdMutex::new(HashSet::new());
+    let ok_blocks = std::sync::Arc::new(StdMutex::new(HashSet::<String>::new()));
+    let ok_blocks_in = ok_blocks.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let m = body["method"].as_str().unwrap_or("");
+            let key = format!("{m}:{}", body["params"][0]);
+            let first_time = seen.lock().unwrap().insert(key.clone());
+            if let (Some(status), true) = (inject, first_time) {
+                if m == "eth_getBlockByNumber" || m == "eth_getLogs" {
+                    let text = if status == 403 {
+                        r#"{"code":-32602,"message":"Archive requests require a personal token"}"#
+                    } else {
+                        "Rate limit (1200rqs/60s) reached"
+                    };
+                    return ResponseTemplate::new(status).set_body_string(text);
+                }
+            }
+            let result = match m {
+                "eth_blockNumber" => json!("0x15"),
+                "eth_getBlockByNumber" => {
+                    ok_blocks_in.lock().unwrap().insert(key);
+                    empty_block_rpc_response()["result"].clone()
+                }
+                "eth_getLogs" => json!([log]),
+                other => panic!("unexpected rpc method {other}"),
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+        })
+        .mount(&rpc_server)
+        .await;
+
+    let provider = http_provider_boxed(&rpc_server.uri());
+    let monitor = Monitor::new(
+        config.chains[0].clone(),
+        test_webhook_deliverer(db.clone()),
+        db.clone(),
+        provider,
+    );
+    monitor.catch_up_once().await.unwrap();
+    // Every block of the gap was fetched successfully once the limits passed.
+    assert_eq!(ok_blocks.lock().unwrap().len(), 21);
+
+    let deposits = db.get_detected_erc20_deposits(TEST_CHAIN).unwrap();
+    let cursor = db.get_last_processed_block(TEST_CHAIN).unwrap();
+    let id = format!("{TEST_CHAIN}:{tx_hash}:0");
+    let enqueued = db
+        .get_webhook_delivery(&id, "deposit_detected")
+        .unwrap()
+        .is_some();
+    (deposits.len(), cursor, enqueued)
+}
+
+/// A chunk survives a 429 (or a 403-archive) on every block fetch and on the
+/// logs call: same deposits, same cursor as with no limits at all.
+#[tokio::test]
+async fn test_catch_up_result_is_identical_with_injected_rate_limits() {
+    let clean = catch_up_with_injected_rate_limits(None).await;
+    assert_eq!(clean, (1, 21, true));
+    assert_eq!(catch_up_with_injected_rate_limits(Some(429)).await, clean);
+    assert_eq!(catch_up_with_injected_rate_limits(Some(403)).await, clean);
+}
+
+/// What a provider says when a range is too big (HTTP 200, JSON-RPC error).
+/// A 5xx or 429 is not this: those are retried with backoff, never bisected.
+fn oversized_range_response() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "jsonrpc": "2.0", "id": 1,
+        "error": {"code": -32602, "message": "Log response size exceeded"}
+    }))
+}
+
+#[derive(Clone, Default)]
+struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for LogBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+    fn make_writer(&'a self) -> LogBuf {
+        self.clone()
+    }
+}
+
+/// Amendment 0006: once the top-up is broadcast it is sent. If the receipt wait
+/// fails (publicnode's transient 403), the faucet logs the hash and returns it,
+/// and a second call for the same address does not broadcast again.
+#[tokio::test]
+async fn test_faucet_receipt_error_after_send_reports_sent_and_logs_hash() {
+    let logs = LogBuf::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+
+    let rpc_server = MockServer::start().await;
+    mount_faucet_gas_mocks(&rpc_server).await;
+    for (m, result) in [
+        ("eth_getBalance", json!("0x0DE0B6B3A7640000")),
+        ("eth_getTransactionCount", json!("0x0")),
+    ] {
+        Mock::given(method("POST"))
+            .and(body_json_contains(m))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "result": result
+            })))
+            .mount(&rpc_server)
+            .await;
+    }
+    let tx_hash = "0x0000000000000000000000000000000000000000000000000000000000000001";
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_sendRawTransaction"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": tx_hash
+        })))
+        .mount(&rpc_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getTransactionReceipt"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(
+            r#"{"code":-32602,"message":"Archive requests require a personal token"}"#,
+        ))
+        .mount(&rpc_server)
+        .await;
+
+    let faucet = Faucet::new(
+        "test test test test test test test test test test test junk".to_string(),
+        http_provider_boxed(&rpc_server.uri()),
+        "10000000000000000",
+    )
+    .unwrap();
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let to = wallet.derive_address(1).unwrap().to_string();
+
+    let sent = faucet.fund_new_address(&to).await.unwrap();
+    assert_eq!(sent, tx_hash);
+    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(text.contains("WARN"), "{text}");
+    assert!(text.contains(tx_hash), "the warning names the hash: {text}");
+
+    // Next pass, the receipt is still unreadable: no second broadcast.
+    let err = faucet.fund_new_address(&to).await.unwrap_err();
+    assert!(err.to_string().contains("faucet top-up pending"), "{err}");
+    let sends = rpc_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| String::from_utf8_lossy(&r.body).contains("eth_sendRawTransaction"))
+        .count();
+    assert_eq!(sends, 1);
+}
+
+/// A 429 on `eth_getLogs` says nothing about the range: the monitor backs off
+/// and asks again for the same range; it never bisects.
+#[tokio::test]
+async fn test_get_logs_429_backs_off_and_does_not_bisect() {
+    use std::collections::HashSet;
+    crate::monitor::RPC_BACKOFF_BASE_MS.store(1, std::sync::atomic::Ordering::Relaxed);
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let allowed_token = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+    let mut allowlist = HashSet::new();
+    allowlist.insert(allowed_token.to_lowercase());
+    let mut config = test_config_with_allowlist(allowlist);
+    config.database_url = db_file.path().to_str().unwrap().to_string();
+    config.chains[0].rpc_url = rpc_server.uri();
+    config.chains[0].get_logs_max_retries = 1;
+    config.chains[0].get_logs_delay_ms = 1;
+    let db = Db::new(&config.database_url).unwrap();
+    db.set_last_processed_block(TEST_CHAIN, 1).unwrap();
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_blockNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x15"
+        })))
+        .mount(&rpc_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .respond_with(
+            ResponseTemplate::new(429).set_body_string("Rate limit (1200rqs/60s) reached"),
+        )
+        .mount(&rpc_server)
+        .await;
+
+    let monitor = Monitor::new(
+        config.chains[0].clone(),
+        test_webhook_deliverer(db.clone()),
+        db.clone(),
+        http_provider_boxed(&rpc_server.uri()),
+    );
+    assert!(monitor.catch_up_once().await.is_err());
+    let ranges: HashSet<String> = rpc_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| {
+            let b: serde_json::Value = serde_json::from_slice(&r.body).ok()?;
+            (b["method"] == "eth_getLogs").then(|| {
+                format!(
+                    "{}-{}",
+                    b["params"][0]["fromBlock"], b["params"][0]["toBlock"]
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        ranges.len(),
+        1,
+        "one range, asked again and again: {ranges:?}"
+    );
+    assert_eq!(db.get_last_processed_block(TEST_CHAIN).unwrap(), 1);
 }
