@@ -74,10 +74,13 @@ fn classify_text(msg: &str) -> Option<Refusal> {
     {
         return Some(Refusal::RateLimited);
     }
+    // "not supported" alone is also what reverts and execution errors say
+    // ("transaction type not supported", "token not supported"): it counts only
+    // with "method" (or JSON-RPC code -32601, in `classify_payload`).
     if s.contains("not available on this plan")
         || s.contains("method not available")
         || s.contains("method not found")
-        || s.contains("not supported")
+        || (s.contains("method") && s.contains("not supported"))
     {
         return Some(Refusal::MethodUnavailable);
     }
@@ -93,6 +96,7 @@ fn classify_text(msg: &str) -> Option<Refusal> {
 fn classify_payload(code: i64, message: &str) -> Option<Refusal> {
     match classify_text(message) {
         None if code == -32005 => Some(Refusal::RateLimited),
+        None if code == -32601 => Some(Refusal::MethodUnavailable),
         other => other,
     }
 }
@@ -637,5 +641,43 @@ mod tests {
         let only = provider(&[&a], Duration::from_secs(30));
         let err: anyhow::Error = only.get_block_number().await.unwrap_err().into();
         assert!(!is_rate_limited(&err));
+    }
+
+    #[tokio::test]
+    async fn a_revert_saying_not_supported_does_not_fail_over_but_32601_does() {
+        for msg in [
+            "execution reverted: token not supported",
+            "transaction type not supported",
+        ] {
+            assert_eq!(classify_text(msg), None, "{msg}");
+            let a = serve(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0","id":0,"error":{"code":3,"message":msg}
+            })))
+            .await;
+            let b = serve(ok_block_number()).await;
+            let p = provider(&[&a, &b], Duration::from_secs(30));
+            assert!(p.get_block_number().await.is_err(), "{msg}");
+            assert_eq!(hits(&b).await, 0, "{msg}");
+        }
+        // Code -32601 fails over whatever the words, and cools that method.
+        let a = serve(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"the endpoint says no"}
+        })))
+        .await;
+        let b = serve(ok_block_number()).await;
+        let p = provider(&[&a, &b], Duration::from_secs(30));
+        for _ in 0..4 {
+            assert_eq!(p.get_block_number().await.unwrap(), 42);
+        }
+        assert_eq!(hits(&a).await, 1);
+        // drpc's wording stays a range refusal.
+        assert_eq!(
+            classify_text("ranges over 10000 blocks are not supported on free plan"),
+            Some(Refusal::RangeRefused)
+        );
+        assert_eq!(
+            classify_text("eth_getLogs method not supported"),
+            Some(Refusal::MethodUnavailable)
+        );
     }
 }

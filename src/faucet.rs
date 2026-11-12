@@ -28,6 +28,10 @@ const UNCONFIRMED_HOLD: Duration = Duration::from_secs(600);
 /// can still show the old balance; a second top-up for the same need would be a
 /// double fund. Passes in this window wait ("faucet top-up pending").
 const CONFIRMED_HOLD: Duration = Duration::from_secs(120);
+/// A reservation with no hash: the send itself is in progress, or a send answered
+/// "nonce too low" (possibly a stale nonce cache with nothing in flight; the
+/// provider is rebuilt, so a retry on a later pass may succeed).
+const RESERVATION_HOLD: Duration = Duration::from_secs(90);
 
 /// A top-up this faucet sent to an address. `hash` is `None` while the
 /// transaction is being sent (the reservation that keeps two concurrent calls
@@ -37,6 +41,8 @@ struct Sent {
     hash: Option<TxHash>,
     at: Instant,
     confirmed: bool,
+    /// How long this record blocks another top-up to the same address.
+    hold: Duration,
 }
 
 pub struct Faucet {
@@ -110,14 +116,7 @@ impl Faucet {
         let earlier = {
             let mut sent = self.sent.lock().unwrap();
             let earlier = sent.get(&to).copied();
-            let blocking = earlier.is_some_and(|s| {
-                s.at.elapsed()
-                    < if s.confirmed {
-                        CONFIRMED_HOLD
-                    } else {
-                        UNCONFIRMED_HOLD
-                    }
-            });
+            let blocking = earlier.is_some_and(|s| s.at.elapsed() < s.hold);
             if !blocking {
                 sent.insert(
                     to,
@@ -125,6 +124,7 @@ impl Faucet {
                         hash: None,
                         at: Instant::now(),
                         confirmed: false,
+                        hold: RESERVATION_HOLD,
                     },
                 );
             }
@@ -137,6 +137,7 @@ impl Faucet {
                 if matches!(self.root.get_transaction_receipt(hash).await, Ok(Some(_))) {
                     if let Some(e) = self.sent.lock().unwrap().get_mut(&to) {
                         e.confirmed = true;
+                        e.hold = CONFIRMED_HOLD;
                     }
                 }
             }
@@ -177,6 +178,14 @@ impl Faucet {
                                 hash: None,
                                 at: Instant::now(),
                                 confirmed: false,
+                                // "already known": it is in a mempool, hold long.
+                                // "nonce too low" may be only a stale nonce
+                                // cache: hold briefly.
+                                hold: if text.contains("already known") {
+                                    UNCONFIRMED_HOLD
+                                } else {
+                                    RESERVATION_HOLD
+                                },
                             },
                         );
                     } else {
@@ -199,6 +208,7 @@ impl Faucet {
                     hash: Some(sent_hash),
                     at: Instant::now(),
                     confirmed: false,
+                    hold: UNCONFIRMED_HOLD,
                 },
             );
             // alloy 0.1 has no receipt timeout: bound the wait so one stuck top-up
@@ -208,6 +218,7 @@ impl Faucet {
                 Ok(Ok(receipt)) => {
                     if let Some(e) = self.sent.lock().unwrap().get_mut(&to) {
                         e.confirmed = true;
+                        e.hold = CONFIRMED_HOLD;
                     }
                     receipt
                 }
@@ -236,6 +247,13 @@ impl Faucet {
         );
 
         Ok(tx_hash)
+    }
+
+    /// How long the faucet's record for `address` blocks another top-up.
+    #[cfg(test)]
+    pub(crate) fn hold_for(&self, address: &str) -> Option<Duration> {
+        let a = Address::from_str(address).ok()?;
+        self.sent.lock().unwrap().get(&a).map(|s| s.hold)
     }
 
     /// Check if an address already has sufficient balance (skip funding if it does)

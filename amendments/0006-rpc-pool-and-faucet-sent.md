@@ -24,7 +24,7 @@ over: another endpoint would say the same. A message is a range refusal only if 
 "exceeds" alone is not one ("transfer amount exceeds balance" is a revert), and "invalid block range" (from after
 to) is a bad request. Range and size phrases are checked before rate-limit ones, so JSON-RPC code -32005 ("limit
 exceeded") is a rate limit only when its message names no range or size (Infura sends "query returned more than 10000
-results" under it). A missing method ("method not found", "not supported", "not available on this plan") fails over and
+results" under it). A missing method ("method not found", "method ... not supported", JSON-RPC code -32601, "not available on this plan") fails over and
 cools that endpoint for that method for 60 s.
 
 - An endpoint that answered 429 cools down for 10 seconds, for every method. A 401, 402, 403, 404 or 413 cools it for
@@ -65,7 +65,8 @@ pass. A balance that still looks low inside the window (a node lagging the one t
 reason to fund again. If the receipt wait errors or times out, the faucet logs a WARN with the transaction hash,
 rebuilds its nonce cache, and returns the hash as funded but unconfirmed. If a send answers "already known" or "nonce
 too low" (after a failover, another endpoint may have taken the transaction), the faucet logs a WARN and keeps the
-record as unconfirmed instead of releasing it. So a pass never funds the same need twice,
+record as unconfirmed instead of releasing it: 10 minutes for "already known", 90 seconds for "nonce too low" (which can
+also be a stale nonce cache with nothing in flight; the provider is rebuilt, so a retry may succeed). So a pass never funds the same need twice,
 and neither do the passes after it, until the window ends.
 
 ## Identifier ledger
