@@ -21,7 +21,11 @@ takes over 10 s, is one), a refusal of the method ("not available on this plan")
 ("limited to 0 - 50 blocks range", "ranges over 10000 blocks", "up to a 10 block range", "Log response size
 exceeded"). Each endpoint is tried once per call. A revert or any execution error, and a plain 400, are not failed
 over: another endpoint would say the same. A message is a range refusal only if it says so in one of those phrases;
-"exceeds" alone is not one ("transfer amount exceeds balance" is a revert).
+"exceeds" alone is not one ("transfer amount exceeds balance" is a revert), and "invalid block range" (from after
+to) is a bad request. Range and size phrases are checked before rate-limit ones, so JSON-RPC code -32005 ("limit
+exceeded") is a rate limit only when its message names no range or size (Infura sends "query returned more than 10000
+results" under it). A missing method ("method not found", "not supported", "not available on this plan") fails over and
+cools that endpoint for that method for 60 s.
 
 - An endpoint that answered 429 cools down for 10 seconds, for every method. A 401, 402, 403, 404 or 413 cools it for
   every method for 60 seconds. A refusal of one method cools that endpoint for that method only, for 60 seconds. A
@@ -59,7 +63,9 @@ minutes while its receipt is unread), a request to fund that address is answered
 is sent; `ensure_gas` and the native sweep return that as a transient funding error and the sweep waits for a later
 pass. A balance that still looks low inside the window (a node lagging the one that confirmed the top-up) is not a
 reason to fund again. If the receipt wait errors or times out, the faucet logs a WARN with the transaction hash,
-rebuilds its nonce cache, and returns the hash as funded but unconfirmed. So a pass never funds the same need twice,
+rebuilds its nonce cache, and returns the hash as funded but unconfirmed. If a send answers "already known" or "nonce
+too low" (after a failover, another endpoint may have taken the transaction), the faucet logs a WARN and keeps the
+record as unconfirmed instead of releasing it. So a pass never funds the same need twice,
 and neither do the passes after it, until the window ends.
 
 ## Identifier ledger

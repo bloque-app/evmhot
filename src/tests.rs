@@ -4259,3 +4259,74 @@ async fn test_get_logs_5xx_on_a_wide_range_bisects_after_backoff() {
     monitor.catch_up_once().await.unwrap();
     assert_eq!(db.get_last_processed_block(TEST_CHAIN).unwrap(), 21);
 }
+
+/// After a failover endpoint A may have accepted the top-up and B answers
+/// "already known" / "nonce too low": the reservation stays (unconfirmed), a
+/// WARN is logged, and the next call does not broadcast again.
+#[tokio::test]
+async fn test_faucet_keeps_the_reservation_when_the_send_says_already_known() {
+    for answer in ["already known", "nonce too low: next nonce 5, tx nonce 4"] {
+        let logs = LogBuf::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let rpc_server = MockServer::start().await;
+        mount_faucet_gas_mocks(&rpc_server).await;
+        for (m, result) in [
+            ("eth_getBalance", json!("0x0DE0B6B3A7640000")),
+            ("eth_getTransactionCount", json!("0x0")),
+        ] {
+            Mock::given(method("POST"))
+                .and(body_json_contains(m))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": 1, "result": result
+                })))
+                .mount(&rpc_server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(body_json_contains("eth_sendRawTransaction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": answer}
+            })))
+            .mount(&rpc_server)
+            .await;
+
+        let faucet = Faucet::new(
+            "test test test test test test test test test test test junk".to_string(),
+            http_provider_boxed(&rpc_server.uri()),
+            "10000000000000000",
+        )
+        .unwrap();
+        let wallet =
+            Wallet::new("test test test test test test test test test test test junk".to_string());
+        let to = wallet.derive_address(1).unwrap().to_string();
+
+        let first = faucet.fund_new_address(&to).await.unwrap_err();
+        assert!(
+            first.to_string().contains("faucet top-up pending"),
+            "{first}"
+        );
+        let second = faucet.fund_new_address(&to).await.unwrap_err();
+        assert!(
+            second.to_string().contains("faucet top-up pending"),
+            "{second}"
+        );
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains("WARN") && text.contains("may have been accepted"),
+            "{text}"
+        );
+        let sends = rpc_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| String::from_utf8_lossy(&r.body).contains("eth_sendRawTransaction"))
+            .count();
+        assert_eq!(sends, 1, "{answer}");
+    }
+}

@@ -160,9 +160,35 @@ impl Faucet {
                 Ok(p) => p,
                 Err(e) => {
                     drop(provider);
-                    error!("Faucet send failed, resetting nonce cache: {e}");
-                    self.sent.lock().unwrap().remove(&to);
+                    // After a failover, one endpoint may have taken the
+                    // transaction and the next one says so ("already known",
+                    // "nonce too low"). The top-up may be on its way: keep the
+                    // reservation as unconfirmed rather than funding again.
+                    let text = e.to_string().to_ascii_lowercase();
+                    let maybe_sent =
+                        text.contains("already known") || text.contains("nonce too low");
+                    if maybe_sent {
+                        warn!(
+                            "Faucet send to {to_address} answered \"{e}\": an earlier attempt may have been accepted, holding the top-up as unconfirmed"
+                        );
+                        self.sent.lock().unwrap().insert(
+                            to,
+                            Sent {
+                                hash: None,
+                                at: Instant::now(),
+                                confirmed: false,
+                            },
+                        );
+                    } else {
+                        error!("Faucet send failed, resetting nonce cache: {e}");
+                        self.sent.lock().unwrap().remove(&to);
+                    }
                     *self.provider.write().await = Self::build_provider(&self.root, &self.wallet);
+                    if maybe_sent {
+                        return Err(anyhow::anyhow!(
+                            "faucet top-up pending: sending to {to_address} answered \"{e}\"; it may already be in flight"
+                        ));
+                    }
                     return Err(e.into());
                 }
             };

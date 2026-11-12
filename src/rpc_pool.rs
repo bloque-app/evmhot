@@ -52,6 +52,21 @@ fn classify_text(msg: &str) -> Option<Refusal> {
     let s = msg.to_ascii_lowercase();
     // Reverts and execution errors ("transfer amount exceeds balance", "exceeds
     // block gas limit") match none of these on purpose: they never fail over.
+    // Range and size phrases come first: some nodes wrap them in a rate-limit
+    // code or text. "invalid block range" (from > to) is a bad request, not a
+    // limit.
+    if !s.contains("invalid")
+        && (s.contains("block range")
+            || s.contains("blocks range")
+            || s.contains("range too large")
+            || s.contains("range is too large")
+            || s.contains("query returned more than")
+            || s.contains("response size exceeded")
+            || s.contains("limited to 0 -")
+            || s.contains("ranges over"))
+    {
+        return Some(Refusal::RangeRefused);
+    }
     if s.contains("rate limit")
         || s.contains("rate-limit")
         || s.contains("too many requests")
@@ -59,26 +74,27 @@ fn classify_text(msg: &str) -> Option<Refusal> {
     {
         return Some(Refusal::RateLimited);
     }
-    if s.contains("block range")
-        || s.contains("blocks range")
-        || s.contains("range too large")
-        || s.contains("range is too large")
-        || s.contains("query returned more than")
-        || s.contains("response size exceeded")
-        || s.contains("limited to 0 -")
-        || s.contains("ranges over")
-        || s.contains("-block range")
-        || s.contains("up to a")
+    if s.contains("not available on this plan")
+        || s.contains("method not available")
+        || s.contains("method not found")
+        || s.contains("not supported")
     {
-        return Some(Refusal::RangeRefused);
-    }
-    if s.contains("not available on this plan") || s.contains("method not available") {
         return Some(Refusal::MethodUnavailable);
     }
     if s.contains("archive requests") || s.contains("personal token") {
         return Some(Refusal::Transient);
     }
     None
+}
+
+/// A JSON-RPC error. Code -32005 ("limit exceeded") is a rate limit only when
+/// the message names no range or size: Infura sends "query returned more than
+/// 10000 results" under it.
+fn classify_payload(code: i64, message: &str) -> Option<Refusal> {
+    match classify_text(message) {
+        None if code == -32005 => Some(Refusal::RateLimited),
+        other => other,
+    }
 }
 
 /// Classifies a transport-level error. `None` means the call itself was bad
@@ -94,13 +110,7 @@ pub fn classify(err: &TransportError) -> Option<Refusal> {
         RpcError::Transport(TransportErrorKind::Custom(_)) => Some(Refusal::Transient),
         RpcError::Transport(TransportErrorKind::BackendGone) => Some(Refusal::Transient),
         RpcError::DeserError { .. } => Some(Refusal::Transient),
-        RpcError::ErrorResp(p) => {
-            if p.code == -32005 {
-                Some(Refusal::RateLimited)
-            } else {
-                classify_text(&p.message)
-            }
-        }
+        RpcError::ErrorResp(p) => classify_payload(p.code, &p.message),
         _ => None,
     }
 }
@@ -250,13 +260,9 @@ async fn execute(pool: Arc<Pool>, req: RequestPacket) -> Result<ResponsePacket, 
         let mut http = ep.http.clone();
         let result = http.call(req.clone()).await;
         let refusal = match &result {
-            Ok(resp) => resp.as_error().and_then(|p| {
-                if p.code == -32005 {
-                    Some(Refusal::RateLimited)
-                } else {
-                    classify_text(&p.message)
-                }
-            }),
+            Ok(resp) => resp
+                .as_error()
+                .and_then(|p| classify_payload(p.code, &p.message)),
             Err(e) => classify(e),
         };
         let Some(refusal) = refusal else {
@@ -550,5 +556,86 @@ mod tests {
         let p = provider(&[&a, &b], Duration::from_secs(30));
         assert!(p.get_block_number().await.is_err());
         assert_eq!(hits(&b).await, 0);
+    }
+
+    #[test]
+    fn code_32005_is_a_rate_limit_only_without_a_range_or_size_phrase() {
+        use Refusal::*;
+        assert_eq!(
+            classify_payload(-32005, "query returned more than 10000 results"),
+            Some(RangeRefused)
+        );
+        assert_eq!(
+            classify_payload(-32005, "query exceeds max block range 100000"),
+            Some(RangeRefused)
+        );
+        assert_eq!(
+            classify_payload(-32005, "limit exceeded"),
+            Some(RateLimited)
+        );
+        assert_eq!(
+            classify_payload(-32005, "daily request count exceeded"),
+            Some(RateLimited)
+        );
+        // Range phrases win over rate-limit text too.
+        assert_eq!(
+            classify_payload(
+                -32000,
+                "rate limit: ranges over 10000 blocks are not supported"
+            ),
+            Some(RangeRefused)
+        );
+    }
+
+    #[test]
+    fn invalid_block_range_is_a_bad_request_not_a_limit() {
+        assert_eq!(classify_text("invalid block range params"), None);
+        assert_eq!(classify_text("invalid block range: from > to"), None);
+        assert_eq!(
+            classify_text("up to a 10 block range"),
+            Some(Refusal::RangeRefused)
+        );
+        // "up to a" alone is not enough.
+        assert_eq!(classify_text("you may batch up to a hundred calls"), None);
+    }
+
+    #[tokio::test]
+    async fn a_missing_method_fails_over_and_cools_that_method_only() {
+        for msg in [
+            "the method eth_getLogs does not exist: method not found",
+            "method not available",
+            "eth_getLogs is not supported",
+        ] {
+            let a = serve(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":msg}
+            })))
+            .await;
+            let b = serve(ok_block_number()).await;
+            let p = provider(&[&a, &b], Duration::from_secs(30));
+            for _ in 0..4 {
+                assert_eq!(p.get_block_number().await.unwrap(), 42, "{msg}");
+            }
+            assert_eq!(hits(&a).await, 1, "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_32005_size_refusal_fails_over_and_is_not_a_rate_limit() {
+        let a = serve(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":0,
+            "error":{"code":-32005,"message":"query returned more than 10000 results"}
+        })))
+        .await;
+        let b = serve(ok_block_number()).await;
+        let p = provider(&[&a, &b], Duration::from_secs(30));
+        for _ in 0..4 {
+            assert_eq!(p.get_block_number().await.unwrap(), 42);
+        }
+        // No cooldown for a range refusal: it is offered the call whenever it is first in turn.
+        assert!(hits(&a).await >= 2);
+        // Alone, the error that comes back is a range refusal, so the monitor bisects.
+        let only = provider(&[&a], Duration::from_secs(30));
+        let err: anyhow::Error = only.get_block_number().await.unwrap_err().into();
+        assert!(!is_rate_limited(&err));
     }
 }
