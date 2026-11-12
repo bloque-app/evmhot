@@ -46,10 +46,11 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         tracing::info!(
-            "Chain: {} (id={}) rpc={} treasury={}",
+            "Chain: {} (id={}) rpc={} (+{} more) treasury={}",
             chain.name,
             chain.chain_id,
             chain.rpc_url,
+            chain.rpc_urls.len() - 1,
             chain.treasury_address
         );
     }

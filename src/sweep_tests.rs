@@ -3542,6 +3542,15 @@ fn a_faucet_receipt_timeout_is_a_transient_funding_error() {
     ));
 }
 
+#[test]
+fn a_pending_faucet_top_up_is_a_transient_funding_error() {
+    // `ensure_gas` returns the faucet's error as is, so a top-up still pending
+    // makes the sweep wait for the next pass; it never funds again in between.
+    assert!(crate::sweeper::is_transient_funding_error_for_tests(
+        "faucet top-up pending: 0xabc was sent to 0xdef recently; not funding it again yet"
+    ));
+}
+
 #[tokio::test]
 async fn deposits_without_a_sender_are_reserved_in_the_same_pass() {
     // 100 is owed to a deposit with no recorded sender (it goes to review), 200 to

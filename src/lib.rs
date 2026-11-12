@@ -6,6 +6,7 @@ pub mod gapscan;
 mod monitor;
 pub mod redb_import;
 pub mod redb_store;
+pub mod rpc_pool;
 pub mod sqlite_import;
 mod sweeper;
 pub mod traits;
@@ -27,7 +28,7 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
-use alloy::providers::{ProviderBuilder, RootProvider};
+use alloy::providers::RootProvider;
 use alloy::transports::BoxTransport;
 use config::{ChainConfig, Config};
 use db::Db;
@@ -335,8 +336,7 @@ impl HotWalletService {
 
         let mut chains = Vec::with_capacity(config.chains.len());
         for chain_cfg in &config.chains {
-            let provider = ProviderBuilder::new()
-                .on_builtin(&chain_cfg.rpc_url)
+            let provider = crate::rpc_pool::connect_provider(&chain_cfg.rpc_urls)
                 .await
                 .map_err(|e| {
                     anyhow::anyhow!(

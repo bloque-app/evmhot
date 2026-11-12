@@ -25,7 +25,7 @@ use crate::monitor::{transfer_amount, Monitor};
 use crate::webhook::WebhookDeliverer;
 use alloy::eips::BlockId;
 use alloy::primitives::{address, keccak256, Address, B256, U256};
-use alloy::providers::{Provider, ProviderBuilder, RootProvider};
+use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::{Filter, Log, TransactionRequest};
 use alloy::sol;
 use alloy::sol_types::SolCall;
@@ -900,8 +900,7 @@ pub async fn run(config: &Config, db: &Db, opts: &RunOptions) -> Result<Vec<Chai
     let deliverer = Arc::new(WebhookDeliverer::new(db.clone(), config)?);
     let mut reports = Vec::new();
     for chain in &chains {
-        let provider = ProviderBuilder::new()
-            .on_builtin(&chain.rpc_url)
+        let provider = crate::rpc_pool::connect_provider(&chain.rpc_urls)
             .await
             .map_err(|e| anyhow!("connecting to {} at {}: {e}", chain.name, chain.rpc_url))?;
         let mut report = scan_chain(db, chain, &provider, &regs, &opts.scan).await?;

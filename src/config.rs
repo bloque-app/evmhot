@@ -149,7 +149,14 @@ pub fn next_sweep_part(
 pub struct ChainConfigRaw {
     pub name: String,
     pub chain_id: u64,
-    pub rpc_url: String,
+    /// One endpoint. Optional when `rpc_urls` is given; when both are, this one
+    /// comes first in the pool.
+    #[serde(default)]
+    pub rpc_url: Option<String>,
+    /// A pool of endpoints for reads to rotate or fail over across (amendment
+    /// 0006). http(s) only when there is more than one.
+    #[serde(default)]
+    pub rpc_urls: Vec<String>,
     pub treasury_address: String,
     pub faucet_address: String,
     #[serde(default = "default_existential_deposit")]
@@ -191,6 +198,9 @@ pub struct ChainConfigRaw {
     pub block_fetch_concurrency: u64,
 }
 
+/// The smallest `block_offset_from_head` allowed with more than one RPC endpoint.
+pub const MIN_POOL_BLOCK_OFFSET: u64 = 10;
+
 fn default_existential_deposit() -> String {
     "10000000000000000".to_string()
 }
@@ -229,7 +239,10 @@ struct ChainsFile {
 pub struct ChainConfig {
     pub name: String,
     pub chain_id: u64,
+    /// The first endpoint of the pool.
     pub rpc_url: String,
+    /// Every endpoint, `rpc_url` first, without repeats.
+    pub rpc_urls: Vec<String>,
     pub treasury_address: String,
     pub faucet_address: String,
     pub existential_deposit: String,
@@ -622,10 +635,36 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
             &token_targets,
         )?;
 
+        let mut rpc_urls: Vec<String> = Vec::new();
+        for u in raw.rpc_url.iter().chain(raw.rpc_urls.iter()) {
+            let u = u.trim().to_string();
+            if !u.is_empty() && !rpc_urls.contains(&u) {
+                rpc_urls.push(u);
+            }
+        }
+        if rpc_urls.is_empty() {
+            return Err(anyhow::anyhow!(
+                "chain '{}': set rpc_url or rpc_urls",
+                raw.name
+            ));
+        }
+        // Endpoints in a pool can sit at different heights: the head comes from
+        // one, the blocks and logs from another. The offset keeps what is read
+        // behind what every endpoint has.
+        if rpc_urls.len() > 1 && raw.block_offset_from_head < MIN_POOL_BLOCK_OFFSET {
+            return Err(anyhow::anyhow!(
+                "chain '{}': {} RPC endpoints are configured, so block_offset_from_head must be at least {} (it is {}): endpoints lag one another, and a block read from a lagging endpoint can come back missing or with empty logs",
+                raw.name,
+                rpc_urls.len(),
+                MIN_POOL_BLOCK_OFFSET,
+                raw.block_offset_from_head
+            ));
+        }
         chains.push(ChainConfig {
             name: raw.name,
             chain_id: raw.chain_id,
-            rpc_url: raw.rpc_url,
+            rpc_url: rpc_urls[0].clone(),
+            rpc_urls,
             treasury_address: raw.treasury_address,
             faucet_address: raw.faucet_address,
             existential_deposit: raw.existential_deposit,
@@ -836,6 +875,78 @@ min_deposit_native = "1000"
         assert_eq!(chains[1].name, "polygon");
         assert_eq!(chains[1].min_deposits.native, U256::from(1000u64));
         assert!(chains[1].is_token_allowed("0xc2132d05d31c914a87c6611c10748aeb04b58e8f"));
+    }
+
+    fn chain_with(rpc_lines: &str) -> String {
+        format!(
+            r#"
+[[chains]]
+name = "polygon"
+chain_id = 137
+{rpc_lines}
+treasury_address = "0x2222222222222222222222222222222222222222"
+faucet_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+allowed_token_addresses = ["0xc2132d05d31c914a87c6611c10748aeb04b58e8f"]
+"#
+        )
+    }
+
+    /// REQ-CF-1: `rpc_urls` is a known key; `rpc_url` stays first.
+    #[test]
+    fn test_rpc_urls_loads_with_rpc_url_first() {
+        let chains = parse_chains_toml(&chain_with(
+            "rpc_url = \"https://a.example\"\nrpc_urls = [\"https://b.example\", \"https://a.example\", \"https://c.example\"]",
+        ))
+        .unwrap();
+        assert_eq!(chains[0].rpc_url, "https://a.example");
+        assert_eq!(
+            chains[0].rpc_urls,
+            vec![
+                "https://a.example",
+                "https://b.example",
+                "https://c.example"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_pool_needs_a_block_offset_of_at_least_ten() {
+        let pool = "rpc_url = \"https://a.example\"\nrpc_urls = [\"https://b.example\"]";
+        // The default (20) is fine.
+        assert!(parse_chains_toml(&chain_with(pool)).is_ok());
+        let err = parse_chains_toml(&chain_with(&format!("{pool}\nblock_offset_from_head = 3")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("block_offset_from_head") && err.contains("lag"),
+            "{err}"
+        );
+        assert!(
+            parse_chains_toml(&chain_with(&format!("{pool}\nblock_offset_from_head = 10"))).is_ok()
+        );
+        // One endpoint: no floor.
+        assert!(parse_chains_toml(&chain_with(
+            "rpc_url = \"https://a.example\"\nblock_offset_from_head = 0"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn test_rpc_urls_alone_and_rpc_url_alone_load() {
+        let only_list =
+            parse_chains_toml(&chain_with("rpc_urls = [\"https://b.example\"]")).unwrap();
+        assert_eq!(only_list[0].rpc_url, "https://b.example");
+        let only_one = parse_chains_toml(&chain_with("rpc_url = \"https://a.example\"")).unwrap();
+        assert_eq!(only_one[0].rpc_urls, vec!["https://a.example"]);
+    }
+
+    #[test]
+    fn test_no_rpc_endpoint_is_refused_and_unknown_key_still_is() {
+        assert!(parse_chains_toml(&chain_with("")).is_err());
+        assert!(parse_chains_toml(&chain_with(
+            "rpc_url = \"https://a.example\"\nrpc_ulrs = [\"x\"]"
+        ))
+        .is_err());
     }
 
     #[test]

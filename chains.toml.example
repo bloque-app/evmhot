@@ -65,6 +65,8 @@ min_deposit_native = "0"
 name = "polygon"
 chain_id = 137
 rpc_url = "https://polygon-mainnet.g.alchemy.com/v2/YOUR_POLYGON_KEY"
+# Optional: more endpoints. Reads fail over to them on 429, 403, 5xx, or a method/range refusal (http(s) only).
+# rpc_urls = ["https://polygon-bor-rpc.publicnode.com"]
 treasury_address = "0x2222222222222222222222222222222222222222"
 faucet_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
 existential_deposit = "10000000000000000"

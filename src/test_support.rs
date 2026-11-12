@@ -26,10 +26,12 @@ pub fn test_webhook_deliverer_fast(db: Db) -> Arc<WebhookDeliverer> {
 }
 
 pub fn test_chain_config(rpc_url: impl Into<String>) -> ChainConfig {
+    let rpc_url: String = rpc_url.into();
     ChainConfig {
         name: TEST_CHAIN.to_string(),
         chain_id: 137,
-        rpc_url: rpc_url.into(),
+        rpc_url: rpc_url.clone(),
+        rpc_urls: vec![rpc_url],
         treasury_address: TEST_TREASURY.to_string(),
         faucet_address: TEST_FAUCET.to_string(),
         existential_deposit: TEST_EXISTENTIAL.to_string(),
