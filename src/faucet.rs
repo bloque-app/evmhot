@@ -24,6 +24,20 @@ type FaucetProvider = FillProvider<
 /// How long a top-up that was broadcast but not seen confirmed blocks a second
 /// top-up for the same address.
 const UNCONFIRMED_HOLD: Duration = Duration::from_secs(600);
+/// How long a confirmed top-up does. A node that lags the one that confirmed it
+/// can still show the old balance; a second top-up for the same need would be a
+/// double fund. Passes in this window wait ("faucet top-up pending").
+const CONFIRMED_HOLD: Duration = Duration::from_secs(120);
+
+/// A top-up this faucet sent to an address. `hash` is `None` while the
+/// transaction is being sent (the reservation that keeps two concurrent calls
+/// from both funding).
+#[derive(Clone, Copy)]
+struct Sent {
+    hash: Option<TxHash>,
+    at: Instant,
+    confirmed: bool,
+}
 
 pub struct Faucet {
     root: RootProvider<BoxTransport>,
@@ -31,9 +45,9 @@ pub struct Faucet {
     faucet_address: Address,
     existential_deposit: U256,
     provider: RwLock<FaucetProvider>,
-    /// Top-ups that were broadcast but whose receipt could not be read (amendment
-    /// 0006: once `send_transaction` succeeds, the top-up is sent).
-    unconfirmed: Mutex<HashMap<Address, (TxHash, Instant)>>,
+    /// Every top-up sent, confirmed or not, per address (amendment 0006: once
+    /// `send_transaction` succeeds, the top-up is sent). In process only.
+    sent: Mutex<HashMap<Address, Sent>>,
 }
 
 impl Faucet {
@@ -55,7 +69,7 @@ impl Faucet {
             faucet_address,
             existential_deposit,
             provider,
-            unconfirmed: Mutex::new(HashMap::new()),
+            sent: Mutex::new(HashMap::new()),
         })
     }
 
@@ -90,24 +104,55 @@ impl Faucet {
             ));
         }
 
+        // A top-up already sent to this address: wait for it, do not send
+        // another because a balance read still looks low. Checked and reserved
+        // in one step so two concurrent calls cannot both fund.
+        let earlier = {
+            let mut sent = self.sent.lock().unwrap();
+            let earlier = sent.get(&to).copied();
+            let blocking = earlier.is_some_and(|s| {
+                s.at.elapsed()
+                    < if s.confirmed {
+                        CONFIRMED_HOLD
+                    } else {
+                        UNCONFIRMED_HOLD
+                    }
+            });
+            if !blocking {
+                sent.insert(
+                    to,
+                    Sent {
+                        hash: None,
+                        at: Instant::now(),
+                        confirmed: false,
+                    },
+                );
+            }
+            blocking.then_some(earlier).flatten()
+        };
+        if let Some(s) = earlier {
+            // Still unconfirmed: it may have landed since. It still counts as
+            // recent, but is no longer in doubt.
+            if let (false, Some(hash)) = (s.confirmed, s.hash) {
+                if matches!(self.root.get_transaction_receipt(hash).await, Ok(Some(_))) {
+                    if let Some(e) = self.sent.lock().unwrap().get_mut(&to) {
+                        e.confirmed = true;
+                    }
+                }
+            }
+            let what = s
+                .hash
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "a top-up".into());
+            return Err(anyhow::anyhow!(
+                "faucet top-up pending: {what} was sent to {to_address} recently; not funding it again yet"
+            ));
+        }
+
         let tx = TransactionRequest::default()
             .with_from(self.faucet_address)
             .with_to(to)
             .with_value(self.existential_deposit);
-
-        // A top-up broadcast earlier whose receipt we could not read: do not
-        // send a second one while the first may still land.
-        let earlier = self.unconfirmed.lock().unwrap().get(&to).copied();
-        if let Some((hash, at)) = earlier {
-            let landed = matches!(self.root.get_transaction_receipt(hash).await, Ok(Some(_)));
-            if landed || at.elapsed() > UNCONFIRMED_HOLD {
-                self.unconfirmed.lock().unwrap().remove(&to);
-            } else {
-                return Err(anyhow::anyhow!(
-                    "faucet top-up pending: {hash} was sent to {to_address} and is not confirmed yet"
-                ));
-            }
-        }
 
         let receipt = {
             let provider = self.provider.read().await;
@@ -116,16 +161,30 @@ impl Faucet {
                 Err(e) => {
                     drop(provider);
                     error!("Faucet send failed, resetting nonce cache: {e}");
+                    self.sent.lock().unwrap().remove(&to);
                     *self.provider.write().await = Self::build_provider(&self.root, &self.wallet);
                     return Err(e.into());
                 }
             };
             let sent_hash = *pending.tx_hash();
+            self.sent.lock().unwrap().insert(
+                to,
+                Sent {
+                    hash: Some(sent_hash),
+                    at: Instant::now(),
+                    confirmed: false,
+                },
+            );
             // alloy 0.1 has no receipt timeout: bound the wait so one stuck top-up
             // cannot freeze the sweeper.
             let waited = tokio::time::timeout(Duration::from_secs(60), pending.get_receipt()).await;
             match waited {
-                Ok(Ok(receipt)) => receipt,
+                Ok(Ok(receipt)) => {
+                    if let Some(e) = self.sent.lock().unwrap().get_mut(&to) {
+                        e.confirmed = true;
+                    }
+                    receipt
+                }
                 other => {
                     // The transaction went out, so the top-up counts as sent. The
                     // nonce cache may be stale; rebuild it. The caller re-checks
@@ -139,10 +198,6 @@ impl Faucet {
                         "Faucet top-up of {to_address} was broadcast as {sent_hash} but its receipt could not be read ({why}); counting it as sent"
                     );
                     *self.provider.write().await = Self::build_provider(&self.root, &self.wallet);
-                    self.unconfirmed
-                        .lock()
-                        .unwrap()
-                        .insert(to, (sent_hash, Instant::now()));
                     return Ok(sent_hash.to_string());
                 }
             }

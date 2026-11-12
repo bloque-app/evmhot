@@ -16,7 +16,7 @@ yet are marked **(not built)**, and `PLAN.md` §4 names the feature that builds 
 | Version | Date | Change |
 |---|---|---|
 | 0.1.0 | 2026-11-09 | The service as it ran: registration, detection, sweeps, faucet, webhooks, store, API |
-| 0.2.5 | 2026-11-12 | Amendment 0006: `rpc_urls` pool with failover, backoff on rate limits instead of discarding a chunk, a faucet top-up that was sent is sent |
+| 0.2.5 | 2026-11-12 | Amendment 0006: `rpc_urls` pool with failover, backoff on rate limits instead of discarding a chunk, no skipping a block a lagging endpoint reports missing, a faucet top-up that was sent is sent |
 | 0.2.4 | 2026-11-09 | Amendment 0005: a second delivery of `deposit_swept` to a target's notify URL; the published `deposit_swept` contract |
 | 0.2.3 | 2026-11-09 | Amendment 0004: sweep intents before broadcast, review states, one sweep per transfer, alerts, `sweep_target` |
 | 0.2.2 | 2026-11-09 | Amendment 0003: the `hold` target kind; `sweeps` in `deposit_swept` |
@@ -151,40 +151,12 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   log query per range, splitting a range the provider refuses, while still fetching every block for native
   deposits. The outcome MUST equal block-by-block processing.
 - `REQ-DT-6` Processing a block twice records nothing new (`INV-2`).
-- `REQ-DT-9` A network with no stored cursor starts at the current detection height. Deposits made before that are
-  not detected.
-- `REQ-DT-10` **Withdrawn by amendment 0001.** In 0.1.0 a token transfer whose symbol was longer than five characters
-  was dropped before it was stored: no deposit, no webhook. A token whose `symbol()` call failed was named `UNKNOWN`
-  and dropped the same way. Admission is by contract address only (`REQ-DT-2`); the symbol is metadata.
-
-### 6.2 Sweeps
-
-- `REQ-SW-1` In 0.1.0 a sweep moves the deposit address's **whole** balance of the token, not the deposit's amount.
-  Several deposits of one token to one address can therefore be settled by one sweep; each of them is then marked swept
-  by that sweep. `REQ-SW-12` overrides this for targets that need a refund address.
-- `REQ-SW-2` A sweep goes to the token's sweep target on that network. A token with no target of its own uses the
-  network's default target. The native coin always uses the default target.
-- `REQ-SW-3` A token deposit whose address holds a zero balance of the token is retried for 10 passes and then marked
-  swept with no sweep transaction. Native deposits have no such rule. It applies only to a group with no recorded sweep
-  and no intent other than a failed, dropped or closed-by-operator one; when it settles a deposit whose keys have any
-  intent history it raises `settled_without_sweep` (amendment 0004).
-- `REQ-SW-4` A sweep that fails with a funding error waits for the faucet and is retried. A token sweep that fails
-  otherwise counts the failure; after 5 consecutive failures, or at once on a decoding error, the deposit is recorded as
-  failed and can be retried by an operator. A native sweep estimates its gas; a failed estimate or a revert counts toward the same 5 failures, and the
-  fifth sends the native deposits to review (`native_sweep_failed`) (amendment 0004).
-- `REQ-SW-11` A native sweep sends the balance minus the cost of 21,000 gas at the current maximum fee plus 10%. A
-  balance at or below that cost is not swept.
-- `REQ-SW-5` A deposit MUST be marked swept only after its sweep's receipt shows success. A reverted
-  sweep is recorded as failed.
-
-### 6.3 Gas
-
-- `REQ-FC-1` Before a sweep, the sweeper checks the deposit address's native balance against the gas the sweep needs,
-  and asks the faucet to top it up if short.
-- `REQ-FC-2` A faucet with too little balance makes sweeps wait; it never marks a deposit swept.
-- `REQ-FC-3` Once the faucet's transaction is broadcast, the top-up counts as sent. If its receipt cannot be read, the
-  faucet logs the hash and returns it as funded but unconfirmed; the sweeper re-checks the balance on its next pass,
-  and no second top-up is sent for that address while the first is unconfirmed. (Amendment 0006.)
+- `REQ-DT-9` A block fetch or `eth_getLogs` that fails with a 429, 401-404, 413, 5xx or transport error is retried with
+  a wait of 0.5 s doubling to 8 s (6 attempts) before the chunk fails. A `null` block at or below the head is an
+  error, retried the same way: the cursor never passes a block that was not read. A range is bisected for a range or
+  size error, and for a 5xx or timeout once the backoff is spent, never for a 429. A lagging endpoint may still answer
+  empty logs for blocks it lacks; the offset floor makes that unlikely, and F-002b's two-node agreement answers it.
+  (Amendment 0006.)
 
 ### 6.4 Sweep targets (amendment 0001)
 
@@ -293,9 +265,11 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   service receives bezent's Safe sweeps this way (R12). (Amendment 0005.)
 - `REQ-CF-1` A `[[chains]]` table with a key evmhot does not know MUST be refused at load, so configuration never
   claims behaviour the binary lacks. `rpc_urls` is a known key. (Amendment 0005, 0006.)
-- `REQ-CF-2` A chain MAY list several RPC endpoints (`rpc_url` first, then `rpc_urls`). A call moves to the next
-  endpoint on a 429, 403, 5xx, transport error, or a refusal of the method, range or size; an endpoint that answered
-  429 cools down for a few seconds. (Amendment 0006.)
+- `REQ-CF-2` A chain MAY list several RPC endpoints (`rpc_url` first, then `rpc_urls`); with several, 
+  `block_offset_from_head` MUST be at least 10. A call moves to the next endpoint on a 429, 401-404, 413, 5xx, transport
+  error (30 s request timeout), or a refusal of the method, range or size; a revert never fails over. An endpoint that
+  answered 429 cools down for 10 s; one that answered 401-404 or 413 for 60 s. A chain with one URL has no failover but
+  is subject to `REQ-DT-9` all the same. (Amendment 0006.)
 - `REQ-WH-11` The token `deposit_swept` body is published as a versioned contract in `contracts/deposit_swept/`
   (JSON Schema, fixtures, changelog); a test checks the payload evmhot builds against it. Consumers ignore unknown
   fields; an additive change bumps the minor version. (Amendment 0005.)

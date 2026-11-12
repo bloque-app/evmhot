@@ -4078,3 +4078,184 @@ async fn test_get_logs_429_backs_off_and_does_not_bisect() {
     );
     assert_eq!(db.get_last_processed_block(TEST_CHAIN).unwrap(), 1);
 }
+
+/// Amendment 0006, REQ-FC-3: a confirmed top-up is remembered too. A lagging
+/// node still shows the old balance on the next pass; that is no reason to send
+/// a second top-up for the same need.
+#[tokio::test]
+async fn test_faucet_does_not_fund_the_same_address_twice_after_a_confirmed_top_up() {
+    let rpc_server = MockServer::start().await;
+    mount_faucet_gas_mocks(&rpc_server).await;
+    for (m, result) in [
+        ("eth_getBalance", json!("0x0DE0B6B3A7640000")),
+        ("eth_getTransactionCount", json!("0x0")),
+    ] {
+        Mock::given(method("POST"))
+            .and(body_json_contains(m))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "result": result
+            })))
+            .mount(&rpc_server)
+            .await;
+    }
+    let tx_hash = "0x0000000000000000000000000000000000000000000000000000000000000001";
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_sendRawTransaction"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": tx_hash
+        })))
+        .mount(&rpc_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getTransactionReceipt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(faucet_receipt_response(tx_hash)))
+        .mount(&rpc_server)
+        .await;
+
+    let faucet = Faucet::new(
+        "test test test test test test test test test test test junk".to_string(),
+        http_provider_boxed(&rpc_server.uri()),
+        "10000000000000000",
+    )
+    .unwrap();
+    let wallet =
+        Wallet::new("test test test test test test test test test test test junk".to_string());
+    let to = wallet.derive_address(1).unwrap().to_string();
+    let other = wallet.derive_address(2).unwrap().to_string();
+
+    assert_eq!(faucet.fund_new_address(&to).await.unwrap(), tx_hash);
+    let err = faucet.fund_new_address(&to).await.unwrap_err();
+    assert!(err.to_string().contains("faucet top-up pending"), "{err}");
+    // Another address is not held back.
+    assert_eq!(faucet.fund_new_address(&other).await.unwrap(), tx_hash);
+    let sends = rpc_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| String::from_utf8_lossy(&r.body).contains("eth_sendRawTransaction"))
+        .count();
+    assert_eq!(sends, 2);
+}
+
+/// A lagging endpoint answers `null` for a block at or below the head. The
+/// monitor retries it and never moves the cursor past it.
+#[tokio::test]
+async fn test_null_block_below_head_is_retried_and_never_skipped() {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    crate::monitor::RPC_BACKOFF_BASE_MS.store(1, std::sync::atomic::Ordering::Relaxed);
+
+    // `null_for_block_5`: how many times block 5 answers null before it exists.
+    async fn run(null_times: usize) -> (Result<(), String>, u64) {
+        let rpc_server = MockServer::start().await;
+        let db_file = NamedTempFile::new().unwrap();
+        let mut config = test_config_with_allowlist(HashSet::new());
+        config.database_url = db_file.path().to_str().unwrap().to_string();
+        config.chains[0].rpc_url = rpc_server.uri();
+        let db = Db::new(&config.database_url).unwrap();
+        db.set_last_processed_block(TEST_CHAIN, 3).unwrap();
+        let nulls = std::sync::Arc::new(AtomicUsize::new(0));
+        let nulls_in = nulls.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let result = match body["method"].as_str().unwrap() {
+                    "eth_blockNumber" => json!("0x8"),
+                    "eth_getBlockByNumber" if body["params"][0] == "0x5" => {
+                        if nulls_in.fetch_add(1, Ordering::SeqCst) < null_times {
+                            serde_json::Value::Null
+                        } else {
+                            empty_block_rpc_response()["result"].clone()
+                        }
+                    }
+                    "eth_getBlockByNumber" => empty_block_rpc_response()["result"].clone(),
+                    "eth_getLogs" => json!([]),
+                    other => panic!("unexpected rpc method {other}"),
+                };
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+            })
+            .mount(&rpc_server)
+            .await;
+        let monitor = Monitor::new(
+            config.chains[0].clone(),
+            test_webhook_deliverer(db.clone()),
+            db.clone(),
+            http_provider_boxed(&rpc_server.uri()),
+        );
+        let r = monitor.catch_up_once().await.map_err(|e| e.to_string());
+        (r, db.get_last_processed_block(TEST_CHAIN).unwrap())
+    }
+
+    // Null twice, then the block: read, cursor reaches the head.
+    let (ok, cursor) = run(2).await;
+    ok.unwrap();
+    assert_eq!(cursor, 8);
+    // Null forever: an error, and the cursor stops before block 5.
+    let (err, cursor) = run(usize::MAX).await;
+    assert!(err.unwrap_err().contains("not available"));
+    assert_eq!(cursor, 4);
+}
+
+/// A 5xx on a wide `eth_getLogs` range, after the backoff budget, is how free
+/// nodes refuse an oversized range: it is split. (A 429 is not: see
+/// `test_get_logs_429_backs_off_and_does_not_bisect`.)
+#[tokio::test]
+async fn test_get_logs_5xx_on_a_wide_range_bisects_after_backoff() {
+    use std::collections::HashSet;
+    crate::monitor::RPC_BACKOFF_BASE_MS.store(1, std::sync::atomic::Ordering::Relaxed);
+
+    let rpc_server = MockServer::start().await;
+    let db_file = NamedTempFile::new().unwrap();
+    let allowed_token = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+    let mut allowlist = HashSet::new();
+    allowlist.insert(allowed_token.to_lowercase());
+    let mut config = test_config_with_allowlist(allowlist);
+    config.database_url = db_file.path().to_str().unwrap().to_string();
+    config.chains[0].rpc_url = rpc_server.uri();
+    config.chains[0].get_logs_max_retries = 1;
+    config.chains[0].get_logs_delay_ms = 1;
+    let db = Db::new(&config.database_url).unwrap();
+    db.set_last_processed_block(TEST_CHAIN, 1).unwrap();
+
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_blockNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1, "result": "0x15"
+        })))
+        .mount(&rpc_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getBlockByNumber"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_block_rpc_response()))
+        .mount(&rpc_server)
+        .await;
+    // Anything wider than 11 blocks gets a 502; narrower ranges answer.
+    Mock::given(method("POST"))
+        .and(body_json_contains("eth_getLogs"))
+        .respond_with(|req: &wiremock::Request| {
+            let b: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let hex = |v: &serde_json::Value| {
+                u64::from_str_radix(v.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
+            };
+            let f = &b["params"][0];
+            if hex(&f["toBlock"]) - hex(&f["fromBlock"]) >= 11 {
+                ResponseTemplate::new(502).set_body_string("bad gateway")
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": b["id"], "result": []}))
+            }
+        })
+        .mount(&rpc_server)
+        .await;
+
+    let monitor = Monitor::new(
+        config.chains[0].clone(),
+        test_webhook_deliverer(db.clone()),
+        db.clone(),
+        http_provider_boxed(&rpc_server.uri()),
+    );
+    monitor.catch_up_once().await.unwrap();
+    assert_eq!(db.get_last_processed_block(TEST_CHAIN).unwrap(), 21);
+}

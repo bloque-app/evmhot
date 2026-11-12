@@ -47,11 +47,18 @@ Secrets and process settings come from the environment; per-network settings com
 ### `chains.toml`
 
 Copy [`chains.toml.example`](chains.toml.example). Each `[[chains]]` block configures one network: `name`,
-`chain_id`, `rpc_url` (HTTP polling only) and optionally `rpc_urls` (more endpoints to fail over to), `treasury_address` (the default sweep target), `faucet_address`,
+`chain_id`, `rpc_url` (HTTP polling only) and optionally `rpc_urls` (more endpoints to fail over to; with more than one, `block_offset_from_head` must be at least 10), `treasury_address` (the default sweep target), `faucet_address`,
 `existential_deposit`, a non-empty `allowed_token_addresses`, and optionally `token_treasuries` (a per-token sweep
 target), `token_targets` (see below), `min_deposits`, `min_deposit_default`, `min_deposit_native`, `poll_interval` and
 `block_offset_from_head`. Use a separate RPC key per network in production so one busy network cannot exhaust
 another's quota.
+
+RPC behaviour (amendment 0006). With several endpoints, a call fails over to the next one on a 429, 401-404, 413, a 5xx,
+a timeout, or a refusal of the method or range, and a 429 cools the endpoint down for 10 s. These rules apply to a
+chain with a single `rpc_url` too, minus the failover: block fetches and `eth_getLogs` wait and retry on a 429 or
+5xx (0.5 s doubling to 8 s, 6 attempts) instead of failing the chunk at once; a 429 never splits a log range, a 5xx
+splits it only after the retries; a `null` block at or below the head is an error, never skipped; and a faucet top-up
+that was sent counts as sent, with no second top-up to that address for 2 minutes.
 
 A token's sweep target is, in order: its `[chains.token_targets."0x..."]` table, its `token_treasuries` address, or the
 network's `treasury_address`. The native coin always uses `treasury_address`. A token is listed in `token_treasuries`

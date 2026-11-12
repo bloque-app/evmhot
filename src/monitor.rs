@@ -6,7 +6,7 @@ use crate::{
 use alloy::primitives::Address;
 use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::{Block, BlockNumberOrTag, Filter, Log};
-use alloy::transports::BoxTransport;
+use alloy::transports::{BoxTransport, TransportError};
 use anyhow::Result;
 use futures::future::BoxFuture;
 use futures::StreamExt;
@@ -182,9 +182,8 @@ impl Monitor {
 
         let results: Vec<Result<()>> = futures::stream::iter(from_block..=to_block)
             .map(|block_num| async move {
-                if let Some(block) = self.fetch_block_with_backoff(block_num).await? {
-                    self.handle_native_txs(&block).await?;
-                }
+                let block = self.fetch_block_with_backoff(block_num).await?;
+                self.handle_native_txs(&block).await?;
                 // Deserializing a hydrated block is a synchronous, non-yielding
                 // CPU burst once the HTTP response body lands; yielding here
                 // gives the runtime a chance to schedule other tasks (other
@@ -203,42 +202,50 @@ impl Monitor {
         Ok(())
     }
 
-    /// One block with its transactions. On 429, 403-archive, 5xx or a transport
-    /// error it waits (0.5 s doubling to 8 s) and tries again, so a chunk keeps
-    /// the blocks it already has instead of failing whole.
-    async fn fetch_block_with_backoff(&self, block_num: u64) -> Result<Option<Block>> {
+    /// One block with its transactions. On 429, 403, 5xx or a transport error it
+    /// waits (0.5 s doubling to 8 s) and tries again, so a chunk keeps the blocks
+    /// it already has instead of failing whole.
+    ///
+    /// Every block asked for here is at or below the head being processed, so a
+    /// `null` answer means the endpoint that served this call lags the one that
+    /// gave the head. It is retried (the pool rotates endpoints) and, if it
+    /// stays null, an error: the cursor never moves past a block that was not
+    /// read.
+    async fn fetch_block_with_backoff(&self, block_num: u64) -> Result<Block> {
         let mut retry = 0;
         loop {
-            match self
+            let failure: anyhow::Error = match self
                 .provider
                 .get_block_by_number(BlockNumberOrTag::Number(block_num), true)
                 .await
             {
-                Ok(b) => return Ok(b),
-                Err(e) => {
-                    let e: anyhow::Error = e.into();
-                    retry += 1;
-                    if !crate::rpc_pool::is_backoff_error(&e) || retry >= RPC_BACKOFF_ATTEMPTS {
-                        return Err(e);
-                    }
-                    let wait = backoff_delay(retry - 1);
-                    warn!(
-                        "[{}] block {} fetch failed (attempt {}/{}), retrying in {:?}: {}",
-                        self.chain.name, block_num, retry, RPC_BACKOFF_ATTEMPTS, wait, e
-                    );
-                    tokio::time::sleep(wait).await;
-                }
+                Ok(Some(b)) => return Ok(b),
+                Ok(None) => anyhow::anyhow!(
+                    "block {block_num} is not available from this endpoint yet (null answer for a block at or below the head)"
+                ),
+                Err(e) => e.into(),
+            };
+            retry += 1;
+            let retryable = failure.downcast_ref::<TransportError>().is_none()
+                || crate::rpc_pool::is_backoff_error(&failure);
+            if !retryable || retry >= RPC_BACKOFF_ATTEMPTS {
+                return Err(failure);
             }
+            let wait = backoff_delay(retry - 1);
+            warn!(
+                "[{}] block {} fetch failed (attempt {}/{}), retrying in {:?}: {}",
+                self.chain.name, block_num, retry, RPC_BACKOFF_ATTEMPTS, wait, failure
+            );
+            tokio::time::sleep(wait).await;
         }
     }
 
     async fn process_single_block(&self, block_num: u64) -> Result<()> {
         info!("[{}] Processing block {}", self.chain.name, block_num);
 
-        if let Some(block) = self.fetch_block_with_backoff(block_num).await? {
-            self.handle_native_txs(&block).await?;
-            self.process_erc20_transfers(block_num).await?;
-        }
+        let block = self.fetch_block_with_backoff(block_num).await?;
+        self.handle_native_txs(&block).await?;
+        self.process_erc20_transfers(block_num).await?;
 
         let chain_name = self.chain.name.clone();
         self.db
@@ -408,9 +415,11 @@ impl Monitor {
             {
                 Ok(logs) => Ok(logs),
                 Err(e) => {
-                    // A rate limit, a 403 or a 5xx says nothing about the
-                    // range: splitting it would only spend more requests.
-                    if from_block >= to_block || crate::rpc_pool::is_backoff_error(&e) {
+                    // A rate limit says nothing about the range: splitting it
+                    // would only spend more requests. A 5xx, a timeout or an
+                    // unreadable body after the whole backoff budget is how free
+                    // nodes answer an oversized range, so that one is split.
+                    if from_block >= to_block || crate::rpc_pool::is_rate_limited(&e) {
                         return Err(e);
                     }
                     warn!(

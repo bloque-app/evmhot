@@ -30,74 +30,67 @@ use tower::Service;
 
 pub const DEFAULT_RATE_COOLDOWN: Duration = Duration::from_secs(10);
 pub const DEFAULT_METHOD_COOLDOWN: Duration = Duration::from_secs(60);
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Why one endpoint could not serve a call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// 429 or a rate-limit message.
+    /// HTTP 429 or a rate-limit message.
     RateLimited,
     /// "Not available on this plan" and the like: this method, here.
     MethodUnavailable,
-    /// The range or response size is over this endpoint's limit.
+    /// The range or size is over this endpoint's limit.
     RangeRefused,
-    /// 403, 5xx, a transport error or an unreadable body.
+    /// 5xx, 408, a transport error (a timeout included) or an unreadable body.
     Transient,
+    /// 401, 402, 403, 404 or 413: this endpoint cannot serve us right now.
+    EndpointUnusable,
 }
 
 fn classify_text(msg: &str) -> Option<Refusal> {
     let s = msg.to_ascii_lowercase();
+    // Reverts and execution errors ("transfer amount exceeds balance", "exceeds
+    // block gas limit") match none of these on purpose: they never fail over.
     if s.contains("rate limit")
         || s.contains("rate-limit")
         || s.contains("too many requests")
-        || s.contains("request limit")
-        || s.contains("429")
+        || s.contains("request limit reached")
     {
         return Some(Refusal::RateLimited);
     }
-    if s.contains("not available on this plan")
-        || s.contains("method not available")
-        || s.contains("method not found")
-        || s.contains("not supported on")
-    {
-        return Some(Refusal::MethodUnavailable);
-    }
-    if s.contains("archive requests")
-        || s.contains("personal token")
-        || s.contains("personal api key")
-    {
-        return Some(Refusal::Transient);
-    }
     if s.contains("block range")
         || s.contains("blocks range")
-        || s.contains("range over")
-        || s.contains("ranges over")
-        || s.contains("limited to")
-        || s.contains("up to a")
-        || s.contains("range is too")
-        || s.contains("range too")
-        || s.contains("too many results")
-        || s.contains("more than 10000 results")
+        || s.contains("range too large")
+        || s.contains("range is too large")
+        || s.contains("query returned more than")
         || s.contains("response size exceeded")
-        || s.contains("exceed")
+        || s.contains("limited to 0 -")
+        || s.contains("ranges over")
+        || s.contains("-block range")
+        || s.contains("up to a")
     {
         return Some(Refusal::RangeRefused);
+    }
+    if s.contains("not available on this plan") || s.contains("method not available") {
+        return Some(Refusal::MethodUnavailable);
+    }
+    if s.contains("archive requests") || s.contains("personal token") {
+        return Some(Refusal::Transient);
     }
     None
 }
 
 /// Classifies a transport-level error. `None` means the call itself was bad
-/// (a revert, bad params): another endpoint would answer the same.
+/// (a revert, bad params, a plain 400): another endpoint would say the same.
 pub fn classify(err: &TransportError) -> Option<Refusal> {
     match err {
-        RpcError::Transport(TransportErrorKind::HttpError(h)) => {
-            if h.status == 429 {
-                Some(Refusal::RateLimited)
-            } else if h.status == 403 || h.status == 408 || h.status >= 500 {
-                Some(Refusal::Transient)
-            } else {
-                classify_text(&h.body)
-            }
-        }
+        RpcError::Transport(TransportErrorKind::HttpError(h)) => match h.status {
+            429 => Some(Refusal::RateLimited),
+            401 | 402 | 403 | 404 | 413 => Some(Refusal::EndpointUnusable),
+            408 | 500..=599 => Some(Refusal::Transient),
+            _ => classify_text(&h.body),
+        },
         RpcError::Transport(TransportErrorKind::Custom(_)) => Some(Refusal::Transient),
         RpcError::Transport(TransportErrorKind::BackendGone) => Some(Refusal::Transient),
         RpcError::DeserError { .. } => Some(Refusal::Transient),
@@ -112,17 +105,22 @@ pub fn classify(err: &TransportError) -> Option<Refusal> {
     }
 }
 
+fn refusal_of(err: &anyhow::Error) -> Option<Refusal> {
+    err.downcast_ref::<TransportError>().and_then(classify)
+}
+
 /// True when waiting and retrying the same call is the right answer: 429,
-/// 403-archive, 5xx, transport errors. Used by the monitor's backoff, and to
-/// keep it from bisecting a range because of them.
+/// 401-404/413, 5xx, transport errors. Used by the monitor's backoff.
 pub fn is_backoff_error(err: &anyhow::Error) -> bool {
-    match err.downcast_ref::<TransportError>() {
-        Some(e) => matches!(
-            classify(e),
-            Some(Refusal::RateLimited) | Some(Refusal::Transient)
-        ),
-        None => false,
-    }
+    matches!(
+        refusal_of(err),
+        Some(Refusal::RateLimited) | Some(Refusal::Transient) | Some(Refusal::EndpointUnusable)
+    )
+}
+
+/// True for a rate limit: the one failure that never justifies splitting a range.
+pub fn is_rate_limited(err: &anyhow::Error) -> bool {
+    refusal_of(err) == Some(Refusal::RateLimited)
 }
 
 struct Endpoint {
@@ -174,6 +172,28 @@ impl PoolTransport {
         rate_cooldown: Duration,
         method_cooldown: Duration,
     ) -> Result<Self> {
+        Self::with_options(
+            urls,
+            rate_cooldown,
+            method_cooldown,
+            DEFAULT_REQUEST_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
+        )
+    }
+
+    /// A request that outlives `request_timeout` is a transport error: it fails over.
+    pub fn with_options(
+        urls: &[String],
+        rate_cooldown: Duration,
+        method_cooldown: Duration,
+        request_timeout: Duration,
+        connect_timeout: Duration,
+    ) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(request_timeout)
+            .connect_timeout(connect_timeout)
+            .build()
+            .map_err(|e| anyhow!("building the RPC client: {e}"))?;
         if urls.is_empty() {
             return Err(anyhow!("an RPC pool needs at least one URL"));
         }
@@ -190,7 +210,7 @@ impl PoolTransport {
             }
             endpoints.push(Endpoint {
                 url: u.clone(),
-                http: Http::new(url),
+                http: Http::with_client(client.clone(), url),
                 cooled: Mutex::new(HashMap::new()),
             });
         }
@@ -245,6 +265,7 @@ async fn execute(pool: Arc<Pool>, req: RequestPacket) -> Result<ResponsePacket, 
         match refusal {
             Refusal::RateLimited => ep.cool("", pool.rate_cooldown),
             Refusal::MethodUnavailable => ep.cool(&method, pool.method_cooldown),
+            Refusal::EndpointUnusable => ep.cool("", pool.method_cooldown),
             _ => {}
         }
         tracing::warn!(
@@ -436,5 +457,98 @@ mod tests {
     fn the_pool_refuses_non_http_urls_and_an_empty_list() {
         assert!(PoolTransport::new(&[]).is_err());
         assert!(PoolTransport::new(&["ws://a".into(), "http://b".into()]).is_err());
+    }
+
+    /// The five endpoints' real refusals, and the errors that must never fail over.
+    #[test]
+    fn real_provider_messages_are_classified_and_reverts_are_not() {
+        use Refusal::*;
+        for (msg, want) in [
+            (
+                "eth_getLogs is limited to 0 - 50 blocks range",
+                RangeRefused,
+            ),
+            (
+                "ranges over 10000 blocks are not supported on free plan",
+                RangeRefused,
+            ),
+            ("up to a 10 block range", RangeRefused),
+            (
+                "Method not available on this plan with fullTransactions=true",
+                MethodUnavailable,
+            ),
+            ("request limit reached", RateLimited),
+            ("Rate limit (1200rqs/60s) reached", RateLimited),
+            ("Log response size exceeded", RangeRefused),
+            ("query returned more than 10000 results", RangeRefused),
+            ("Archive requests require a personal token", Transient),
+        ] {
+            assert_eq!(classify_text(msg), Some(want), "{msg}");
+        }
+        for msg in [
+            "execution reverted: ERC20: transfer amount exceeds balance",
+            "exceeds block gas limit",
+            "gas required exceeds allowance (30000000)",
+            "insufficient funds for gas * price + value",
+            "nonce too low",
+            "error 4290 in the request",
+        ] {
+            assert_eq!(classify_text(msg), None, "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_revert_that_says_exceeds_is_not_failed_over() {
+        let a = serve(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":0,
+            "error":{"code":3,"message":"execution reverted: transfer amount exceeds balance"}
+        })))
+        .await;
+        let b = serve(ok_block_number()).await;
+        let p = provider(&[&a, &b], Duration::from_secs(30));
+        assert!(p.get_block_number().await.is_err());
+        assert_eq!(hits(&b).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_slow_endpoint_times_out_and_fails_over() {
+        let a = serve(ok_block_number().set_delay(Duration::from_secs(3))).await;
+        let b = serve(ok_block_number()).await;
+        let urls = vec![a.uri(), b.uri()];
+        let t = PoolTransport::with_options(
+            &urls,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let p = ProviderBuilder::new()
+            .on_client(RpcClient::new(t, false))
+            .boxed();
+        let started = Instant::now();
+        for _ in 0..2 {
+            assert_eq!(p.get_block_number().await.unwrap(), 42);
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn other_4xx_fail_over_and_cool_the_endpoint_but_400_does_not() {
+        for status in [401u16, 402, 403, 404, 413] {
+            let a = serve(ResponseTemplate::new(status).set_body_string("no")).await;
+            let b = serve(ok_block_number()).await;
+            let p = provider(&[&a, &b], Duration::from_secs(30));
+            for _ in 0..4 {
+                assert_eq!(p.get_block_number().await.unwrap(), 42, "{status}");
+            }
+            assert_eq!(hits(&a).await, 1, "{status} cools the endpoint");
+        }
+        // 400 may be a real bad request: returned as is, no failover.
+        let a = serve(ResponseTemplate::new(400).set_body_string("bad request")).await;
+        let b = serve(ok_block_number()).await;
+        let p = provider(&[&a, &b], Duration::from_secs(30));
+        assert!(p.get_block_number().await.is_err());
+        assert_eq!(hits(&b).await, 0);
     }
 }

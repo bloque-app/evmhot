@@ -198,6 +198,9 @@ pub struct ChainConfigRaw {
     pub block_fetch_concurrency: u64,
 }
 
+/// The smallest `block_offset_from_head` allowed with more than one RPC endpoint.
+pub const MIN_POOL_BLOCK_OFFSET: u64 = 10;
+
 fn default_existential_deposit() -> String {
     "10000000000000000".to_string()
 }
@@ -645,6 +648,18 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
                 raw.name
             ));
         }
+        // Endpoints in a pool can sit at different heights: the head comes from
+        // one, the blocks and logs from another. The offset keeps what is read
+        // behind what every endpoint has.
+        if rpc_urls.len() > 1 && raw.block_offset_from_head < MIN_POOL_BLOCK_OFFSET {
+            return Err(anyhow::anyhow!(
+                "chain '{}': {} RPC endpoints are configured, so block_offset_from_head must be at least {} (it is {}): endpoints lag one another, and a block read from a lagging endpoint can come back missing or with empty logs",
+                raw.name,
+                rpc_urls.len(),
+                MIN_POOL_BLOCK_OFFSET,
+                raw.block_offset_from_head
+            ));
+        }
         chains.push(ChainConfig {
             name: raw.name,
             chain_id: raw.chain_id,
@@ -892,6 +907,28 @@ allowed_token_addresses = ["0xc2132d05d31c914a87c6611c10748aeb04b58e8f"]
                 "https://c.example"
             ]
         );
+    }
+
+    #[test]
+    fn test_pool_needs_a_block_offset_of_at_least_ten() {
+        let pool = "rpc_url = \"https://a.example\"\nrpc_urls = [\"https://b.example\"]";
+        // The default (20) is fine.
+        assert!(parse_chains_toml(&chain_with(pool)).is_ok());
+        let err = parse_chains_toml(&chain_with(&format!("{pool}\nblock_offset_from_head = 3")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("block_offset_from_head") && err.contains("lag"),
+            "{err}"
+        );
+        assert!(
+            parse_chains_toml(&chain_with(&format!("{pool}\nblock_offset_from_head = 10"))).is_ok()
+        );
+        // One endpoint: no floor.
+        assert!(parse_chains_toml(&chain_with(
+            "rpc_url = \"https://a.example\"\nblock_offset_from_head = 0"
+        ))
+        .is_ok());
     }
 
     #[test]
