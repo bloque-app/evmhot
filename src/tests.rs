@@ -4310,6 +4310,14 @@ async fn test_faucet_keeps_the_reservation_when_the_send_says_already_known() {
             first.to_string().contains("faucet top-up pending"),
             "{first}"
         );
+        // "already known" holds 600 s; "nonce too low" may be a stale nonce
+        // cache with nothing in flight, so it holds only 90 s.
+        let want = if answer == "already known" { 600 } else { 90 };
+        assert_eq!(
+            faucet.hold_for(&to),
+            Some(std::time::Duration::from_secs(want)),
+            "{answer}"
+        );
         let second = faucet.fund_new_address(&to).await.unwrap_err();
         assert!(
             second.to_string().contains("faucet top-up pending"),
