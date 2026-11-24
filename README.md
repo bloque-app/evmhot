@@ -50,7 +50,8 @@ Copy [`chains.toml.example`](chains.toml.example). Each `[[chains]]` block confi
 `chain_id`, `rpc_url` (HTTP polling only) and optionally `rpc_urls` (more endpoints to fail over to; with more than one, `block_offset_from_head` must be at least 10), `treasury_address` (the default sweep target), `faucet_address`,
 `existential_deposit`, a non-empty `allowed_token_addresses`, and optionally `token_treasuries` (a per-token sweep
 target), `token_targets` (see below), `min_deposits`, `min_deposit_default`, `min_deposit_native`, `poll_interval` and
-`block_offset_from_head`. Use a separate RPC key per network in production so one busy network cannot exhaust
+`block_offset_from_head`, and `faucet_low_balance` (amendment 0007: below this faucet balance, in wei, evmhot raises
+`EVMHOT_ALERT kind=faucet_low`, checked every 5 minutes and repeated hourly; default 20 × `existential_deposit`). Use a separate RPC key per network in production so one busy network cannot exhaust
 another's quota.
 
 RPC behaviour (amendment 0006). With several endpoints, a call fails over to the next one on a 429, 401-404, 413, a 5xx,

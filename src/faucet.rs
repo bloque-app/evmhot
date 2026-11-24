@@ -340,7 +340,10 @@ pub async fn watch_balance(faucet: std::sync::Arc<Faucet>, network: String, floo
     let mut last_alert: Option<Instant> = None;
     let mut ticker = tokio::time::interval(FAUCET_WATCH_INTERVAL);
     loop {
-        ticker.tick().await;
+        // Stamp each reading with its tick, not with when the read returned:
+        // ticks sit on a fixed grid, so the hourly repeat lands on the twelfth
+        // tick after an alert however long each read took.
+        let tick = ticker.tick().await.into_std();
         let balance = match faucet.balance().await {
             Ok(b) => b,
             Err(e) => {
@@ -348,13 +351,7 @@ pub async fn watch_balance(faucet: std::sync::Arc<Faucet>, network: String, floo
                 continue;
             }
         };
-        let (step, next) = low_balance_step(
-            balance,
-            floor,
-            last_alert,
-            Instant::now(),
-            FAUCET_LOW_REPEAT,
-        );
+        let (step, next) = low_balance_step(balance, floor, last_alert, tick, FAUCET_LOW_REPEAT);
         last_alert = next;
         match step {
             LowBalance::Alert => warn!(

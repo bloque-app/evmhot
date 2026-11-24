@@ -215,18 +215,26 @@ fn resolve_faucet_low_balance(
     configured: Option<&str>,
     existential_deposit: &str,
 ) -> Result<U256> {
+    let wei = |field: &str, v: &str| -> Result<U256> {
+        let v = v.trim();
+        if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+            bail!("chain '{chain}': {field} must be an amount in wei (decimal digits)");
+        }
+        U256::from_str(v).with_context(|| format!("chain '{chain}': {field} is out of range"))
+    };
     let floor = match configured {
-        Some(v) => U256::from_str(v.trim()).with_context(|| {
-            format!("chain '{chain}': faucet_low_balance must be an amount in wei")
-        })?,
-        None => U256::from_str(existential_deposit.trim())
-            .with_context(|| {
-                format!("chain '{chain}': existential_deposit must be an amount in wei")
-            })?
+        Some(v) => wei("faucet_low_balance", v)?,
+        None => wei("existential_deposit", existential_deposit)?
             .saturating_mul(U256::from(FAUCET_LOW_TOP_UPS)),
     };
     if floor.is_zero() {
-        bail!("chain '{chain}': faucet_low_balance must be above zero");
+        if configured.is_some() {
+            bail!("chain '{chain}': faucet_low_balance must be above zero");
+        }
+        bail!(
+            "chain '{chain}': existential_deposit is zero, so the default faucet_low_balance \
+             ({FAUCET_LOW_TOP_UPS} top-ups) is zero too; set faucet_low_balance"
+        );
     }
     Ok(floor)
 }
@@ -933,7 +941,7 @@ existential_deposit = "1000"
 
     #[test]
     fn req_fc_4_faucet_low_balance_refuses_zero_and_non_numbers() {
-        for bad in ["0", "lots", ""] {
+        for bad in ["0", "lots", "", "0x10"] {
             let toml = format!("{ONE_CHAIN}faucet_low_balance = \"{bad}\"\n");
             let err = parse_chains_toml(&toml).unwrap_err().to_string();
             assert!(err.contains("faucet_low_balance"), "{bad}: {err}");
