@@ -161,6 +161,10 @@ pub struct ChainConfigRaw {
     pub faucet_address: String,
     #[serde(default = "default_existential_deposit")]
     pub existential_deposit: String,
+    /// Faucet balance, in wei, below which `faucet_low` is raised (amendment
+    /// 0007, `REQ-FC-4`). Default: `FAUCET_LOW_TOP_UPS` top-ups.
+    #[serde(default)]
+    pub faucet_low_balance: Option<String>,
     #[serde(default)]
     pub allowed_token_addresses: Vec<String>,
     #[serde(default)]
@@ -200,6 +204,32 @@ pub struct ChainConfigRaw {
 
 /// The smallest `block_offset_from_head` allowed with more than one RPC endpoint.
 pub const MIN_POOL_BLOCK_OFFSET: u64 = 10;
+
+/// Top-ups' worth of gas the default `faucet_low_balance` keeps in reserve
+/// (amendment 0007).
+pub const FAUCET_LOW_TOP_UPS: u64 = 20;
+
+/// `faucet_low_balance` as configured, or `FAUCET_LOW_TOP_UPS` top-ups.
+fn resolve_faucet_low_balance(
+    chain: &str,
+    configured: Option<&str>,
+    existential_deposit: &str,
+) -> Result<U256> {
+    let floor = match configured {
+        Some(v) => U256::from_str(v.trim()).with_context(|| {
+            format!("chain '{chain}': faucet_low_balance must be an amount in wei")
+        })?,
+        None => U256::from_str(existential_deposit.trim())
+            .with_context(|| {
+                format!("chain '{chain}': existential_deposit must be an amount in wei")
+            })?
+            .saturating_mul(U256::from(FAUCET_LOW_TOP_UPS)),
+    };
+    if floor.is_zero() {
+        bail!("chain '{chain}': faucet_low_balance must be above zero");
+    }
+    Ok(floor)
+}
 
 fn default_existential_deposit() -> String {
     "10000000000000000".to_string()
@@ -246,6 +276,8 @@ pub struct ChainConfig {
     pub treasury_address: String,
     pub faucet_address: String,
     pub existential_deposit: String,
+    /// Faucet balance, in wei, below which `faucet_low` is raised (`REQ-FC-4`).
+    pub faucet_low_balance: U256,
     pub block_offset_from_head: u64,
     pub poll_interval: u64,
     pub get_logs_max_retries: u32,
@@ -660,6 +692,11 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
                 raw.block_offset_from_head
             ));
         }
+        let faucet_low_balance = resolve_faucet_low_balance(
+            &raw.name,
+            raw.faucet_low_balance.as_deref(),
+            &raw.existential_deposit,
+        )?;
         chains.push(ChainConfig {
             name: raw.name,
             chain_id: raw.chain_id,
@@ -668,6 +705,7 @@ pub fn parse_chains_toml(content: &str) -> Result<Vec<ChainConfig>> {
             treasury_address: raw.treasury_address,
             faucet_address: raw.faucet_address,
             existential_deposit: raw.existential_deposit,
+            faucet_low_balance,
             block_offset_from_head: raw.block_offset_from_head,
             poll_interval: raw.poll_interval,
             get_logs_max_retries: raw.get_logs_max_retries,
@@ -865,6 +903,42 @@ min_deposit_native = "1000"
 [chains.min_deposits]
 "0xc2132d05d31c914a87c6611c10748aeb04b58e8f" = "10000"
 "#;
+
+    const ONE_CHAIN: &str = r#"
+[[chains]]
+name = "polygon"
+chain_id = 137
+rpc_url = "https://polygon.example.com"
+treasury_address = "0x2222222222222222222222222222222222222222"
+faucet_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+allowed_token_addresses = ["0xc2132d05d31c914a87c6611c10748aeb04b58e8f"]
+existential_deposit = "1000"
+"#;
+
+    #[test]
+    fn req_fc_4_faucet_low_balance_defaults_to_twenty_top_ups() {
+        let chains = parse_chains_toml(ONE_CHAIN).unwrap();
+        assert_eq!(
+            chains[0].faucet_low_balance,
+            U256::from(1000u64 * FAUCET_LOW_TOP_UPS)
+        );
+    }
+
+    #[test]
+    fn req_fc_4_faucet_low_balance_is_configurable() {
+        let toml = format!("{ONE_CHAIN}faucet_low_balance = \"123456\"\n");
+        let chains = parse_chains_toml(&toml).unwrap();
+        assert_eq!(chains[0].faucet_low_balance, U256::from(123456u64));
+    }
+
+    #[test]
+    fn req_fc_4_faucet_low_balance_refuses_zero_and_non_numbers() {
+        for bad in ["0", "lots", ""] {
+            let toml = format!("{ONE_CHAIN}faucet_low_balance = \"{bad}\"\n");
+            let err = parse_chains_toml(&toml).unwrap_err().to_string();
+            assert!(err.contains("faucet_low_balance"), "{bad}: {err}");
+        }
+    }
 
     #[test]
     fn test_parse_valid_chains_toml() {

@@ -1,6 +1,6 @@
 # evmhot — System Specification
 
-**Version:** 0.2.5 · **Status:** draft for review · **Owner:** @pandres95
+**Version:** 0.2.6 · **Status:** draft for review · **Owner:** @pandres95
 
 ## 0. How to read this document
 
@@ -16,6 +16,7 @@ yet are marked **(not built)**, and `PLAN.md` §4 names the feature that builds 
 | Version | Date | Change |
 |---|---|---|
 | 0.1.0 | 2026-11-09 | The service as it ran: registration, detection, sweeps, faucet, webhooks, store, API |
+| 0.2.6 | 2026-11-23 | Amendment 0007: `faucet_low` when a faucet's balance is below its network's floor |
 | 0.2.5 | 2026-11-12 | Amendment 0006: `rpc_urls` pool with failover, backoff on rate limits instead of discarding a chunk, no skipping a block a lagging endpoint reports missing, a faucet top-up that was sent is sent |
 | 0.2.4 | 2026-11-09 | Amendment 0005: a second delivery of `deposit_swept` to a target's notify URL; the published `deposit_swept` contract |
 | 0.2.3 | 2026-11-09 | Amendment 0004: sweep intents before broadcast, review states, one sweep per transfer, alerts, `sweep_target` |
@@ -264,7 +265,7 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   start when a notify URL's token is empty. The swap
   service receives bezent's Safe sweeps this way (R12). (Amendment 0005.)
 - `REQ-CF-1` A `[[chains]]` table with a key evmhot does not know MUST be refused at load, so configuration never
-  claims behaviour the binary lacks. `rpc_urls` is a known key. (Amendment 0005, 0006.)
+  claims behaviour the binary lacks. `rpc_urls` and `faucet_low_balance` are known keys. (Amendment 0005, 0006, 0007.)
 - `REQ-CF-2` A chain MAY list several RPC endpoints (`rpc_url` first, then `rpc_urls`); with several, 
   `block_offset_from_head` MUST be at least 10. A call moves to the next endpoint on a 429, 401-404, 413, 5xx, transport
   error (30 s request timeout), or a refusal of the method, range or size; a revert never fails over. An endpoint that
@@ -331,8 +332,12 @@ more is owed (amendment 0004).
 - `REQ-OB-4` An alert is a log line starting `EVMHOT_ALERT kind=<kind> network=<network>`, with the deposit's identity
   and transaction where there are some. Kinds: `sweep_review`, `balance_shortfall`, `no_sender`, `pair_blocked`
   (review or failed blockers only), `dust`, `settled_without_sweep`, `native_sweep_failed`, `review_self_resolved`,
-  `sweep_stuck`, `notify_failed`, and with `REQ-OB-1`/`REQ-OB-2` `lag` and `provider`. `dust` and `pair_blocked` are raised once per deposit
+  `sweep_stuck`, `notify_failed`, `faucet_low` (amendment 0007), and with `REQ-OB-1`/`REQ-OB-2` `lag` and `provider`. `dust` and `pair_blocked` are raised once per deposit
   and blocking state. (Amendment 0004.)
+- `REQ-FC-4` Per network, evmhot reads the faucet's balance every 5 minutes and raises `faucet_low` when it is below
+  the chain's `faucet_low_balance` (wei; default 20 × `existential_deposit`; zero is refused at load): on the first
+  low reading, then hourly while it stays low. A reading back at or above the floor is logged and closes the spell. A
+  failed read is a WARN, not an alert. The check never changes what the faucet funds. (Amendment 0007.)
 - `REQ-OB-3` Health reports the store's writer and lists the networks. **(not built)** It also reports whether each
   network's provider answers.
 
