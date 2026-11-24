@@ -412,6 +412,16 @@ impl HotWalletService {
                 tracing::info!("[{chain_name}] Starting Sweeper");
                 sweeper.run().await;
             });
+
+            let faucet = Arc::clone(&ctx.faucet);
+            let chain_name = ctx.cfg.name.clone();
+            let floor = ctx.cfg.faucet_low_balance;
+            tokio::spawn(async move {
+                tracing::info!(
+                    "[{chain_name}] Watching faucet balance (faucet_low below {floor} wei)"
+                );
+                crate::faucet::watch_balance(faucet, chain_name, floor).await;
+            });
         }
         Ok(())
     }

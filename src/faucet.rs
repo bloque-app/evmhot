@@ -256,11 +256,184 @@ impl Faucet {
         self.sent.lock().unwrap().get(&a).map(|s| s.hold)
     }
 
+    /// The faucet's own address on this network.
+    pub fn address(&self) -> Address {
+        self.faucet_address
+    }
+
+    /// The faucet's balance, read through the network's pool.
+    pub async fn balance(&self) -> Result<U256> {
+        Ok(self.root.get_balance(self.faucet_address).await?)
+    }
+
+    /// The amount one top-up sends.
+    pub fn top_up_amount(&self) -> U256 {
+        self.existential_deposit
+    }
+
     /// Check if an address already has sufficient balance (skip funding if it does)
     #[allow(dead_code)]
     pub async fn needs_funding(&self, address: &str) -> Result<bool> {
         let addr = Address::from_str(address)?;
         let balance = self.root.get_balance(addr).await?;
         Ok(balance < self.existential_deposit)
+    }
+}
+
+/// How often the faucet's balance is read for `faucet_low` (amendment 0007).
+pub const FAUCET_WATCH_INTERVAL: Duration = Duration::from_secs(300);
+/// How often `faucet_low` is raised again while the balance stays low.
+pub const FAUCET_LOW_REPEAT: Duration = Duration::from_secs(3600);
+
+/// What one balance reading leads to (`REQ-FC-4`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum LowBalance {
+    /// Raise `faucet_low`: the first low reading, or the repeat is due.
+    Alert,
+    /// Low, already alerted within the repeat window.
+    StillLow,
+    /// Back at or above the floor after an alert.
+    Recovered,
+    /// At or above the floor, no alert outstanding.
+    Fine,
+}
+
+/// The `faucet_low` state machine, kept pure so it can be tested without a
+/// chain. `last_alert` is when `faucet_low` was last raised for this network,
+/// `None` when no low spell is open; the caller stores what is returned.
+pub fn low_balance_step(
+    balance: U256,
+    floor: U256,
+    last_alert: Option<Instant>,
+    now: Instant,
+    repeat: Duration,
+) -> (LowBalance, Option<Instant>) {
+    if balance < floor {
+        match last_alert {
+            Some(at) if now.saturating_duration_since(at) < repeat => {
+                (LowBalance::StillLow, Some(at))
+            }
+            _ => (LowBalance::Alert, Some(now)),
+        }
+    } else if last_alert.is_some() {
+        (LowBalance::Recovered, None)
+    } else {
+        (LowBalance::Fine, None)
+    }
+}
+
+/// How many top-ups `balance` still pays for.
+pub fn top_ups_left(balance: U256, top_up: U256) -> U256 {
+    if top_up.is_zero() {
+        U256::ZERO
+    } else {
+        balance / top_up
+    }
+}
+
+/// Reads the faucet's balance every `FAUCET_WATCH_INTERVAL` and raises
+/// `faucet_low` when it is below `floor` (`REQ-FC-4`): on the first low
+/// reading, then every `FAUCET_LOW_REPEAT` while it stays low. A failed read
+/// is a WARN, not an alert; persistent provider trouble is `provider`'s.
+pub async fn watch_balance(faucet: std::sync::Arc<Faucet>, network: String, floor: U256) {
+    let top_up = faucet.top_up_amount();
+    let mut last_alert: Option<Instant> = None;
+    let mut ticker = tokio::time::interval(FAUCET_WATCH_INTERVAL);
+    loop {
+        // Stamp each reading with its tick, not with when the read returned:
+        // ticks sit on a fixed grid, so the hourly repeat lands on the twelfth
+        // tick after an alert however long each read took.
+        let tick = ticker.tick().await.into_std();
+        let balance = match faucet.balance().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("[{network}] Faucet balance read failed: {e}");
+                continue;
+            }
+        };
+        let (step, next) = low_balance_step(balance, floor, last_alert, tick, FAUCET_LOW_REPEAT);
+        last_alert = next;
+        match step {
+            LowBalance::Alert => warn!(
+                "EVMHOT_ALERT kind=faucet_low network={network} deposit=- tx=- \
+                 (faucet {} holds {balance} wei, below {floor} wei: about {} top-ups left; \
+                 refill it or sweeps on {network} stop when it runs out)",
+                faucet.address(),
+                top_ups_left(balance, top_up),
+            ),
+            LowBalance::Recovered => info!(
+                "[{network}] Faucet {} back at {balance} wei (floor {floor} wei)",
+                faucet.address()
+            ),
+            LowBalance::StillLow | LowBalance::Fine => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod low_balance_tests {
+    //! `REQ-FC-4` (amendment 0007).
+    use super::*;
+
+    const REPEAT: Duration = Duration::from_secs(3600);
+
+    fn wei(n: u64) -> U256 {
+        U256::from(n)
+    }
+
+    #[test]
+    fn req_fc_4_first_low_reading_alerts() {
+        let now = Instant::now();
+        assert_eq!(
+            low_balance_step(wei(9), wei(10), None, now, REPEAT),
+            (LowBalance::Alert, Some(now))
+        );
+    }
+
+    #[test]
+    fn req_fc_4_low_within_repeat_window_stays_quiet() {
+        let at = Instant::now();
+        let now = at + Duration::from_secs(600);
+        assert_eq!(
+            low_balance_step(wei(9), wei(10), Some(at), now, REPEAT),
+            (LowBalance::StillLow, Some(at))
+        );
+    }
+
+    #[test]
+    fn req_fc_4_low_after_repeat_window_alerts_again() {
+        let at = Instant::now();
+        let now = at + REPEAT;
+        assert_eq!(
+            low_balance_step(wei(9), wei(10), Some(at), now, REPEAT),
+            (LowBalance::Alert, Some(now))
+        );
+    }
+
+    #[test]
+    fn req_fc_4_floor_itself_is_not_low() {
+        assert_eq!(
+            low_balance_step(wei(10), wei(10), None, Instant::now(), REPEAT),
+            (LowBalance::Fine, None)
+        );
+    }
+
+    #[test]
+    fn req_fc_4_refill_after_an_alert_reports_recovery_and_closes_the_spell() {
+        let at = Instant::now();
+        let (step, next) = low_balance_step(wei(50), wei(10), Some(at), at, REPEAT);
+        assert_eq!((step, next), (LowBalance::Recovered, None));
+        // The next drop is a new spell: it alerts at once.
+        let later = at + Duration::from_secs(60);
+        assert_eq!(
+            low_balance_step(wei(1), wei(10), next, later, REPEAT),
+            (LowBalance::Alert, Some(later))
+        );
+    }
+
+    #[test]
+    fn req_fc_4_top_ups_left_counts_whole_top_ups() {
+        assert_eq!(top_ups_left(wei(25), wei(10)), wei(2));
+        assert_eq!(top_ups_left(wei(25), wei(0)), wei(0));
     }
 }

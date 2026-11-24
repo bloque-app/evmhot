@@ -1,9 +1,11 @@
 use crate::config::{ChainConfig, Config, MinDepositSettings};
 use crate::db::Db;
 use crate::webhook::WebhookDeliverer;
+use alloy::primitives::U256;
 use alloy::providers::{ProviderBuilder, RootProvider};
 use alloy::transports::BoxTransport;
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub const TEST_CHAIN: &str = "polygon";
@@ -35,6 +37,8 @@ pub fn test_chain_config(rpc_url: impl Into<String>) -> ChainConfig {
         treasury_address: TEST_TREASURY.to_string(),
         faucet_address: TEST_FAUCET.to_string(),
         existential_deposit: TEST_EXISTENTIAL.to_string(),
+        faucet_low_balance: U256::from_str(TEST_EXISTENTIAL).unwrap()
+            * U256::from(crate::config::FAUCET_LOW_TOP_UPS),
         block_offset_from_head: 0,
         poll_interval: 1,
         get_logs_max_retries: 30,
