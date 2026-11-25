@@ -590,10 +590,21 @@ allowed_token_addresses = ["0x1111111111111111111111111111111111111111"]
             r#"{"block_number":"ten"}"#,
         )
         .await;
-        assert!(status.is_client_error());
-        let v = json_body(&body);
-        assert_eq!(keys(&v), ["error", "status"]);
-        assert_eq!(v["status"], json!(status.as_u16()));
+        assert_error_body(status, &body, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn req_api_1_undecodable_path_answers_json_400() {
+        let h = harness(None).await;
+        let (status, body) = call(
+            &h.app,
+            Method::GET,
+            "/evm/chains/%FF/block_number",
+            None,
+            None,
+        )
+        .await;
+        assert_error_body(status, &body, StatusCode::BAD_REQUEST);
     }
 
     #[test]
