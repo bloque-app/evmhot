@@ -1,6 +1,11 @@
 use axum::{
-    extract::{Json, Path, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    async_trait,
+    extract::{
+        rejection::{JsonRejection, PathRejection},
+        FromRequest, FromRequestParts, Request,
+    },
+    extract::{Json, State},
+    http::{header::AUTHORIZATION, request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
@@ -87,6 +92,9 @@ fn router(service: Arc<HotWalletService>, default_chain: String) -> Router {
         )
         .route("/admin/retry_sweeps", post(retry_sweeps))
         .route("/admin/retry_webhooks", post(retry_webhooks))
+        // Unknown paths and wrong methods answer like every other error (SPEC section 9.1).
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
 }
 
@@ -119,7 +127,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 
 async fn register(
     State(state): State<AppState>,
-    Json(payload): Json<RegisterRequest>,
+    ApiJson(payload): ApiJson<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, ApiError> {
     match state.service.register(payload).await {
         Ok(response) => Ok(Json(response)),
@@ -139,7 +147,7 @@ fn map_write_error(e: anyhow::Error, context: &str) -> ApiError {
 
 async fn verify_transfer(
     State(state): State<AppState>,
-    Json(payload): Json<VerifyTransferRequest>,
+    ApiJson(payload): ApiJson<VerifyTransferRequest>,
 ) -> Result<Json<VerifyTransferResponse>, ApiError> {
     match state.service.verify_transfer(payload).await {
         Ok(response) => Ok(Json(response)),
@@ -179,7 +187,7 @@ async fn get_block_number(
 
 async fn set_block_number(
     State(state): State<AppState>,
-    Json(payload): Json<SetBlockNumberRequest>,
+    ApiJson(payload): ApiJson<SetBlockNumberRequest>,
 ) -> Result<Json<BlockNumberResponse>, ApiError> {
     write_block_number(&state, &state.default_chain, payload.block_number).await?;
     Ok(Json(BlockNumberResponse {
@@ -189,7 +197,7 @@ async fn set_block_number(
 
 async fn get_chain_block_number(
     State(state): State<AppState>,
-    Path(chain): Path<String>,
+    ApiPath(chain): ApiPath<String>,
 ) -> Result<Json<ChainBlockNumberResponse>, ApiError> {
     let block_number = read_block_number(&state, &chain).await?;
     Ok(Json(ChainBlockNumberResponse {
@@ -200,8 +208,8 @@ async fn get_chain_block_number(
 
 async fn set_chain_block_number(
     State(state): State<AppState>,
-    Path(chain): Path<String>,
-    Json(payload): Json<SetBlockNumberRequest>,
+    ApiPath(chain): ApiPath<String>,
+    ApiJson(payload): ApiJson<SetBlockNumberRequest>,
 ) -> Result<Json<ChainBlockNumberResponse>, ApiError> {
     write_block_number(&state, &chain, payload.block_number).await?;
     Ok(Json(ChainBlockNumberResponse {
@@ -229,7 +237,7 @@ fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError
 async fn retry_sweeps(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<RetrySweepRequest>,
+    ApiJson(payload): ApiJson<RetrySweepRequest>,
 ) -> Result<Json<RetrySweepResponse>, ApiError> {
     authorize_admin(&state, &headers)?;
     state
@@ -243,7 +251,7 @@ async fn retry_sweeps(
 async fn retry_webhooks(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<RetryWebhookRequest>,
+    ApiJson(payload): ApiJson<RetryWebhookRequest>,
 ) -> Result<Json<RetryWebhookResponse>, ApiError> {
     authorize_admin(&state, &headers)?;
     state
@@ -261,8 +269,62 @@ async fn retry_webhooks(
         })
 }
 
+async fn not_found() -> ApiError {
+    ApiError::Client(StatusCode::NOT_FOUND, "Not found".to_string())
+}
+
+async fn method_not_allowed() -> ApiError {
+    ApiError::Client(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "Method not allowed".to_string(),
+    )
+}
+
+/// `Json`, with its rejections (malformed JSON, a missing field, a wrong
+/// content type) answered as `{error, status}` instead of axum's plain text
+/// (SPEC section 9.1).
+struct ApiJson<T>(T);
+
+#[async_trait]
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) => Err(ApiError::Client(rejection.status(), rejection.body_text())),
+        }
+    }
+}
+
+/// `Path`, with its rejections answered as `{error, status}` (SPEC section 9.1).
+struct ApiPath<T>(T);
+
+#[async_trait]
+impl<S, T> FromRequestParts<S> for ApiPath<T>
+where
+    axum::extract::Path<T>: FromRequestParts<S, Rejection = PathRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::extract::Path::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Path(value)) => Ok(ApiPath(value)),
+            Err(rejection) => Err(ApiError::Client(rejection.status(), rejection.body_text())),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ApiError {
+    /// A 4xx the request itself caused: a rejected body or path, an unknown
+    /// route, a wrong method.
+    Client(StatusCode, String),
     Internal(String),
     Unauthorized(String),
     NotFound(String),
@@ -272,6 +334,7 @@ enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
+            ApiError::Client(status, msg) => (status, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
@@ -426,10 +489,19 @@ allowed_token_addresses = ["0x1111111111111111111111111111111111111111"]
         assert_eq!(json_body(&body2)["address"], json!(address));
     }
 
+    /// SPEC section 9.1: an error is its status with a JSON body `{error, status}`.
+    fn assert_error_body(status: StatusCode, body: &str, expected: StatusCode) {
+        assert_eq!(status, expected);
+        let v = json_body(body);
+        assert_eq!(keys(&v), ["error", "status"]);
+        assert_eq!(v["status"], json!(expected.as_u16()));
+        assert!(!v["error"].as_str().unwrap().is_empty());
+    }
+
     #[tokio::test]
-    async fn register_with_a_malformed_body_is_a_client_error() {
+    async fn req_api_1_register_with_a_missing_field_answers_json_422() {
         let h = harness(None).await;
-        let (status, _) = call(
+        let (status, body) = call(
             &h.app,
             Method::POST,
             "/evm/register",
@@ -437,7 +509,102 @@ allowed_token_addresses = ["0x1111111111111111111111111111111111111111"]
             None,
         )
         .await;
-        assert!(status.is_client_error());
+        assert_error_body(status, &body, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(json_body(&body)["error"]
+            .as_str()
+            .unwrap()
+            .contains("webhook_url"));
+    }
+
+    async fn raw(
+        app: &Router,
+        method: Method,
+        path: &str,
+        ct: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let mut req = Request::builder().method(method).uri(path);
+        if let Some(ct) = ct {
+            req = req.header("content-type", ct);
+        }
+        let res = app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn req_api_1_unparseable_json_answers_json_400() {
+        let h = harness(None).await;
+        let (status, body) = raw(
+            &h.app,
+            Method::POST,
+            "/evm/verify_transfer",
+            Some("application/json"),
+            "{not json",
+        )
+        .await;
+        assert_error_body(status, &body, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn req_api_1_missing_content_type_answers_json_415() {
+        let h = harness(None).await;
+        let (status, body) = raw(
+            &h.app,
+            Method::POST,
+            "/evm/register",
+            None,
+            r#"{"id":"x","webhook_url":"https://hook.example/cb"}"#,
+        )
+        .await;
+        assert_error_body(status, &body, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn req_api_1_unknown_path_answers_json_404() {
+        let h = harness(None).await;
+        let (status, body) = call(&h.app, Method::GET, "/evm/nope", None, None).await;
+        assert_error_body(status, &body, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn req_api_1_wrong_method_answers_json_405() {
+        let h = harness(None).await;
+        let (status, body) = call(&h.app, Method::GET, "/evm/register", None, None).await;
+        assert_error_body(status, &body, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn req_api_1_bad_block_number_body_answers_json() {
+        let h = harness(None).await;
+        let (status, body) = raw(
+            &h.app,
+            Method::POST,
+            "/evm/chains/polygon/block_number",
+            Some("application/json"),
+            r#"{"block_number":"ten"}"#,
+        )
+        .await;
+        assert_error_body(status, &body, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn req_api_1_undecodable_path_answers_json_400() {
+        let h = harness(None).await;
+        let (status, body) = call(
+            &h.app,
+            Method::GET,
+            "/evm/chains/%FF/block_number",
+            None,
+            None,
+        )
+        .await;
+        assert_error_body(status, &body, StatusCode::BAD_REQUEST);
     }
 
     #[test]
