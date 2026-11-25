@@ -11,3 +11,4 @@
 - T-002-09 Atomic outbox; separate tokens; counter ceiling; provider health (`REQ-WH-7`, `REQ-WH-8`, `REQ-RG-5`, `REQ-OB-3`).
 - T-002-10 Faucet low-balance alert `faucet_low` (`REQ-FC-4`, amendment 0007).
 - T-002-11 JSON `{error, status}` bodies on rejected requests, unknown paths and wrong methods (SPEC §9.1, `REQ-API-1`).
+- T-002-12 `evmhot-gapscan` exits with its real status: the Postgres store is dropped off the async threads (exit 134/139 after a finished scan).

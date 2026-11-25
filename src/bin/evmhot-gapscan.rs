@@ -90,7 +90,12 @@ async fn main() -> anyhow::Result<()> {
         },
         csv: cli.csv.clone(),
     };
-    let reports = gapscan::run(&config, &db, &opts).await?;
+    let result = gapscan::run(&config, &db, &opts).await;
+    // The sync Postgres client blocks on its own runtime when it is dropped, which panics on
+    // an async thread and aborts the process after the results are written (exit 134/139).
+    // Drop the store on a blocking thread, on success and on error alike.
+    tokio::task::spawn_blocking(move || drop(db)).await?;
+    let reports = result?;
     println!("{}", gapscan::render_summary(&reports, cli.apply));
     println!("CSV written to {}", cli.csv.display());
     Ok(())
