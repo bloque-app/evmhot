@@ -11,8 +11,9 @@ then a mint that evmhot relays or finds already relayed. `deposit_swept` reports
 
 ## Scope
 
-- **Client scope.** A `cctp_burn` target lists its clients by normalized webhook URL origin and names `others`
-  (`hold` on Base), so Mediums' Base deposits are never burned. A deposit's route is fixed and stored when its first
+- **Client scope.** A `cctp_burn` target lists its clients by webhook URL (normalized origin, exact path) and names
+  `others` (`hold` on Base), so only the reserve route's Base deposits are burned; the same client's other routes are
+  not. A deposit's route is fixed and stored when its first
   sweep is planned; a hold releases each deposit to its own route; detection logs the route.
 - **Config.** The `cctp_burn` kind with its destination token, checked at load: `per_transfer` with a maximum, two
   RPC endpoints, and bounds within the reserve's. The pre-burn reads: domains, minter, burn limit, the destination's
@@ -55,7 +56,8 @@ then a mint that evmhot relays or finds already relayed. `deposit_swept` reports
   - relays: one that wins; one that loses to another relayer, singly and in a batch; one that is lost and resent; an
     expired message re-attested; a reverted relay; a message that always reverts, without starving the others;
   - a burn whose reverted receipt a reorganisation turns into a success;
-  - a registration outside the target's clients, kept on `hold`, including across the hold release;
+  - a registration outside the target's clients (another path on a listed origin, too), kept on `hold`, including
+    across the hold release;
   - a change to `clients` while a deposit has a part in flight;
   - a mint short of the burn, and `cctp_unminted`.
 - **Interfaces.** Function signatures, event layouts, `usedNonces`, the attestation and re-attestation responses come

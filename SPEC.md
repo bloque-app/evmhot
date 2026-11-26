@@ -321,16 +321,18 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
     that reverts fails its intent, never the deposit.
   - **Unminted:** a part with no passed mint 60 minutes after its burn was accepted raises `cctp_unminted`, then
     hourly. An operator's recourse is a relay by hand, which the next pass finds.
-- `REQ-SW-19` **(not built)** A `cctp_burn` target lists the registration clients it serves, by the origin of the
-  registration's webhook URL: scheme and host in lowercase (IDNA), and the port unless it is the scheme's default.
+- `REQ-SW-19` **(not built)** A `cctp_burn` target lists the registration clients it serves, each by a webhook URL:
+  its origin (scheme and host in lowercase, IDNA, and the port unless it is the scheme's default) and its exact path
+  (no trailing slash, query or fragment).
   It names `others`, `hold` or a non-`cctp_burn` target table, for every other registration's deposits of the token;
   a missing or `cctp_burn` `others` is refused at load. A deposit's route is fixed and stored when its first sweep is
   planned, and no later configuration change moves a deposit with a part in flight, burned or part-swept. Each part
   stores the transmitter, destination, destination token, recipient, source domain and attestation URL, and its relay
   and mint check run from them. Dropping a `cctp_burn` target, or changing those keys, is refused at load while any
   deposit routed to it has a part in flight, is burned, or is part-swept with parts still owed. A deposit with a
-  stored `cctp_burn` route and no part ever burned takes its registration's current route when next planned, logged. Detection logs each deposit's route. A consumer MUST ignore a `deposit_swept` whose `registration_id` it
-  did not create.
+  stored `cctp_burn` route and no part ever burned takes its registration's current route when next planned, logged.
+  Detection logs each deposit's route. Registration is unauthenticated, so a consumer MUST credit a `deposit_swept`
+  only to a party its own records attribute it to, and park any other.
 
 ## 7. Finality and the detection height
 

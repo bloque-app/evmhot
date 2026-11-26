@@ -32,7 +32,7 @@ mints it to a recipient on another configured network (the **destination**). Its
 | `attestation_url` | Circle's attestation API base URL |
 | `min_finality_threshold` | Default 2000 (standard transfer) |
 | `max_fee` | In the token's minor units; default 0 |
-| `clients` | The registration clients it serves, by webhook URL origin (A1a) |
+| `clients` | The registration clients it serves, by webhook URL (origin and exact path, A1a) |
 | `others` | The target for every other registration's deposits of the token: `hold` or a full target table (A1a) |
 
 At load, refused if any fails:
@@ -57,9 +57,11 @@ Only standard transfers with `max_fee` 0 are built. A fee rule for fast transfer
 
 ## A1a — a target scoped to its clients
 
-New `REQ-SW-19`. A `cctp_burn` target MUST list the registration clients it serves, by the origin of the
-registration's webhook URL. The origin is the scheme and host in lowercase (IDNA for a non-ASCII host) and the port,
-with a scheme's default port dropped. The target MUST also name `others`: the target for every other registration's
+New `REQ-SW-19`. A `cctp_burn` target MUST list the registration clients it serves, each by a webhook URL: its origin
+and its exact path. The origin is the scheme and host in lowercase (IDNA for a non-ASCII host) and the port, with a
+scheme's default port dropped. The path matches exactly, without a trailing slash, a query or a fragment. One service
+may register different kinds of address under different paths of one origin, so the origin alone does not name a
+client. The target MUST also name `others`: the target for every other registration's
 deposits of the token, either `hold` or a full target table that is not `cctp_burn`. Refused at load: a missing
 `others`, an `others` of kind `cctp_burn`, or a `cctp_burn` target used as a network's default target (the default
 also routes the native coin). `REQ-SW-2` is revised to say so.
@@ -78,22 +80,24 @@ also routes the native coin). `REQ-SW-2` is revised to say so.
   Base USDC from `hold` to `cctp_burn` with `others = "hold"` releases only the listed clients' held deposits; every
   other client's stay held. Enabling burns every deposit the listed clients made while Base was on `hold`, so their
   consumers get `deposit_swept` for old deposits.
-- **A registration's origin never changes:** a repeat `register` changes nothing (`REQ-RG-1`). A client that moves to
-  a new host lists both origins until its old registrations are gone.
-- **Real origins live in deployment configuration only.** The example configuration uses `.invalid` placeholders.
+- **A registration's webhook URL never changes:** a repeat `register` changes nothing (`REQ-RG-1`). A client that
+  moves to a new URL lists both until its old registrations are gone.
+- **Real URLs live in deployment configuration only.** The example configuration uses `.invalid` placeholders.
 - **Logging:** detection logs each deposit's route, so a registration that misses the list by a typo is visible
   rather than silently held.
 
-Why: not every client of a network reads the same thing. On Base, the reserve's route (Swaps) reads
-`deposit_swept` 1.1.0, while other clients (Mediums' virtual accounts and per-order addresses) read only its
-top-level fields and route their deposits elsewhere. Burning their USDC into the reserve would be wrong as well as
-unreadable. The origin is what the client chose at registration, so it needs no new API.
+Why: one client registers addresses for several routes. Mediums registers every reserve (bUSDC) deposit address,
+and its other EVM routes (per-order bridge addresses, real-time payment addresses) too, all on one origin with one
+path per route. Only the reserve's route ends in the Safe; the others route their deposits elsewhere and read only
+the top-level 1.0.0 fields. Burning their USDC into the reserve would be wrong as well as unreadable. The webhook URL
+is what the client chose at registration, so this needs no new API.
 
-The limit, stated plainly: registration is unauthenticated (§12), and matching is on origin only. A caller that
-registers with a listed origin, on any path, gets its deposits burned into the reserve, and evmhot pays the gas of
-both the burn and the relay. The listed client is then posted about deposits it never made. That is today's exposure
-for any webhook URL on Polygon. So a consumer MUST ignore a `deposit_swept` whose `registration_id` it did not create,
-and the reserve's own registration (by Swaps, at bezent) credits only deposits Swaps knows.
+The limit, stated plainly: registration is unauthenticated (§12), so the URL is spoofable. A caller that registers
+with a listed URL gets its deposits burned into the reserve, and evmhot pays the gas of both the burn and the relay.
+The listed client is then posted about a deposit it never made. That is today's exposure for any webhook URL on
+Polygon. A consumer MUST therefore credit a `deposit_swept` only to a party it can attribute it to by its own records
+(for the reserve: an account the registering client holds at that deposit address), and park any other. Such USDC
+reaches the reserve and is owed there, but is credited to no one.
 
 ## A2 — the burn
 
