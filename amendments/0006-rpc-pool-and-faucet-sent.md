@@ -6,6 +6,10 @@
 **Rationale in one line:** on free public RPCs (publicnode: 1,200 requests a minute per caller IP, shared by both
 chains) one 429 threw away a whole 500-block chunk, and a faucet top-up that was broadcast was logged as failed.
 
+**Erratum (26 Nov, SPEC 0.2.7):** `REQ-DT-9` below was already in use (a network with no cursor starts at the
+detection height), so this rule is `REQ-DT-11` in `SPEC.md`. Applying this amendment also dropped §6.2, §6.3 and
+`REQ-DT-10` from `SPEC.md` by mistake, and left `REQ-FC-3` out; 0.2.7 restores them.
+
 ## A1 — `rpc_urls`
 
 A `[[chains]]` table MAY carry `rpc_urls = ["...", "..."]` beside `rpc_url`. The pool is `rpc_url` first, then
