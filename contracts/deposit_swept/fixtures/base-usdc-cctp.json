@@ -12,7 +12,7 @@
   "token_symbol": "USDC",
   "token_address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
   "token_decimals": 6,
-  "sweep_tx_hash": "0x6666666666666666666666666666666666666666666666666666666666666666",
+  "sweep_tx_hash": "0x5555555555555555555555555555555555555555555555555555555555555555",
   "sweeps": [
     {
       "sweep_network": "polygon",

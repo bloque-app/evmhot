@@ -12,8 +12,15 @@ Additive, for `cctp_burn` targets (`SPEC.md` 0.2.8, amendment 0008). Each `sweep
 - `burn_tx_hash`: the `depositForBurn` on `chain`. `sweep_tx_hash` and the coordinate are then the mint's
   `receiveMessage` on `sweep_network`, and `sweep_target` is the mint recipient.
 
+The top-level `sweep_tx_hash` is the first part's transaction from the deposit address, on `chain`: for a `transfer`
+the same as `sweeps[0].sweep_tx_hash`, as before; for `cctp_burn`, the first burn.
+
 The event is sent once every part is minted, never after the burn alone. Fixture: one Base deposit minted to the
 Polygon reserve. Consumers key a sweep on `(sweep_network or chain, sweep_block_hash, sweep_log_index)`.
+
+The schema change is additive, but a 1.0.0 reader that ignores `sweep_network` would misplace a mint's coordinate. So
+no `cctp_burn` target is enabled until every consumer of that network's `deposit_swept` has confirmed 1.1.0
+(`REQ-WH-12`).
 
 ## 1.0.0 — 2026-11-09
 

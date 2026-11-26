@@ -82,7 +82,7 @@
     },
     "sweep_tx_hash": {
       "$ref": "#/$defs/hash",
-      "description": "Equal to sweeps[0].sweep_tx_hash; kept for older clients."
+      "description": "The first part's transaction from the deposit address, on chain: sweeps[0].sweep_tx_hash for a transfer, sweeps[0].burn_tx_hash for a cctp_burn deposit (1.1.0). Kept for older clients."
     },
     "sweeps": {
       "type": "array",
