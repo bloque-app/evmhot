@@ -3123,6 +3123,7 @@ async fn deposit_swept_payload_matches_the_published_contract() {
     for fixture in [
         include_str!("../contracts/deposit_swept/fixtures/polygon-usdc-single.json"),
         include_str!("../contracts/deposit_swept/fixtures/polygon-usdc-split.json"),
+        include_str!("../contracts/deposit_swept/fixtures/base-usdc-cctp.json"),
     ] {
         let value: Value = serde_json::from_str(fixture).unwrap();
         assert_valid(&validator, &value, "a published fixture");

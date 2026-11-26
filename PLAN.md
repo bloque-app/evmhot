@@ -65,13 +65,14 @@ Polygon detects on `finalized` (measured about 4 s behind the newest block). Bas
 Configured per network and token in `chains.toml`. Polygon native USDC goes to bezent's reserve, a `transfer` target
 that admits only that token, needs a refund address per sweep, and has bezent's per-transfer bounds (`REQ-SW-7`,
 `REQ-SW-8`, `REQ-SW-12`). Polygon USDT0 is held in its deposit addresses until bezent admits it into the same reserve.
-Base USDC is held until it can reach that reserve, which needs a bridge leg to Polygon (R9). `directed_deposit` (F-004) follows bezent's contract.
+Base USDC is held until it can reach that reserve. F-005 builds that leg: a `cctp_burn` target that burns on Base over CCTP V2, standard transfer, and mints to the reserve on Polygon (amendment 0008). `directed_deposit` (F-004) follows bezent's contract.
 
 ### DEC-7 Keys
 
 Two mnemonics, read from the environment at start: deposit and faucet. In production they come from the secret
 store through the deployment, never from files in the image. They are the same mnemonics that derived every existing
-address (`REQ-KY-4`).
+address (`REQ-KY-4`). The relayer for CCTP mints is the faucet mnemonic's index 1 (`REQ-KY-5`), so it needs no new
+secret.
 
 ### DEC-8 Deployment
 
@@ -93,6 +94,8 @@ unannounced.
 | Secret-store path with the existing mnemonics | Bloque operations | F-003 |
 | Clients' base-URL change | Mediums and Swaps owners | Cutover |
 | bezent's directed-deposit contract | bezent | F-004 |
+| Circle's CCTP V2 contracts and attestation API (public; no key) | Circle | F-005 |
+| Swaps registering the Polygon mint for a Base deposit, on `deposit_swept` 1.1.0 | Swaps | F-005 in production |
 
 ## 4. Features
 
@@ -102,6 +105,7 @@ unannounced.
 | F-002 pre-restart fixes | Sweep outcome, sweep coordinate, senders and per-sender sweeps, finality per network, target bounds and admission, atomic outbox, separate tokens, counter ceiling, lag and provider alerts with back-off, ranged steady-state logs, operator route auth, provider health, withdraw the symbol filter | `REQ-SW-5`, `REQ-SW-7` to `REQ-SW-10`, `REQ-SW-12`, `REQ-WH-4`, `REQ-WH-7` to `REQ-WH-9`, `REQ-RG-5`, `REQ-DT-8`, `REQ-DT-10`, `REQ-OB-1` to `REQ-OB-3`, `REQ-API-2`, `INV-5`, `INV-6` |
 | F-003 self-hosting | Image pins, deploy definitions and runbook in the devops repository; the service, task role, DNS and routing in the infrastructure repository; the store move | DEC-2, DEC-7, DEC-8, DEC-9 |
 | F-004 directed deposit | `directed_deposit` targets | `REQ-SW-6` (second kind) |
+| F-005 CCTP burn | `cctp_burn` targets: approve and burn on the source, sender check, attestation, relay and mint check on the destination, `deposit_swept` 1.1.0 | `REQ-SW-6` (fourth kind), `REQ-SW-16` to `REQ-SW-19`, `REQ-KY-5`, `REQ-WH-12`, and the parts of `REQ-SW-2`, `REQ-SW-3`, `REQ-SW-13` to `REQ-SW-15`, `REQ-FC-1`, `REQ-WH-4`, `REQ-WH-11`, `REQ-OB-4`, `INV-5`, `INV-7`, `INV-8` marked (not built, amendment 0008); `INV-9` |
 
 ## 5. Milestones
 
@@ -110,15 +114,19 @@ unannounced.
 - **M-3 Ready to restart.** F-002 merged; F-003's definitions reviewed.
 - **M-4 Running.** Production restarted by the runbook; clients cut over.
 - **M-5 Directed deposits.** F-004, when bezent's contract ships.
+- **M-6 Base USDC reaches the reserve.** F-005 merged; a test deposit on Base minted to the reserve; then production.
 
 ## 6. Risks
 
 - **Losing the store** strands addresses (`REQ-ST-2`). Snapshot before every migration; verify row counts after.
 - **Provider quota** silently stopping detection. Mitigated by DEC-4 and `REQ-OB-1`/`REQ-OB-2`.
 - **Misrouted tokens** into a reserve that cannot refund them automatically. Mitigated by `REQ-SW-8` at load time.
+- **Funds between a burn and its mint** are on neither network, and a message expires about 24 hours after
+  attestation. Mitigated by `cctp_unminted`, re-attestation before a relay, and a zero destination caller, so anyone
+  can relay.
 - **A wrong counter seed** reallocating an index. Mitigated by `REQ-RG-3` and a test that seeds from a store with
   hashed indices.
 
 ## 7. What to do first
 
-F-001, then F-002, then F-003. F-004 waits on bezent.
+F-001, then F-002, then F-003. F-004 waits on bezent. F-005 can start now.
