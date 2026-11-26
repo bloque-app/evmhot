@@ -1,6 +1,6 @@
 # evmhot — System Specification
 
-**Version:** 0.2.7 · **Status:** draft for review · **Owner:** @pandres95
+**Version:** 0.2.8 · **Status:** draft for review · **Owner:** @pandres95
 
 ## 0. How to read this document
 
@@ -16,6 +16,7 @@ yet are marked **(not built)**, and `PLAN.md` §4 names the feature that builds 
 | Version | Date | Change |
 |---|---|---|
 | 0.1.0 | 2026-11-09 | The service as it ran: registration, detection, sweeps, faucet, webhooks, store, API |
+| 0.2.8 | 2026-11-26 | Amendment 0008 **(not built)**: the `cctp_burn` target kind (Base USDC burned over CCTP V2 and minted to the Polygon reserve), the sender check before a burn, the relayer key, `deposit_swept` 1.1.0 |
 | 0.2.7 | 2026-11-26 | Repair: restores §6.2, §6.3, `REQ-DT-9` and the withdrawn `REQ-DT-10`, which the 0.2.5 edit dropped; 0006's retry rule becomes `REQ-DT-11`; adds `REQ-FC-3` |
 | 0.2.6 | 2026-11-23 | Amendment 0007: `faucet_low` when a faucet's balance is below its network's floor |
 | 0.2.5 | 2026-11-12 | Amendment 0006: `rpc_urls` pool with failover, backoff on rate limits instead of discarding a chunk, no skipping a block a lagging endpoint reports missing, a faucet top-up that was sent is sent |
@@ -73,6 +74,8 @@ a host service.
   other systems and keeps no list of permitted senders.
 - Prices, conversions, fees charged to a party, refunds.
 - Custody of the sweep targets.
+- Payouts: sending funds from custody to a party, on any network. A `cctp_burn` sweep (§6.7) moves a deposit to its
+  target on another network; it pays no one.
 
 ## 2. Glossary
 
@@ -124,6 +127,9 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   store, or included in a webhook.
 - `REQ-KY-4` A change of deposit mnemonic strands every existing address. The deposit mnemonic MUST NOT change while
   any registration exists.
+- `REQ-KY-5` **(not built)** The **relayer**, which relays `cctp_burn` mints (`REQ-SW-18`), is the faucet mnemonic's
+  address at index 1. It pays only for relays, and the faucet tops it up on the destination like a deposit address
+  (`REQ-FC-1`). (Amendment 0008.)
 
 ### 5.2 Registration
 
@@ -205,6 +211,10 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   - `hold`: no sweep. Deposits are detected, stored and notified with `deposit_detected`, and stay in
     their deposit addresses until the token's target changes to another kind. Changing it releases every held
     deposit to the new target. (Amendment 0003.)
+  - `cctp_burn` **(not built)**: a burn through Circle's CCTP V2 that mints the token to a recipient on another
+    configured network, the **destination** (§6.7). The mint is the transfer into the target for `REQ-SW-9` and its
+    coordinate for `REQ-SW-10`, on the destination. A `cctp_burn` target MAY be `per_transfer` (`REQ-SW-15`). Only
+    standard transfers with a zero maximum fee are built. (Amendment 0008.)
 - `REQ-SW-7` A target MAY declare a minimum and a maximum per sweep, in the token's minor units:
   - A balance below the minimum MUST NOT be swept to that target. It stays in the deposit address until later
     deposits bring it to the minimum.
@@ -255,6 +265,33 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   transaction hash, block number, block hash, the block-level log index of the `Transfer` into the target, the
   amount swept, and the target address (`sweep_target`, amendment 0004). The log index is the position of that log in its block, taken from the receipt, not its position
   within the transaction.
+
+### 6.7 CCTP burns (amendment 0008)
+
+- `REQ-SW-16` **(not built)** A `cctp_burn` target names the network's `TokenMessengerV2`, the destination's
+  `MessageTransmitterV2`, the destination, both CCTP domains, the mint recipient, the attestation API's URL, the
+  minimum finality threshold (default 2000) and the maximum fee (default 0). At load, the destination MUST be a
+  configured network, the recipient non-zero, and the network MUST have at least two RPC endpoints. Before the first
+  burn of a process, evmhot reads both sides' `localDomain`, the messenger's minter and its per-message burn limit for the
+  token. A domain that differs from the configuration, or a target maximum above the burn limit, stops burns on that
+  target and raises `cctp_config`. A sweep is, from the deposit address, an `approve` of the messenger for the largest
+  amount once per address and token (an intent that settles no deposit), then per sweep `depositForBurn` with
+  destination caller zero. Both are sweep intents under `REQ-SW-13`, and the faucet tops up gas for each. A burn's
+  receipt passes only if it holds the messenger's `DepositForBurn` for this token, amount, depositor, recipient and
+  domain, and the token's `Transfer` of that amount out of the deposit address; anything else is `sweep_review`. A
+  passed burn leaves its deposit **burned**: no longer in the address, not yet swept.
+- `REQ-SW-17` **(not built)** Before each burn, evmhot reads the deposit's sender's code on two of the network's
+  endpoints. Both empty, or both an EIP-7702 delegation designator (`0xef0100` and 20 bytes): the burn may proceed.
+  Both other code: the deposit enters `needs_review` (`contract_sender`) and waits for an operator. A failed read or a
+  disagreement: no burn this pass; after an hour of that, `contract_sender` is raised for the deposit.
+- `REQ-SW-18` **(not built)** Each pass, for each burned deposit, evmhot asks the attestation API for the burn's
+  message. Once it is `complete`, evmhot has the message, its nonce and the attestation. If the destination's
+  transmitter already marks that nonce used, evmhot finds the `MessageReceived` for it and checks that mint.
+  Otherwise the relayer (`REQ-KY-5`) sends `receiveMessage` as a relay intent under the rules of `REQ-SW-13`. A relay
+  that reverts because the nonce is now used falls back to finding the mint. A mint passes only if its receipt holds
+  the token's `Transfer` from the zero address to the recipient for the burned amount, less the fee the message says
+  was executed. The deposit is then swept with that coordinate. A burned deposit with no passed mint 60 minutes after
+  its burn raises `cctp_unminted`, then again hourly.
 
 ## 7. Finality and the detection height
 
@@ -343,6 +380,10 @@ never re-opening one. What is owed is then computed
 from recorded sweeps alone; retrying a review whose sweep in fact moved the funds is the operator's word that nothing
 more is owed (amendment 0004).
 
+- `REQ-WH-12` **(not built)** A `cctp_burn` deposit's `deposit_swept` is sent once every part is minted. Its
+  top-level fields describe the deposit on its own network. Each `sweeps[]` entry adds `sweep_network` (the
+  destination) and `burn_tx_hash` (that part's burn), and its `sweep_*` coordinate, `sweep_tx_hash` and `sweep_target`
+  are the mint's. An entry without `sweep_network` is on the deposit's own network. Contract 1.1.0. (Amendment 0008.)
 - `REQ-API-1` A standalone evmhot MUST serve §9.1 under `/evm` with exactly those shapes, so that existing clients only
   change their base URL. It MAY also serve per-network forms of `block_number` that take a `chain`.
 - `REQ-API-2` **(not built)** `POST /evm/block_number` MUST require the operator's bearer token.
@@ -365,7 +406,7 @@ more is owed (amendment 0004).
 - `REQ-OB-4` An alert is a log line starting `EVMHOT_ALERT kind=<kind> network=<network>`, with the deposit's identity
   and transaction where there are some. Kinds: `sweep_review`, `balance_shortfall`, `no_sender`, `pair_blocked`
   (review or failed blockers only), `dust`, `settled_without_sweep`, `native_sweep_failed`, `review_self_resolved`,
-  `sweep_stuck`, `notify_failed`, `faucet_low` (amendment 0007), and with `REQ-OB-1`/`REQ-OB-2` `lag` and `provider`. `dust` and `pair_blocked` are raised once per deposit
+  `sweep_stuck`, `notify_failed`, `faucet_low` (amendment 0007), `contract_sender`, `cctp_unminted` and `cctp_config` (amendment 0008, not built), and with `REQ-OB-1`/`REQ-OB-2` `lag` and `provider`. `dust` and `pair_blocked` are raised once per deposit
   and blocking state. (Amendment 0004.)
 - `REQ-FC-4` Per network, evmhot reads the faucet's balance every 5 minutes and raises `faucet_low` when it is below
   the chain's `faucet_low_balance` (wei; default 20 × `existential_deposit`; zero is refused at load): on the first
@@ -381,13 +422,15 @@ more is owed (amendment 0004).
 - `INV-3` A derivation index belongs to at most one registration.
 - `INV-4` No key or mnemonic leaves the process (`REQ-KY-3`).
 - `INV-5` A deposit marked swept with a sweep transaction has a successful receipt for that
-  transaction (`REQ-SW-5`).
+  transaction (`REQ-SW-5`). A deposit swept by `cctp_burn` has a successful burn receipt and a successful mint receipt
+  holding its `Transfer` (`REQ-SW-18`).
 - `INV-6` No sweep sends a token to a target that does not admit it (`REQ-SW-8`).
 - `INV-7` No deposit is marked swept (by a receipt or by `REQ-SW-3`) or released by an operator while a sweep intent
   covering it is pending, and a deposit is settled only by its recorded sweeps once nothing is left owed
   (`REQ-SW-13`).
 - `INV-8` Every transaction mined from a deposit address is a recorded sweep or belongs to an open intent
   (`REQ-SW-13`).
+- `INV-9` **(not built)** Every transaction mined from the relayer belongs to a recorded relay intent (`REQ-SW-18`).
 
 What this version does not protect, stated plainly:
 
