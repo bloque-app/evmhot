@@ -71,9 +71,9 @@ also routes the native coin). `REQ-SW-2` is revised to say so.
   the transmitter, destination, destination token, recipient, source domain and attestation URL. Live configuration
   is never used for them.
 - **Changing a target in use.** Configuration that drops a `cctp_burn` target, or changes any of those keys, is
-  refused at load while any of its parts is in flight. A deposit with a stored `cctp_burn` route and nothing in flight
-  (planned, then failed or in review) takes its registration's current route when it is next planned, and the change
-  is logged.
+  refused at load while any deposit routed to it is unsettled and committed: a part in flight, burned, or part-swept
+  with parts still owed. A deposit with a stored `cctp_burn` route and no part ever burned (planned, then failed or in
+  review) takes its registration's current route when it is next planned, and the change is logged.
 - **Releasing a hold** (`REQ-SW-6`) sends each held deposit to the target its registration now routes to. Changing
   Base USDC from `hold` to `cctp_burn` with `others = "hold"` releases only the listed clients' held deposits; every
   other client's stay held. Enabling burns every deposit the listed clients made while Base was on `hold`, so their
