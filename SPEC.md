@@ -325,7 +325,11 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   registration's webhook URL: scheme and host in lowercase (IDNA), and the port unless it is the scheme's default.
   It names `others`, `hold` or a non-`cctp_burn` target table, for every other registration's deposits of the token;
   a missing or `cctp_burn` `others` is refused at load. A deposit's route is fixed and stored when its first sweep is
-  planned. Detection logs each deposit's route. A consumer MUST ignore a `deposit_swept` whose `registration_id` it
+  planned, and no later configuration change moves a deposit with a part in flight, burned or part-swept. Each part
+  stores the transmitter, destination, destination token, recipient, source domain and attestation URL, and its relay
+  and mint check run from them. Dropping a `cctp_burn` target, or changing those keys, is refused at load while any of
+  its parts is in flight. A deposit with a stored `cctp_burn` route and nothing in flight takes its registration's
+  current route when next planned, logged. Detection logs each deposit's route. A consumer MUST ignore a `deposit_swept` whose `registration_id` it
   did not create.
 
 ## 7. Finality and the detection height

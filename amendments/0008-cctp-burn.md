@@ -65,7 +65,15 @@ deposits of the token, either `hold` or a full target table that is not `cctp_bu
 also routes the native coin). `REQ-SW-2` is revised to say so.
 
 - **The route is fixed per deposit** when its first sweep is planned, and stored with it, as the sender verdict is.
-  A later change to `clients` never moves a deposit with a part in flight, burned, or already part-swept.
+  No later change to the target, to `clients` or to any other key, moves a deposit with a part in flight, burned, or
+  already part-swept.
+- **Each part carries what finishing it needs.** Its relay and mint check run from what is stored with the part:
+  the transmitter, destination, destination token, recipient, source domain and attestation URL. Live configuration
+  is never used for them.
+- **Changing a target in use.** Configuration that drops a `cctp_burn` target, or changes any of those keys, is
+  refused at load while any of its parts is in flight. A deposit with a stored `cctp_burn` route and nothing in flight
+  (planned, then failed or in review) takes its registration's current route when it is next planned, and the change
+  is logged.
 - **Releasing a hold** (`REQ-SW-6`) sends each held deposit to the target its registration now routes to. Changing
   Base USDC from `hold` to `cctp_burn` with `others = "hold"` releases only the listed clients' held deposits; every
   other client's stay held. Enabling burns every deposit the listed clients made while Base was on `hold`, so their
@@ -221,8 +229,8 @@ lists them. Consumers key a sweep on `(sweep_network or chain, sweep_block_hash,
 
 ## A7 — store and invariants
 
-The store gains: each deposit's sender verdict; parts in flight with their burn, message, nonce, expiry and
-attestation; relay intents. `REQ-SW-13`'s one-open-intent rule also covers the relayer.
+The store gains: each deposit's route and sender verdict; parts in flight with their burn, message, nonce, expiry,
+attestation, and the relay and mint parameters (A1a); relay intents. `REQ-SW-13`'s one-open-intent rule also covers the relayer.
 
 - `INV-5` widens: a deposit swept by `cctp_burn` has, for each part, an accepted burn receipt and a passed mint
   receipt holding its `Transfer`.

@@ -2,7 +2,8 @@
 
 - T-005-01 Config: the `cctp_burn` kind, its keys, its clients and `others` (`REQ-SW-19`) and load-time checks; the
   pre-burn reads and `cctp_config`. Route stored per deposit; hold release per route; `.invalid` examples.
-- T-005-02 Store: sender verdicts, parts in flight (burn, message, nonce, expiry, attestation), relay intents.
+- T-005-02 Store: routes and sender verdicts, parts in flight (burn, message, nonce, expiry, attestation, relay and
+  mint parameters), relay intents; refuse a config that drops or edits a target with parts in flight.
   Postgres and SQLite migrations, plus the importer.
 - T-005-03 Fake chain: messenger, transmitter, minter, attestation and re-attestation stub.
 - T-005-04 Source leg: the on-chain allowance check, approval and burn intents, the burn receipt check, and acceptance
