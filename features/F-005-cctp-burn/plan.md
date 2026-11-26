@@ -11,8 +11,9 @@ then a mint that evmhot relays or finds already relayed. `deposit_swept` reports
 
 ## Scope
 
-- **Client scope.** A `cctp_burn` target lists its clients by webhook URL origin; other registrations' deposits keep
-  the token's other target (`hold` on Base today), so Mediums' Base deposits are never burned.
+- **Client scope.** A `cctp_burn` target lists its clients by normalized webhook URL origin and names `others`
+  (`hold` on Base), so Mediums' Base deposits are never burned. A deposit's route is fixed and stored when its first
+  sweep is planned; a hold releases each deposit to its own route; detection logs the route.
 - **Config.** The `cctp_burn` kind with its destination token, checked at load: `per_transfer` with a maximum, two
   RPC endpoints, and bounds within the reserve's. The pre-burn reads: domains, minter, burn limit, the destination's
   local token, and the minimum fee (a revert reads as zero, a transport error skips the pass); `cctp_config`.
@@ -33,7 +34,7 @@ then a mint that evmhot relays or finds already relayed. `deposit_swept` reports
   the destination's detection height.
 - **Relayer.** Faucet index 1. One relay loop per destination, with at most one open relay intent, oldest ready part
   first; an intent's part never changes. Each relay is simulated before signing, and each part backs off on its own
-  after a revert; `relay_failing` after 5. The `usedNonces` and expiry reads come before every rebroadcast or re-sign.
+  after a revert (a re-sign at an existing nonce is never refused for reverting); `relay_failing` after 5. The `usedNonces` and expiry reads come before every rebroadcast or re-sign.
   A relay that lost to someone else is left to revert. A re-attested message is re-signed at the same nonce with both
   fees raised by at least 10%. The faucet funds the relayer through `ensure_gas`.
 - **Webhook.** `sweep_network` and `burn_tx_hash` on each entry; the top-level `sweep_tx_hash` is the first burn.
@@ -54,7 +55,8 @@ then a mint that evmhot relays or finds already relayed. `deposit_swept` reports
   - relays: one that wins; one that loses to another relayer, singly and in a batch; one that is lost and resent; an
     expired message re-attested; a reverted relay; a message that always reverts, without starving the others;
   - a burn whose reverted receipt a reorganisation turns into a success;
-  - a registration outside the target's clients, kept on `hold`;
+  - a registration outside the target's clients, kept on `hold`, including across the hold release;
+  - a change to `clients` while a deposit has a part in flight;
   - a mint short of the burn, and `cctp_unminted`.
 - **Interfaces.** Function signatures, event layouts, `usedNonces`, the attestation and re-attestation responses come
   from Circle's verified V2 source and API documentation at build time, not from this plan.

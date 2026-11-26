@@ -177,8 +177,9 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   Several deposits of one token to one address can therefore be settled by one sweep; each of them is then marked swept
   by that sweep. `REQ-SW-12` overrides this for targets that need a refund address.
 - `REQ-SW-2` A sweep goes to the token's sweep target on that network. A token with no target of its own uses the
-  network's default target. The native coin always uses the default target. **(not built, amendment 0008)** A deposit whose registration
-  is not among a `cctp_burn` target's clients uses the token's other target on that network (`REQ-SW-19`).
+  network's default target. The native coin always uses the default target. **(not built, amendment 0008)** A `cctp_burn` target
+  serves only its listed clients; every other registration's deposits of the token go to its `others` target
+  (`REQ-SW-19`). A `cctp_burn` target is never a network's default target.
 - `REQ-SW-3` A token deposit whose address holds a zero balance of the token is retried for 10 passes and then marked
   swept with no sweep transaction. Native deposits have no such rule. It applies only to a group with no recorded sweep
   and no intent other than a failed, dropped or closed-by-operator one; when it settles a deposit whose keys have any
@@ -212,7 +213,8 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
     the same for every deposit address.
   - `hold`: no sweep. Deposits are detected, stored and notified with `deposit_detected`, and stay in
     their deposit addresses until the token's target changes to another kind. Changing it releases every held
-    deposit to the new target. (Amendment 0003.)
+    deposit to the new target. (Amendment 0003.) **(not built, amendment 0008)** Each held deposit is released to
+    the target its registration now routes to (`REQ-SW-19`); the others stay held.
   - `cctp_burn` **(not built)**: a burn through Circle's CCTP V2 that mints the token to a recipient on another
     configured network, the **destination** (§6.7). The mint is the transfer into the target for `REQ-SW-9`, and its
     coordinate is the one in `REQ-SW-10`, on the destination. A `cctp_burn` target MUST be `per_transfer`
@@ -309,7 +311,8 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
     nonce used, it searches `MessageReceived` by nonce in bounded ranges from the head recorded on the burn's intent.
     Otherwise the relayer (`REQ-KY-5`) sends `receiveMessage` as a relay intent for that part under `REQ-SW-13`, one
     open relay intent per relayer, oldest ready part first. An intent's part never changes.
-  - **Before signing a relay**, evmhot simulates it and signs nothing that would revert. Each simulated or mined revert
+  - **Before a relay intent's first signature**, evmhot simulates it and signs nothing that would revert; a re-sign at
+    an existing intent's nonce is never refused for that. Each simulated or mined revert
     backs that part off (1 minute doubling to 60), and the fifth raises `relay_failing`, then hourly.
   - **Before any relay rebroadcast or re-sign**, evmhot reads `usedNonces` and the message's `expirationBlock`. If the
     nonce is used, the part settles from that mint and the open relay is left to be mined and revert. If the message
@@ -319,8 +322,11 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   - **Unminted:** a part with no passed mint 60 minutes after its burn was accepted raises `cctp_unminted`, then
     hourly. An operator's recourse is a relay by hand, which the next pass finds.
 - `REQ-SW-19` **(not built)** A `cctp_burn` target lists the registration clients it serves, by the origin of the
-  registration's webhook URL. Only deposits of those registrations are swept to it; the others use the token's other
-  target on the network (`REQ-SW-2`).
+  registration's webhook URL: scheme and host in lowercase (IDNA), and the port unless it is the scheme's default.
+  It names `others`, `hold` or a non-`cctp_burn` target table, for every other registration's deposits of the token;
+  a missing or `cctp_burn` `others` is refused at load. A deposit's route is fixed and stored when its first sweep is
+  planned. Detection logs each deposit's route. A consumer MUST ignore a `deposit_swept` whose `registration_id` it
+  did not create.
 
 ## 7. Finality and the detection height
 

@@ -1,7 +1,7 @@
 # F-005 tasks
 
-- T-005-01 Config: the `cctp_burn` kind, its keys, its clients (`REQ-SW-19`) and load-time checks; the pre-burn reads
-  and `cctp_config`.
+- T-005-01 Config: the `cctp_burn` kind, its keys, its clients and `others` (`REQ-SW-19`) and load-time checks; the
+  pre-burn reads and `cctp_config`. Route stored per deposit; hold release per route; `.invalid` examples.
 - T-005-02 Store: sender verdicts, parts in flight (burn, message, nonce, expiry, attestation), relay intents.
   Postgres and SQLite migrations, plus the importer.
 - T-005-03 Fake chain: messenger, transmitter, minter, attestation and re-attestation stub.

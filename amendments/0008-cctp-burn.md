@@ -33,6 +33,7 @@ mints it to a recipient on another configured network (the **destination**). Its
 | `min_finality_threshold` | Default 2000 (standard transfer) |
 | `max_fee` | In the token's minor units; default 0 |
 | `clients` | The registration clients it serves, by webhook URL origin (A1a) |
+| `others` | The target for every other registration's deposits of the token: `hold` or a full target table (A1a) |
 
 At load, refused if any fails:
 
@@ -56,18 +57,35 @@ Only standard transfers with `max_fee` 0 are built. A fee rule for fast transfer
 
 ## A1a — a target scoped to its clients
 
-New `REQ-SW-19`. A `cctp_burn` target MUST list the registration clients it serves, by the origin (scheme, host and
-port) of the registration's webhook URL. A deposit whose registration's webhook origin is not listed is not swept to
-it: it uses the token's other target on that network. For Base USDC today that is `hold`. `REQ-SW-2` is revised to
-say so.
+New `REQ-SW-19`. A `cctp_burn` target MUST list the registration clients it serves, by the origin of the
+registration's webhook URL. The origin is the scheme and host in lowercase (IDNA for a non-ASCII host) and the port,
+with a scheme's default port dropped. The target MUST also name `others`: the target for every other registration's
+deposits of the token, either `hold` or a full target table that is not `cctp_burn`. Refused at load: a missing
+`others`, an `others` of kind `cctp_burn`, or a `cctp_burn` target used as a network's default target (the default
+also routes the native coin). `REQ-SW-2` is revised to say so.
 
-Not every client of a network reads the same thing. On Base, the reserve's route (Swaps) reads `deposit_swept` 1.1.0,
-while other clients (Mediums' virtual accounts and per-order addresses) read only its top-level fields and route
-their deposits elsewhere. Swapping their USDC into the reserve would be wrong as well as unreadable. The origin is
-what the client chose at registration, so it needs no new API. The limit, stated plainly: registration is
-unauthenticated (§12), so a caller that registers with a listed origin has its deposits burned into the reserve, and
-the listed client is posted about deposits it never made. That is today's exposure for any webhook URL, and the
-reserve's own registration (by Swaps, at bezent) credits only deposits Swaps knows.
+- **The route is fixed per deposit** when its first sweep is planned, and stored with it, as the sender verdict is.
+  A later change to `clients` never moves a deposit with a part in flight, burned, or already part-swept.
+- **Releasing a hold** (`REQ-SW-6`) sends each held deposit to the target its registration now routes to. Changing
+  Base USDC from `hold` to `cctp_burn` with `others = "hold"` releases only the listed clients' held deposits; every
+  other client's stay held. Enabling burns every deposit the listed clients made while Base was on `hold`, so their
+  consumers get `deposit_swept` for old deposits.
+- **A registration's origin never changes:** a repeat `register` changes nothing (`REQ-RG-1`). A client that moves to
+  a new host lists both origins until its old registrations are gone.
+- **Real origins live in deployment configuration only.** The example configuration uses `.invalid` placeholders.
+- **Logging:** detection logs each deposit's route, so a registration that misses the list by a typo is visible
+  rather than silently held.
+
+Why: not every client of a network reads the same thing. On Base, the reserve's route (Swaps) reads
+`deposit_swept` 1.1.0, while other clients (Mediums' virtual accounts and per-order addresses) read only its
+top-level fields and route their deposits elsewhere. Burning their USDC into the reserve would be wrong as well as
+unreadable. The origin is what the client chose at registration, so it needs no new API.
+
+The limit, stated plainly: registration is unauthenticated (§12), and matching is on origin only. A caller that
+registers with a listed origin, on any path, gets its deposits burned into the reserve, and evmhot pays the gas of
+both the burn and the relay. The listed client is then posted about deposits it never made. That is today's exposure
+for any webhook URL on Polygon. So a consumer MUST ignore a `deposit_swept` whose `registration_id` it did not create,
+and the reserve's own registration (by Swaps, at bezent) credits only deposits Swaps knows.
 
 ## A2 — the burn
 
@@ -150,7 +168,9 @@ Relay intents follow `REQ-SW-13`: recorded before signing, an explicit nonce on 
 sent to review by the same rules. An intent's part never changes. Its transactions differ only in fees, or in a
 re-attested message for the same part.
 
-- **Before signing**, evmhot simulates the call (`eth_call`) and signs nothing that would revert. A simulated or mined
+- **Before an intent's first signature**, evmhot simulates the call (`eth_call`) and signs nothing that would revert.
+  A re-sign at an existing intent's nonce, for fees or for a re-attested message, is never refused because it would
+  revert, so a relay that lost to someone else can still be repriced and mined. A simulated or mined
   revert backs that part off on its own (1, 2, 4 … up to 60 minutes). After 5 reverts it raises `relay_failing`, then
   again hourly. The relay loop takes the oldest part that is ready, so one failing message never starves the others.
 - **Before a rebroadcast or re-sign**, evmhot reads `usedNonces` and the message's expiry:
@@ -224,7 +244,7 @@ attestation; relay intents. `REQ-SW-13`'s one-open-intent rule also covers the r
 | Action | Identifiers |
 |---|---|
 | New | `REQ-SW-16`, `REQ-SW-17`, `REQ-SW-18`, `REQ-SW-19`, `REQ-KY-5`, `REQ-WH-12`, `INV-9` |
-| Revised | `REQ-SW-2` (a target scoped to its clients), `REQ-SW-3` (not for a deposit with a part in flight), `REQ-SW-6` (kind `cctp_burn`), `REQ-SW-13` (covers the relayer), `REQ-SW-14` and `REQ-SW-15` (parts in flight count as paid), `REQ-FC-1` (the faucet also funds the relayer), `REQ-WH-4` (the top-level `sweep_tx_hash`), `REQ-WH-11` (contract 1.1.0, and a field that changes how others are read is gated), `REQ-OB-4` (kinds `contract_sender`, `sender_unchecked`, `cctp_unminted`, `cctp_config`, `relay_failing`), `INV-5`, `INV-7`, `INV-8` |
+| Revised | `REQ-SW-2` (a target scoped to its clients), `REQ-SW-6` (kind `cctp_burn`; a hold releases each deposit to its registration's route), `REQ-SW-3` (not for a deposit with a part in flight), `REQ-SW-13` (covers the relayer), `REQ-SW-14` and `REQ-SW-15` (parts in flight count as paid), `REQ-FC-1` (the faucet also funds the relayer), `REQ-WH-4` (the top-level `sweep_tx_hash`), `REQ-WH-11` (contract 1.1.0, and a field that changes how others are read is gated), `REQ-OB-4` (kinds `contract_sender`, `sender_unchecked`, `cctp_unminted`, `cctp_config`, `relay_failing`), `INV-5`, `INV-7`, `INV-8` |
 | Withdrawn | none |
 
 `REQ-SW-9` and `REQ-SW-10` keep their text; for `cctp_burn` they apply to the mint, on the destination (A1).
