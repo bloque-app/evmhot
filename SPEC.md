@@ -161,7 +161,7 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
 - `REQ-DT-11` A block fetch or `eth_getLogs` that fails with a 429, 401-404, 413, 5xx or transport error is retried with
   a wait of 0.5 s doubling to 8 s (6 attempts) before the chunk fails. A `null` block at or below the head is an
   error, retried the same way: the cursor never passes a block that was not read. A range is bisected for a range or
-  size error, and for a 5xx or timeout once the backoff is spent, never for a 429. A lagging endpoint may still answer
+  size error once every endpoint has refused it, and for a 5xx or timeout once the backoff is spent, never for a 429. A lagging endpoint may still answer
   empty logs for blocks it lacks; the offset floor makes that unlikely, and F-002b's two-node agreement answers it.
   (Amendment 0006, which named it `REQ-DT-9`, an identifier already in use.)
 
@@ -191,7 +191,7 @@ One process. For each configured network it runs a **monitor** and a **sweeper**
   and asks the faucet to top it up if short.
 - `REQ-FC-2` A faucet with too little balance makes sweeps wait; it never marks a deposit swept.
 - `REQ-FC-3` A faucet top-up counts as sent once it is broadcast. The faucet records each one per address. While
-  it is recent (2 minutes once confirmed; 10 while unconfirmed or after "already known"; 90 s after "nonce too low"), a
+  it is recent (2 minutes once confirmed; 10 minutes while unconfirmed or after "already known"; 90 s after "nonce too low"), a
   request to fund that address is answered "faucet top-up pending" and sends nothing, and the sweep waits for a later
   pass. (Amendment 0006, A3.)
 
