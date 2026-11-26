@@ -32,6 +32,7 @@ mints it to a recipient on another configured network (the **destination**). Its
 | `attestation_url` | Circle's attestation API base URL |
 | `min_finality_threshold` | Default 2000 (standard transfer) |
 | `max_fee` | In the token's minor units; default 0 |
+| `clients` | The registration clients it serves, by webhook URL origin (A1a) |
 
 At load, refused if any fails:
 
@@ -43,14 +44,30 @@ At load, refused if any fails:
 
 Before each burn, evmhot reads: each side's `localDomain`; the messenger's local minter and its burn limit for the
 token; the destination minter's local token for (source domain, token), which MUST be the destination token; and,
-where the messenger has one, its minimum fee for the amount. A domain or token that differs, a `max` above the burn
-limit, or a minimum fee above `max_fee` stops burns on that target and raises `cctp_config`, until a read agrees again.
-These reads are cached for a pass.
+its minimum fee for the amount. A messenger without a fee switch reverts that call; a revert reads as a zero fee. A
+domain or token that differs, a `max` above the burn limit, or a minimum fee above `max_fee` stops burns on that
+target and raises `cctp_config`, until a read agrees again. A read that fails in transport means no burn this pass,
+not `cctp_config`. These reads are cached for a pass.
 
 The mint's `Transfer` from the zero address to the recipient is the transfer into the target for `REQ-SW-9`, and its
 coordinate is the sweep coordinate (`REQ-SW-10`), on the destination network (A4).
 
 Only standard transfers with `max_fee` 0 are built. A fee rule for fast transfers is Swaps' to set later.
+
+## A1a — a target scoped to its clients
+
+New `REQ-SW-19`. A `cctp_burn` target MUST list the registration clients it serves, by the origin (scheme, host and
+port) of the registration's webhook URL. A deposit whose registration's webhook origin is not listed is not swept to
+it: it uses the token's other target on that network. For Base USDC today that is `hold`. `REQ-SW-2` is revised to
+say so.
+
+Not every client of a network reads the same thing. On Base, the reserve's route (Swaps) reads `deposit_swept` 1.1.0,
+while other clients (Mediums' virtual accounts and per-order addresses) read only its top-level fields and route
+their deposits elsewhere. Swapping their USDC into the reserve would be wrong as well as unreadable. The origin is
+what the client chose at registration, so it needs no new API. The limit, stated plainly: registration is
+unauthenticated (§12), so a caller that registers with a listed origin has its deposits burned into the reserve, and
+the listed client is posted about deposits it never made. That is today's exposure for any webhook URL, and the
+reserve's own registration (by Swaps, at bezent) credits only deposits Swaps knows.
 
 ## A2 — the burn
 
@@ -63,7 +80,8 @@ New `REQ-SW-16`. A `cctp_burn` sweep is, from the deposit address:
 
 The allowance is read on chain before each burn, never taken from a stored flag. Both transactions are sweep intents
 under `REQ-SW-13`: one open intent per address, an explicit nonce, never dropped once signed. The faucet tops up gas
-for each, as for a transfer.
+for each, as for a transfer. Before signing a burn, evmhot records the destination's current head on its intent; the
+mint is never before it.
 
 A burn's receipt passes only if both of these hold:
 
@@ -71,9 +89,10 @@ A burn's receipt passes only if both of these hold:
   messenger, `destination_caller` 0, `max_fee` and `min_finality_threshold`;
 - the token's `Transfer` of that amount from the deposit address to the local minter.
 
-Anything else is `sweep_review` (`REQ-SW-14`). A burn is accepted only once its block is at or below the network's
-detection height (§7). Until then its intent stays open, and a burn that a reorganisation removes is broadcast
-again like any unmined sweep.
+Anything else is `sweep_review` (`REQ-SW-14`). Every receipt of a burn or an approval, a revert included, is acted on
+only once its block is at or below the network's detection height (§7). Until then the intent stays open, and a
+transaction that a reorganisation removes is broadcast again like any unmined sweep. So a revert that a
+reorganisation turns into a success can never be followed by a second burn of the same part.
 
 An accepted burn is **in flight** until its mint passes: its amount has left the address but is not yet a recorded
 sweep.
@@ -120,29 +139,38 @@ log inside its own call, never another part's. evmhot looks for the mint in thre
 
 - the transaction the attestation API reports as the mint, when it reports one, is checked first;
 - otherwise, if the transmitter's `usedNonces` marks the nonce used, `MessageReceived` logs filtered on that nonce
-  are searched in bounded ranges from the destination's head when the burn was accepted;
+  are searched in bounded ranges, starting at the destination head recorded on the burn's intent (A2);
 - otherwise the relayer relays it.
 
-**The relay.** The relayer (`REQ-KY-5`) sends `receiveMessage(message, attestation)` as a relay intent. Relay intents
-follow `REQ-SW-13`: recorded before signing, an explicit nonce on the relayer, resent, re-signed and sent to review by
-the same rules. The relayer's signed nonce is never abandoned. Before any rebroadcast or re-sign, evmhot reads
-`usedNonces` and the message's expiry:
+A mint is acted on only once its block is at or below the destination's detection height, since its coordinate is
+what consumers key on.
 
-- **nonce used by someone else:** the part settles from that mint. The relayer's nonce is re-signed for the next
-  waiting relay, or as a zero-value transfer to itself.
-- **message expired, or within 100 destination blocks of `expirationBlock`:** evmhot asks for re-attestation
-  (`POST /v2/reattest/{nonce}`), fetches the message again, and re-signs the relay at the same nonce with the new
-  attestation. A message with `expirationBlock` 0 never expires.
+**The relay.** The relayer (`REQ-KY-5`) sends `receiveMessage(message, attestation)` as a relay intent for one part.
+Relay intents follow `REQ-SW-13`: recorded before signing, an explicit nonce on the relayer, resent, re-signed and
+sent to review by the same rules. An intent's part never changes. Its transactions differ only in fees, or in a
+re-attested message for the same part.
 
-A mined relay that reverts closes its intent as failed. evmhot then reads `usedNonces` and the expiry again (a receipt
-carries no revert reason), and the part stays in flight for the next pass. A failed relay never fails the deposit.
+- **Before signing**, evmhot simulates the call (`eth_call`) and signs nothing that would revert. A simulated or mined
+  revert backs that part off on its own (1, 2, 4 … up to 60 minutes). After 5 reverts it raises `relay_failing`, then
+  again hourly. The relay loop takes the oldest part that is ready, so one failing message never starves the others.
+- **Before a rebroadcast or re-sign**, evmhot reads `usedNonces` and the message's expiry:
+  - **Nonce used by someone else:** the part settles from that mint (`INV-7`). The open relay intent is left to be
+    mined; it reverts, which costs little gas, and closes as failed.
+  - **Message expired, or within 100 destination blocks of `expirationBlock`:** evmhot asks for re-attestation
+    (`POST /v2/reattest/{nonce}`), fetches the message again, and re-signs at the same nonce with the new attestation.
+    Both fee fields are raised by at least 10% at once, so the node accepts the replacement. A message with
+    `expirationBlock` 0 never expires.
+- **A mined relay that reverts** closes its intent as failed. A receipt carries no revert reason, so evmhot then reads
+  `usedNonces` and the expiry again. The part stays in flight, and a failed relay never fails the deposit.
 
 **Throughput.** One relay loop per destination owns the relayer and keeps at most one open relay intent, so relays go
 one at a time across all deposit addresses. That is enough for today's volume; batching is a later change.
 
 **Unminted.** A part in flight with no passed mint 60 minutes after its burn was accepted raises `cctp_unminted`,
 naming the burn, the attestation status and Circle's `delayReason` if given, then again hourly. Funds between a burn
-and its mint are on neither network; only Circle's message holds them.
+and its mint are on neither network; only Circle's message holds them. An operator's recourse is the alert, then a
+relay by hand (anyone may relay, since the destination caller is zero). The next pass finds that mint. No operator
+route moves a part in flight.
 
 ## A5 — keys
 
@@ -159,14 +187,15 @@ New `REQ-WH-12`. A `cctp_burn` deposit's `deposit_swept` is sent once every part
 burn alone.
 
 - Its top-level fields describe the deposit on its own network. The top-level `sweep_tx_hash` (`REQ-WH-4`) becomes,
-  for every kind, the first part's transaction from the deposit address: for `cctp_burn`, the first burn. For a
-  `transfer` that is the same transaction as before, so a reader of 1.0.0 still finds a transaction on `chain`.
+  for every kind, the first part's sweep transaction on `chain`: for a `transfer` the transfer, as before; for
+  `cctp_burn` the first part's burn, never its approval. A 1.0.0 reader still finds a transaction on `chain`. That
+  transaction moves nothing into the reserve, so `verify_transfer` with the reserve as `to` fails for it.
 - Each `sweeps[]` entry adds `sweep_network` (the destination) and `burn_tx_hash` (that part's burn). Its `sweep_*`
   coordinate, `sweep_tx_hash` and `sweep_target` are the mint's, on the destination.
 - An entry without `sweep_network` is on the deposit's own network, so every body sent today is unchanged.
 
 The schema change is additive, but a 1.0.0 consumer that ignores `sweep_network` would read a mint's coordinate as one
-on `chain`. So a `cctp_burn` target MUST NOT be enabled until every consumer of that network's `deposit_swept` (each
+on `chain`. So a `cctp_burn` target MUST NOT be enabled until every consumer of its clients' `deposit_swept` (each
 registration's webhook client and the target's notify URL, `REQ-WH-10`) has confirmed it reads 1.1.0. The runbook
 lists them. Consumers key a sweep on `(sweep_network or chain, sweep_block_hash, sweep_log_index)`.
 
@@ -194,8 +223,8 @@ attestation; relay intents. `REQ-SW-13`'s one-open-intent rule also covers the r
 
 | Action | Identifiers |
 |---|---|
-| New | `REQ-SW-16`, `REQ-SW-17`, `REQ-SW-18`, `REQ-KY-5`, `REQ-WH-12`, `INV-9` |
-| Revised | `REQ-SW-3` (not for a deposit with a part in flight), `REQ-SW-6` (kind `cctp_burn`), `REQ-SW-13` (covers the relayer), `REQ-SW-14` and `REQ-SW-15` (parts in flight count as paid), `REQ-FC-1` (the faucet also funds the relayer), `REQ-WH-4` (the top-level `sweep_tx_hash`), `REQ-WH-11` (contract 1.1.0), `REQ-OB-4` (kinds `contract_sender`, `sender_unchecked`, `cctp_unminted`, `cctp_config`), `INV-5`, `INV-7`, `INV-8` |
+| New | `REQ-SW-16`, `REQ-SW-17`, `REQ-SW-18`, `REQ-SW-19`, `REQ-KY-5`, `REQ-WH-12`, `INV-9` |
+| Revised | `REQ-SW-2` (a target scoped to its clients), `REQ-SW-3` (not for a deposit with a part in flight), `REQ-SW-6` (kind `cctp_burn`), `REQ-SW-13` (covers the relayer), `REQ-SW-14` and `REQ-SW-15` (parts in flight count as paid), `REQ-FC-1` (the faucet also funds the relayer), `REQ-WH-4` (the top-level `sweep_tx_hash`), `REQ-WH-11` (contract 1.1.0, and a field that changes how others are read is gated), `REQ-OB-4` (kinds `contract_sender`, `sender_unchecked`, `cctp_unminted`, `cctp_config`, `relay_failing`), `INV-5`, `INV-7`, `INV-8` |
 | Withdrawn | none |
 
 `REQ-SW-9` and `REQ-SW-10` keep their text; for `cctp_burn` they apply to the mint, on the destination (A1).
@@ -217,4 +246,5 @@ attestation; relay intents. `REQ-SW-13`'s one-open-intent rule also covers the r
 - **Shared reserve.** The test environment burns on mainnet into the same reserve. Each environment's swap service
   tells its mints apart by which evmhot reports them.
 - **Sender check.** It reads two endpoints once per deposit, and holds every deposit from a contract for a person.
-- **Enabling is gated** on every consumer confirming 1.1.0 (A6).
+- **Enabling is gated** on every consumer confirming 1.1.0 (A6), and only the listed clients' deposits are burned (A1a).
+  Every other client's Base USDC stays held.

@@ -105,7 +105,7 @@ unannounced.
 | F-002 pre-restart fixes | Sweep outcome, sweep coordinate, senders and per-sender sweeps, finality per network, target bounds and admission, atomic outbox, separate tokens, counter ceiling, lag and provider alerts with back-off, ranged steady-state logs, operator route auth, provider health, withdraw the symbol filter | `REQ-SW-5`, `REQ-SW-7` to `REQ-SW-10`, `REQ-SW-12`, `REQ-WH-4`, `REQ-WH-7` to `REQ-WH-9`, `REQ-RG-5`, `REQ-DT-8`, `REQ-DT-10`, `REQ-OB-1` to `REQ-OB-3`, `REQ-API-2`, `INV-5`, `INV-6` |
 | F-003 self-hosting | Image pins, deploy definitions and runbook in the devops repository; the service, task role, DNS and routing in the infrastructure repository; the store move | DEC-2, DEC-7, DEC-8, DEC-9 |
 | F-004 directed deposit | `directed_deposit` targets | `REQ-SW-6` (second kind) |
-| F-005 CCTP burn | `cctp_burn` targets: approve and burn on the source, sender check, attestation, relay and mint check on the destination, `deposit_swept` 1.1.0 | `REQ-SW-6` (fourth kind), `REQ-SW-16` to `REQ-SW-18`, `REQ-KY-5`, `REQ-WH-12`, and the parts of `REQ-SW-3`, `REQ-SW-13` to `REQ-SW-15`, `REQ-FC-1`, `REQ-WH-4`, `REQ-OB-4`, `INV-5`, `INV-7`, `INV-8` marked (not built, amendment 0008); `INV-9` |
+| F-005 CCTP burn | `cctp_burn` targets: approve and burn on the source, sender check, attestation, relay and mint check on the destination, `deposit_swept` 1.1.0 | `REQ-SW-6` (fourth kind), `REQ-SW-16` to `REQ-SW-19`, `REQ-KY-5`, `REQ-WH-12`, and the parts of `REQ-SW-2`, `REQ-SW-3`, `REQ-SW-13` to `REQ-SW-15`, `REQ-FC-1`, `REQ-WH-4`, `REQ-WH-11`, `REQ-OB-4`, `INV-5`, `INV-7`, `INV-8` marked (not built, amendment 0008); `INV-9` |
 
 ## 5. Milestones
 
